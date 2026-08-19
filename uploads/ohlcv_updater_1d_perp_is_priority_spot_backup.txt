@@ -1,0 +1,1361 @@
+#!/usr/bin/env python3
+"""
+================================================================================
+OHLCV Updater — STABLE HIGH/LOW VOLUME (PROGRESS & PROXY FIX)
+================================================================================
+  ✅ НОВОЕ: выбор инструментов PERP-FIRST (как в 15m апдейтере): для каждого
+     базового актива берём линейный перп (BTC/USDT:USDT); спот (BTC/USDT) —
+     только если перпа на бирже нет.
+================================================================================
+"""
+
+import asyncio
+import datetime
+import time
+import re
+import sys
+import logging
+import warnings
+from typing import Optional, Dict, Any, List, Set, Tuple
+
+import asyncpg
+import pandas as pd
+import numpy as np
+import ccxt.async_support as ccxt_async
+from pytz import timezone as pytz_timezone
+
+# Отключаем предупреждения
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+try:
+    import db_config
+except ImportError:
+    print("Ошибка: не найден файл db_config.py")
+    sys.exit(1)
+
+# ==========================================================================
+#                         LOGGING & SETTINGS
+# ==========================================================================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("updater_1d")
+
+def log(msg: str):
+    logger.info(msg)
+
+
+DB_HIGH = "ohlcv_1d_data_for_usdt_pairs_using_ccxt_and_direct_api1"
+DB_LOW = "ohlcv_1d_data_for_low_vol_usdt_pairs_using_ccxt_and_direct_api1"
+
+# Настройки для CCXT
+EXCHANGE_MAP = {
+    "bybit": "bybit", "bitget": "bitget", "mexc": "mexc",
+    "kucoin": "kucoin", "gateio": "gate", "bingx": "bingx",
+    "htx": "htx", "coinex": "coinex", "okx": "okx"
+}
+
+# Используем только ОДИН параметр прокси для избежания ошибки "multiple proxies"
+SOCKS5_PROXY = "socks5://127.0.0.1:10808"
+
+HARD_FLOOR_USD = 500000
+MIN_DAYS_VOLUME_CHECK = 7
+CONCURRENT_PER_EXCHANGE = 5
+MSK_TZ = pytz_timezone("Europe/Moscow")
+ALMATY_TZ = pytz_timezone("Asia/Almaty")
+UPDATE_DAYS = 10
+UPDATE_INTERVAL_SECONDS = 3600
+
+# ПОЛНЫЙ БЭКОФИЛЛ ДЛЯ НОВЫХ ТАБЛИЦ (напр. свежие перп-таблицы при perp-first):
+# если таблицы в БД нет, история скачивается целиком (пагинацией по limit),
+# а не только последние UPDATE_DAYS дней.
+BACKFILL_NEW_TABLES: bool = True
+# Обратный бэкофилл УЖЕ СУЩЕСТВУЮЩИХ, но коротких таблиц (история в БД
+# начинается позже BACKFILL_START_DATE — напр. таблица создана запуском,
+# качавшим только last-UPDATE_DAYS): докачиваем старые бары пагинацией назад.
+BACKFILL_OLDER_EXISTING_TABLES: bool = True
+BACKFILL_START_DATE: str = "2018-01-01"   # от этой даты качаем новые таблицы
+BACKFILL_MAX_ITERATIONS: int = 50         # защита от бесконечного цикла
+# Лимит свечей за ОДИН запрос при пагинации. У бирж максимум разный
+# (ccxt сам лишний лимит НЕ обрежет — биржа вернёт либо меньше данных,
+# либо ошибку параметра, как OKX с max=100 на исторических свечах).
+BACKFILL_REQUEST_LIMIT: int = 300         # безопасный дефолт для любой биржи
+BACKFILL_REQUEST_LIMIT_PER_EXCHANGE: Dict[str, int] = {
+    "bybit": 1000,   # V5 spot/linear kline: max 1000
+    "bitget": 1000,  # фьючерсные/спотовые candles: до 1000
+    "mexc": 1000,    # контракт kline до 2000, спот 1000 — берём 1000
+    "kucoin": 1500,  # klines: max 1500
+    "gateio": 1000,  # spot max 1000 (futures до 1999 — не рискуем)
+    "bingx": 1000,   # kline: max 1000
+    "htx": 2000,     # kline size: до 2000
+    "coinex": 1000,  # kline: max 1000
+    "okx": 100,      # history-candles: max 100, иначе ошибка параметра
+}
+
+# ПРОВЕРКА НА ГЭПЫ: после обновления дневная история таблицы не должна иметь
+# пропущенных дней в диапазоне [первая свеча, последняя свеча]. Обнаруженные
+# дыры докачиваются с биржи и вставляются (с тем же дедупом по дню).
+CHECK_AND_FILL_GAPS: bool = True
+GAP_MAX_PAGES_PER_RANGE: int = 50   # защита от бесконечного цикла при докачке дыры
+
+SKIP_PATTERNS = re.compile(r"(3L|3S|5L|5S|2L|2S|4L|4S|UP|DOWN|BULL|BEAR)/USDT$", re.IGNORECASE)
+
+ALL_COLUMNS_SQL = {
+    "Timestamp": "BIGINT", "open": "DOUBLE PRECISION", "high": "DOUBLE PRECISION",
+    "low": "DOUBLE PRECISION", "close": "DOUBLE PRECISION", "volume": "DOUBLE PRECISION",
+    "ticker": "TEXT", "exchange": "TEXT", "open_time_msk": "TEXT", "open_time_almaty": "TEXT",
+    "volume_x_low": "DOUBLE PRECISION", "volume_x_close": "DOUBLE PRECISION", "asset_type": "TEXT",
+    # URL колонка на спотовую пару. Монитор уже умеет её читать.
+    "url_of_trading_pair": "TEXT",
+    # URL колонка на перп / swap, если он существует на бирже.
+    "url_of_swap_contract_if_it_exists": "TEXT",
+}
+
+# ==========================================================================
+#   НОВОЕ: колонки со снимком текущего состояния книги ордеров / ленты.
+#   Пишутся в САМУЮ СВЕЖУЮ (последнюю по Timestamp) строку таблицы пары —
+#   это snapshot на момент запуска апдейтера. Историю свечей НЕ трогаем.
+#   Схема существующих таблиц мигрируется автоматически (ADD COLUMN ...).
+# ==========================================================================
+ORDERBOOK_COLUMNS_SQL: Dict[str, str] = {
+    # Когда сделан снимок (unix sec, UTC).
+    "ob_snapshot_ts": "BIGINT",
+    "ob_snapshot_time_msk": "TEXT",
+    # Лента сделок.
+    "ob_last_trade_sec": "DOUBLE PRECISION",   # сколько секунд назад была последняя сделка
+    "ob_trades_per_min": "DOUBLE PRECISION",   # частота сделок (окно 5 мин)
+    "ob_buy_pressure_pct": "DOUBLE PRECISION", # % сделок на покупку (окно 5 мин)
+    "ob_cvd": "DOUBLE PRECISION",              # Cumulative Volume Delta ($) по загруженным сделкам
+    "ob_cvd_5m": "DOUBLE PRECISION",           # CVD ($) за последние 5 минут
+    # Спред.
+    "ob_spread_abs": "DOUBLE PRECISION",       # абсолютный спред (ask-bid)
+    "ob_spread_pct": "DOUBLE PRECISION",       # спред в % от цены
+    "ob_spread_atr_pct": "DOUBLE PRECISION",   # спред в % от Герчиковского ATR  <-- ключевое
+    "ob_gerchik_atr": "DOUBLE PRECISION",      # сам Герчиковский ATR (для прозрачности)
+    # Стакан.
+    "ob_best_bid": "DOUBLE PRECISION",
+    "ob_best_ask": "DOUBLE PRECISION",
+    "ob_bid_depth_usd": "DOUBLE PRECISION",
+    "ob_ask_depth_usd": "DOUBLE PRECISION",
+    "ob_total_depth_usd": "DOUBLE PRECISION",
+    "ob_imbalance": "DOUBLE PRECISION",        # bid_depth / ask_depth
+    # Оценка "живости".
+    "ob_vitality_score": "DOUBLE PRECISION",   # 0..10
+    "ob_vitality_grade": "TEXT",               # A/B/C/D/F
+    "ob_is_barcode": "BOOLEAN",                # лайв-забор (мёртвый рынок)
+    # Мин. объём в $ за 7 дней = min(volume*low) по 7 последним барам (для дашборда).
+    "ob_min_7d_volume_usd": "DOUBLE PRECISION",
+}
+
+# Включить/выключить сбор книги ордеров (не ломает базовый апдейтер OHLCV).
+COLLECT_ORDERBOOK: bool = True
+# Подробный лог ошибок сбора книги ордеров.
+DEBUG_ORDERBOOK: bool = False
+
+# --- Чистка спот-таблиц, замещённых перпами (perp-first) ---
+# Спот-таблица '<x>_usdt_on_<ex>' больше не обновляется, если для базы выбран
+# перп '<x>_usdt:usdt_on_<ex>'. Удаляем такую спот-таблицу, ЕСЛИ её история
+# НЕ длиннее перповой (min Timestamp спота >= min Timestamp перпа) — смысла
+# хранить её нет. Более ДЛИННУЮ спот-историю оставляем (глубина до перпа).
+CLEANUP_DUPLICATE_SPOT_TABLES: bool = True
+KEEP_SPOT_IF_LONGER_HISTORY: bool = True
+
+# --- Параметры сбора книги ордеров (совместимы с monitor'ом) ---
+OB_FETCH_LIMIT: int = 50
+OB_TRADES_LIMIT: int = 100
+OB_TRADES_WINDOW_SEC: int = 300
+OB_DEPTH_PCT: float = 1.0
+OB_FALLBACK_LIMITS: List[int] = [20, 10, 5]
+OB_LIMIT_PER_EXCHANGE: Dict[str, int] = {}
+
+OB_TRADES_MIN_SLOW: float = 3.0
+OB_TRADES_MIN_OK: float = 15.0
+OB_TRADES_MIN_GOOD: float = 45.0
+OB_TRADES_MIN_BLAZING: float = 120.0
+OB_DEPTH_MIN_THIN: float = 1000
+OB_DEPTH_MIN_OK: float = 10000
+OB_DEPTH_MIN_GOOD: float = 50000
+
+# Параметры Герчиковского robust ATR (совпадают с monitor'ом).
+GC_ATR_PERIOD: int = 5
+GC_BAR_SMALL_THRESHOLD: float = 0.5
+GC_BAR_LARGE_THRESHOLD: float = 1.8
+
+db_pools: Dict[str, asyncpg.Pool] = {}
+
+
+# ==========================================================================
+#                 FILTERS & DB UTILS
+# ==========================================================================
+
+def should_skip_pair(symbol: str) -> bool:
+    if not symbol: return True
+    # Отбрасываем settle-часть перпов: BTC/USDT:USDT -> BTC/USDT,
+    # чтобы плечевые токены (BTC3L/USDT:USDT) тоже отсекались SKIP_PATTERNS.
+    spot_like = symbol.split(':')[0]
+    parts = spot_like.split('/')
+    if len(parts) > 0:
+        base = parts[0].lower()
+        if "usd" in base: return True
+    return bool(SKIP_PATTERNS.search(spot_like))
+
+
+def _split_symbol(symbol: str) -> Tuple[str, str]:
+    parts = (symbol or '').split('/')
+    if len(parts) >= 2:
+        # Для перпов (BTC/USDT:USDT) quote = 'USDT', без settle-части.
+        return parts[0], parts[1].split(':')[0]
+    return symbol or '', 'USDT'
+
+
+def get_exchange_url(exchange_id: str, symbol: str) -> str:
+    base, quote = _split_symbol(symbol)
+    b_up, q_up = base.upper(), quote.upper()
+    b_lo, q_lo = base.lower(), quote.lower()
+    urls = {
+        "bybit": f"https://www.bybit.com/ru-RU/trade/spot/{b_up}/{q_up}",
+        "bitget": f"https://www.bitget.com/ru/spot/{b_up}{q_up}_SPBL?type=spot",
+        "mexc": f"https://www.mexc.com/exchange/{b_up}_{q_up}",
+        "kucoin": f"https://trade.kucoin.com/{b_up}-{q_up}",
+        "gateio": f"https://www.gate.io/trade/{b_up}_{q_up}",
+        "bingx": f"https://bingx.com/en-us/spot/{b_up}{q_up}/",
+        "htx": f"https://www.htx.com/trade/{b_lo}_{q_lo}/",
+        "huobipro": f"https://www.htx.com/trade/{b_lo}_{q_lo}/",
+        "coinex": f"https://www.coinex.com/exchange/{b_lo}-{q_lo}",
+        "okx": f"https://www.okx.com/ru/trade-spot/{b_lo}-{q_lo}",
+        "okex": f"https://www.okx.com/ru/trade-spot/{b_lo}-{q_lo}",
+    }
+    return urls.get((exchange_id or '').lower(), "")
+
+
+def get_swap_url(exchange_id: str, symbol: str) -> str:
+    base, quote = _split_symbol(symbol)
+    b_up, q_up = base.upper(), quote.upper()
+    b_lo, q_lo = base.lower(), quote.lower()
+    urls = {
+        "bybit": f"https://www.bybit.com/trade/usdt/{b_up}{q_up}",
+        "bitget": f"https://www.bitget.com/ru/futures/usdt/{b_up}{q_up}",
+        "mexc": f"https://futures.mexc.com/exchange/{b_up}_{q_up}",
+        "kucoin": f"https://www.kucoin.com/futures/trade/{b_up}{q_up}M",
+        "gateio": f"https://www.gate.com/futures/USDT/{b_up}_{q_up}",
+        "bingx": f"https://bingx.com/en-us/perpetual/{b_up}{q_up}/",
+        "htx": f"https://www.htx.com/futures/linear_swap/exchange/{b_lo}-{q_lo}/",
+        "huobipro": f"https://www.htx.com/futures/linear_swap/exchange/{b_lo}-{q_lo}/",
+        "coinex": f"https://www.coinex.com/futures/{b_lo}-{q_lo}",
+        "okx": f"https://www.okx.com/ru/trade-swap/{b_lo}-{q_lo}-swap",
+        "okex": f"https://www.okx.com/ru/trade-swap/{b_lo}-{q_lo}-swap",
+    }
+    return urls.get((exchange_id or '').lower(), "")
+
+
+# ==========================================================================
+#   НОВОЕ: PERP-FIRST выборка инструментов (как в 15m апдейтере).
+#   Для каждого базового актива берём линейный перп (BTC/USDT:USDT);
+#   спот (BTC/USDT) берём только если перпа на этой бирже нет.
+#   Имя таблицы: перп BTC/USDT:USDT -> btc_usdt:usdt_on_<exchange>
+#   (парсится parse_table_name в сканере; kind определяется по ':').
+# ==========================================================================
+
+def select_symbols_for_exchange(symbols, markets, exchange_name="") -> List[str]:
+    """
+    Выбирает пары для загрузки по правилу PERP-FIRST:
+    для каждого базового актива (например, BTC) берём линейный перп
+    (BTC/USDT:USDT), а если перп не существует — спот (BTC/USDT).
+    """
+    spots = {}  # base -> symbol
+    swaps = {}  # base -> symbol
+
+    for symbol in symbols:
+        if symbol not in markets:
+            continue
+        market = markets[symbol]
+
+        # Проверяем, нужно ли пропускать эту пару по названию
+        if should_skip_pair(symbol):
+            continue
+
+        base = market.get('base')
+        if not base:
+            continue
+        base = base.upper()
+
+        # Спот: символ оканчивается на /USDT и тип spot
+        if market.get('spot') and symbol.endswith('/USDT'):
+            spots[base] = symbol
+
+        # Линейный перп: символ оканчивается на /USDT:USDT и тип swap
+        elif market.get('swap') and symbol.endswith('/USDT:USDT'):
+            swaps[base] = symbol
+
+    # Объединяем по приоритету: если есть перп — берём его, иначе берём спот
+    selected_symbols = []
+    all_bases = set(spots.keys()) | set(swaps.keys())
+
+    for base in sorted(all_bases):
+        if base in swaps:
+            selected_symbols.append(swaps[base])
+        elif base in spots:
+            selected_symbols.append(spots[base])
+
+    return selected_symbols
+
+
+def _make_exchange(ccxt_id: str):
+    """Создаёт экземпляр биржи с универсальными настройками (спот + перпы)."""
+    return getattr(ccxt_async, ccxt_id)({
+        "enableRateLimit": True,
+        "timeout": 40000,
+        "socks_proxy": SOCKS5_PROXY,
+        "options": {},
+    })
+
+
+async def init_db_pools():
+    for db in [DB_HIGH, DB_LOW]:
+        db_pools[db] = await asyncpg.create_pool(
+            user=db_config.user, password=db_config.password, host=db_config.host, port=db_config.port,
+            database=db, min_size=2, max_size=10
+        )
+    log("✓ DB pools initialized")
+
+
+async def find_table_in_dbs(table_name: str) -> Tuple[Optional[str], int, int]:
+    """Возвращает (db, max_ts, min_ts). Для отсутствующей таблицы: (None, 0, 0)."""
+    for db in [DB_HIGH, DB_LOW]:
+        async with db_pools[db].acquire() as conn:
+            exists = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name=$1)",
+                                         table_name)
+            if exists:
+                row = await conn.fetchrow(
+                    f'SELECT MAX("Timestamp") AS mx, MIN("Timestamp") AS mn FROM "{table_name}"')
+                mx = int(row["mx"]) if row["mx"] else 0
+                mn = int(row["mn"]) if row["mn"] else 0
+                return db, mx, mn
+    return None, 0, 0
+
+
+async def move_table(table_name, from_db, to_db):
+    async with db_pools[from_db].acquire() as fc:
+        rows = await fc.fetch(f'SELECT * FROM "{table_name}"')
+        if not rows: return
+    async with db_pools[to_db].acquire() as tc:
+        cols_sql = ", ".join([f'"{k}" {ALL_COLUMNS_SQL.get(k, "TEXT")}' for k in rows[0].keys()])
+        await tc.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+        await tc.execute(f'CREATE TABLE "{table_name}" ({cols_sql})')
+        await tc.copy_records_to_table(table_name, records=[tuple(r.values()) for r in rows],
+                                       columns=list(rows[0].keys()))
+    async with db_pools[from_db].acquire() as fc2:
+        await fc2.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+
+
+# ==========================================================================
+#   НОВОЕ: Герчиковский robust ATR + снимок книги ордеров / ленты сделок
+# ==========================================================================
+
+def compute_gerchik_atr(highs, lows, closes) -> float:
+    """
+    Герчиковский robust ATR (последнее значение) — тот же алгоритм, что в мониторе:
+    True Range со скользящим окном GC_ATR_PERIOD + итеративная фильтрация выбросов
+    вне диапазона [GC_BAR_SMALL_THRESHOLD*curr, GC_BAR_LARGE_THRESHOLD*curr].
+    Возвращает ATR для ПОСЛЕДНЕГО бара (актуальный). 0.0, если данных мало.
+    """
+    try:
+        H = np.asarray(highs, dtype=float)
+        L = np.asarray(lows, dtype=float)
+        C = np.asarray(closes, dtype=float)
+    except Exception:
+        return 0.0
+    n = len(C)
+    if n < 3:
+        return 0.0
+    prev_c = np.roll(C, 1)
+    prev_c[0] = C[0]
+    tr = np.maximum(H - L, np.maximum(np.abs(H - prev_c), np.abs(L - prev_c)))
+    tr = np.where(np.isfinite(tr), tr, 0.0)
+    window_tr = tr[max(0, n - GC_ATR_PERIOD):n]
+    if len(window_tr) == 0:
+        return 0.0
+    curr = float(np.mean(window_tr))
+    if not np.isfinite(curr) or curr <= 0:
+        return 0.0
+    for _ in range(10):
+        valid = window_tr[
+            (window_tr >= GC_BAR_SMALL_THRESHOLD * curr)
+            & (window_tr <= GC_BAR_LARGE_THRESHOLD * curr)
+        ]
+        if len(valid) == 0:
+            break
+        new_atr = float(np.mean(valid))
+        if not np.isfinite(new_atr) or new_atr <= 0:
+            break
+        if abs(new_atr - curr) / max(abs(curr), 1e-12) < 0.01:
+            curr = new_atr
+            break
+        curr = new_atr
+    return max(float(curr), 0.0)
+
+
+def _vitality_grade_from_score(score: float) -> str:
+    if score >= 8:
+        return "A"
+    if score >= 6:
+        return "B"
+    if score >= 4:
+        return "C"
+    if score >= 2:
+        return "D"
+    return "F"
+
+
+async def fetch_orderbook_snapshot(exchange, symbol: str, gerchik_atr: float) -> Optional[Dict[str, Any]]:
+    """
+    Снимает ТЕКУЩЕЕ состояние книги ордеров и ленты сделок и возвращает dict с
+    метриками (совместимы с monitor'ом), плюс CVD:
+      - last_trade_sec, trades_per_min, buy_pressure_pct
+      - cvd (по всем загруженным сделкам) и cvd_5m (за 5 минут), в USD
+      - spread_abs, spread_pct, spread_atr_pct (% от Герчиковского ATR)
+      - best_bid/ask, depth (bid/ask/total, USD), imbalance
+      - vitality_score (0..10), vitality_grade (A..F), is_barcode
+    Ничего не поднимает наружу — при ошибке возвращает None.
+    """
+    ex_id = getattr(exchange, "id", "unknown")
+    limit = OB_LIMIT_PER_EXCHANGE.get(ex_id, OB_FETCH_LIMIT)
+
+    # --- стакан ---
+    ob = None
+    for l in [limit] + [fb for fb in OB_FALLBACK_LIMITS if fb != limit]:
+        try:
+            ob = await exchange.fetch_order_book(symbol, limit=l)
+            if ob:
+                break
+        except Exception:
+            continue
+    if not ob:
+        return None
+    bids, asks = ob.get("bids", []) or [], ob.get("asks", []) or []
+    if not bids or not asks:
+        return None
+    try:
+        best_bid, best_ask = float(bids[0][0]), float(asks[0][0])
+    except Exception:
+        return None
+    if best_bid <= 0 or best_ask <= 0:
+        return None
+
+    mid = (best_bid + best_ask) / 2.0
+    spread_abs = best_ask - best_bid
+    spread_pct = (spread_abs / best_bid) * 100.0 if best_bid > 0 else 0.0
+    spread_atr_pct = (spread_abs / gerchik_atr) * 100.0 if gerchik_atr and gerchik_atr > 0 else 0.0
+
+    lo, hi = mid * (1 - OB_DEPTH_PCT / 100.0), mid * (1 + OB_DEPTH_PCT / 100.0)
+    bid_depth = ask_depth = 0.0
+    for entry in bids:
+        if len(entry) < 2:
+            continue
+        p, a = float(entry[0]), float(entry[1])
+        if p >= lo:
+            bid_depth += p * a
+    for entry in asks:
+        if len(entry) < 2:
+            continue
+        p, a = float(entry[0]), float(entry[1])
+        if p <= hi:
+            ask_depth += p * a
+    total_depth = bid_depth + ask_depth
+    imbalance = round(bid_depth / ask_depth, 4) if ask_depth > 0 else 99.0
+
+    # --- лента сделок ---
+    tpm, last_sec, buy_pct = 0.0, 999.0, 50.0
+    cvd = cvd_5m = 0.0
+    trades = []
+    try:
+        trades = await exchange.fetch_trades(symbol, limit=OB_TRADES_LIMIT) or []
+    except Exception:
+        trades = []
+    if trades:
+        now_ms = time.time() * 1000
+        # CVD по всем загруженным сделкам (buy +, sell -), в USD.
+        for t in trades:
+            price = float(t.get("price", 0) or 0)
+            amt = float(t.get("amount", 0) or 0)
+            usd = price * amt
+            side = t.get("side")
+            signed = usd if side == "buy" else (-usd if side == "sell" else 0.0)
+            cvd += signed
+            ts = t.get("timestamp") or 0
+            if ts and ts >= now_ms - OB_TRADES_WINDOW_SEC * 1000:
+                cvd_5m += signed
+        recent = [t for t in trades if t.get("timestamp") and t["timestamp"] >= now_ms - OB_TRADES_WINDOW_SEC * 1000]
+        if recent:
+            tpm = len(recent) / (OB_TRADES_WINDOW_SEC / 60.0)
+            buys = sum(1 for t in recent if t.get("side") == "buy")
+            buy_pct = buys / len(recent) * 100.0
+        valid_ts = [t.get("timestamp", 0) or 0 for t in trades if t.get("timestamp")]
+        if valid_ts:
+            last_sec = (now_ms - max(valid_ts)) / 1000.0
+
+    # --- barcode / vitality (та же логика, что в мониторе) ---
+    is_barcode = False
+    try:
+        prices = [float(t["price"]) for t in trades if t.get("price")]
+        if len(trades) >= 30 and len(set(prices)) <= 4:
+            is_barcode = True
+    except Exception:
+        is_barcode = False
+
+    score = 0
+    if not is_barcode:
+        if tpm >= OB_TRADES_MIN_BLAZING:
+            score += 4
+        elif tpm >= OB_TRADES_MIN_GOOD:
+            score += 3
+        elif tpm >= OB_TRADES_MIN_OK:
+            score += 2
+        elif tpm >= OB_TRADES_MIN_SLOW:
+            score += 1
+        if total_depth >= OB_DEPTH_MIN_GOOD:
+            score += 3
+        elif total_depth >= OB_DEPTH_MIN_OK:
+            score += 2
+        elif total_depth >= OB_DEPTH_MIN_THIN:
+            score += 1
+        if spread_pct < 0.1:
+            score += 3
+        elif spread_pct < 0.3:
+            score += 2
+        elif spread_pct < 1.0:
+            score += 1
+    score = max(0, min(10, score))
+    grade = _vitality_grade_from_score(score) if not is_barcode else "F"
+
+    return {
+        "ob_last_trade_sec": round(last_sec, 1),
+        "ob_trades_per_min": round(tpm, 2),
+        "ob_buy_pressure_pct": round(buy_pct, 1),
+        "ob_cvd": round(cvd, 2),
+        "ob_cvd_5m": round(cvd_5m, 2),
+        "ob_spread_abs": spread_abs,
+        "ob_spread_pct": round(spread_pct, 4),
+        "ob_spread_atr_pct": round(spread_atr_pct, 4),
+        "ob_gerchik_atr": round(float(gerchik_atr or 0.0), 10),
+        "ob_best_bid": best_bid,
+        "ob_best_ask": best_ask,
+        "ob_bid_depth_usd": round(bid_depth, 2),
+        "ob_ask_depth_usd": round(ask_depth, 2),
+        "ob_total_depth_usd": round(total_depth, 2),
+        "ob_imbalance": imbalance,
+        "ob_vitality_score": float(score),
+        "ob_vitality_grade": grade,
+        "ob_is_barcode": bool(is_barcode),
+    }
+
+
+async def ensure_orderbook_columns(conn, tbl: str) -> None:
+    """Добавляет недостающие ob_*-колонки в таблицу пары (idempotent)."""
+    existing = {r["column_name"] for r in await conn.fetch(
+        "SELECT column_name FROM information_schema.columns WHERE table_name=$1", tbl)}
+    for col, typ in ORDERBOOK_COLUMNS_SQL.items():
+        if col not in existing:
+            await conn.execute(f'ALTER TABLE "{tbl}" ADD COLUMN "{col}" {typ}')
+
+
+async def save_orderbook_snapshot(db, tbl: str, full_df, snap: Optional[Dict[str, Any]]) -> None:
+    """
+    Пишет снимок книги ордеров в САМУЮ СВЕЖУЮ строку таблицы (по MAX(Timestamp)).
+    Также всегда обновляет ob_min_7d_volume_usd = min(volume*low) за 7 последних
+    баров (эта метрика считается из OHLCV и не требует стакана).
+    Историю не трогаем — обновляем только последнюю строку.
+    """
+    async with db_pools[db].acquire() as conn:
+        await ensure_orderbook_columns(conn, tbl)
+
+        # Мин. объём за 7 дней (из OHLCV) — считаем всегда, даже если стакан не сняли.
+        # ИСКЛЮЧАЕМ текущий (незакрытый) день: его объём неполный и занизил бы минимум.
+        # Закрытым считаем бар, у которого прошло >= 86400 сек с открытия.
+        min_7d = None
+        try:
+            closed_cutoff = int(time.time()) - 86400
+            closed = full_df[full_df["Timestamp"] <= closed_cutoff]
+            tail = closed.tail(MIN_DAYS_VOLUME_CHECK)
+            if len(tail) >= 1:
+                min_7d = float((tail["volume"] * tail["low"]).min())
+        except Exception:
+            min_7d = None
+
+        last_ts = await conn.fetchval(f'SELECT MAX("Timestamp") FROM "{tbl}"')
+        if last_ts is None:
+            return
+
+        set_parts, values = [], []
+        idx = 1
+
+        def add(col, val):
+            nonlocal idx
+            set_parts.append(f'"{col}" = ${idx}')
+            values.append(val)
+            idx += 1
+
+        if min_7d is not None and np.isfinite(min_7d):
+            add("ob_min_7d_volume_usd", round(min_7d, 2))
+
+        if snap:
+            now = int(time.time())
+            add("ob_snapshot_ts", now)
+            add("ob_snapshot_time_msk",
+                datetime.datetime.fromtimestamp(now, MSK_TZ).strftime("%Y-%m-%d %H:%M:%S"))
+            for col in ORDERBOOK_COLUMNS_SQL:
+                if col in ("ob_snapshot_ts", "ob_snapshot_time_msk", "ob_min_7d_volume_usd"):
+                    continue
+                if col in snap:
+                    add(col, snap[col])
+
+        if not set_parts:
+            return
+        values.append(int(last_ts))
+        sql = f'UPDATE "{tbl}" SET {", ".join(set_parts)} WHERE "Timestamp" = ${idx}'
+        await conn.execute(sql, *values)
+
+
+async def fill_history_gaps(exchange, symbol, ccxt_id, tbl, current_db, bf_limit) -> int:
+    """Проверяет дневную историю таблицы на пропущенные дни и заделывает дыры.
+
+    "День" = Timestamp // 86400 (совпадает с дедупом по логическому дню).
+    Все дни между самой ранней и самой поздней свечой должны присутствовать.
+    Обнаруженные пропуски группируются в непрерывные диапазоны, каждый
+    диапазон докачивается пагинацией с лимитом конкретной биржи и вставляется
+    с тем же дедупом по дню. Возвращает число вставленных свечей.
+    """
+    async with db_pools[current_db].acquire() as conn:
+        rows = await conn.fetch(
+            f'SELECT DISTINCT ("Timestamp" / 86400) AS day FROM "{tbl}" ORDER BY day')
+    if len(rows) < 2:
+        return 0
+    days = np.fromiter((int(r["day"]) for r in rows), dtype=np.int64)
+    full = np.arange(days[0], days[-1] + 1, dtype=np.int64)
+    missing = np.setdiff1d(full, days, assume_unique=True)
+    if len(missing) == 0:
+        return 0
+
+    # Группируем пропущенные дни в непрерывные диапазоны [r0, r1].
+    boundaries = np.nonzero(np.diff(missing) > 1)[0]
+    gap_ranges: List[Tuple[int, int]] = []
+    start_idx = 0
+    for b in boundaries:
+        gap_ranges.append((int(missing[start_idx]), int(missing[b])))
+        start_idx = b + 1
+    gap_ranges.append((int(missing[start_idx]), int(missing[-1])))
+
+    gap_days = set(int(d) for d in missing)
+    all_gap_cs: List[list] = []
+    seen_days: Set[int] = set()
+    for r0, r1 in gap_ranges:
+        cursor_day = r0
+        for _ in range(GAP_MAX_PAGES_PER_RANGE):
+            batch = await exchange.fetch_ohlcv(
+                symbol, "1d", since=cursor_day * 86400000, limit=bf_limit)
+            if not batch:
+                break
+            for c in batch:
+                day = int(c[0]) // 86400000
+                if day in gap_days and day not in seen_days:
+                    seen_days.add(day)
+                    all_gap_cs.append(c)
+            last_day = int(batch[-1][0]) // 86400000
+            if last_day >= r1 or len(batch) < bf_limit:
+                break  # диапазон покрыт или биржа больше не отдаёт данные
+            cursor_day = last_day + 1
+
+    if not all_gap_cs:
+        log(f"    ⚠️ [GAPS] [{ccxt_id}] {symbol}: дыры на {len(missing)} дн., но биржа их не отдала")
+        return 0
+
+    is_swap = ":" in symbol
+    spot_url = get_exchange_url(ccxt_id, symbol)
+    swap_url = get_swap_url(ccxt_id, symbol)
+    df_gap = pd.DataFrame(all_gap_cs, columns=["ts", "open", "high", "low", "close", "volume"])
+    df_gap["Timestamp"] = (df_gap["ts"] // 1000).astype("int64")
+    df_gap["ticker"], df_gap["exchange"] = symbol, ccxt_id
+    df_gap["volume_x_low"] = df_gap["volume"] * df_gap["low"]
+    df_gap["volume_x_close"] = df_gap["volume"] * df_gap["close"]
+    df_gap["asset_type"] = "swap" if is_swap else "spot"
+    if is_swap:
+        df_gap["url_of_trading_pair"] = swap_url if swap_url else None
+        df_gap["url_of_swap_contract_if_it_exists"] = None
+    else:
+        df_gap["url_of_trading_pair"] = spot_url if spot_url else None
+        df_gap["url_of_swap_contract_if_it_exists"] = swap_url if swap_url else None
+    dt_gap = pd.to_datetime(df_gap['Timestamp'], unit='s', utc=True)
+    df_gap['open_time_msk'] = dt_gap.dt.tz_convert(MSK_TZ).dt.strftime("%Y-%m-%d %H:%M:%S")
+    df_gap['open_time_almaty'] = dt_gap.dt.tz_convert(ALMATY_TZ).dt.strftime("%Y-%m-%d %H:%M:%S")
+    gap_cols = list(ALL_COLUMNS_SQL.keys())
+    tuples_gap = [tuple(None if pd.isna(x) else x for x in row)
+                  for row in df_gap[gap_cols].to_numpy()]
+
+    async with db_pools[current_db].acquire() as gconn:
+        existing_cols_g = {r['column_name'] for r in
+                           await gconn.fetch("SELECT column_name FROM information_schema.columns WHERE table_name=$1",
+                                             tbl)}
+        for col in gap_cols:
+            if col not in existing_cols_g:
+                await gconn.execute(
+                    f'ALTER TABLE "{tbl}" ADD COLUMN "{col}" {ALL_COLUMNS_SQL[col]}')
+        async with gconn.transaction():
+            # Сносим любые строки гэповых дней (их быть не должно, но на всякий
+            # случай) и вставляем докачанные — в одной транзакции.
+            await gconn.execute(
+                f'DELETE FROM "{tbl}" WHERE ("Timestamp" / 86400) = ANY($1::bigint[])',
+                list(gap_days))
+            await gconn.copy_records_to_table(tbl, records=tuples_gap, columns=gap_cols)
+        await gconn.execute(f'''
+            DELETE FROM "{tbl}" t USING (
+                SELECT "Timestamp",
+                       row_number() OVER (
+                           PARTITION BY ("Timestamp" / 86400)
+                           ORDER BY COALESCE(volume, 0) DESC, "Timestamp" DESC
+                       ) AS rn
+                FROM "{tbl}"
+            ) d
+            WHERE t."Timestamp" = d."Timestamp" AND d.rn > 1
+        ''')
+
+    filled = len(all_gap_cs)
+    log(f"    🕳️ [GAPS] [{ccxt_id}] {symbol}: заполнено {filled}/{len(missing)} пропущенных дней")
+    return filled
+
+
+# ==========================================================================
+#                 CORE LOGIC
+# ==========================================================================
+
+async def process_pair(exchange, symbol, ccxt_id):
+    tbl = f"{symbol.replace('/', '_').replace('-', '_')}_on_{ccxt_id}".lower()
+    current_db, last_ts, first_ts = await find_table_in_dbs(tbl)
+
+    since_ts = int(time.time() - (UPDATE_DAYS * 86400))
+    # ВАЖНО: запрашиваем ВКЛЮЧАЯ последний уже сохранённый день (last_ts, а не
+    # last_ts + 1 день). Последний дневной бар почти всегда ещё формируется, и его
+    # нужно ПЕРЕЗАПИСАТЬ свежими значениями при каждом часовом прогоне.
+    if last_ts > 0:
+        since_ts = last_ts
+
+    # Лимит свечей за запрос ИМЕННО для этой биржи (у бирж разный максимум,
+    # см. BACKFILL_REQUEST_LIMIT_PER_EXCHANGE; ccxt сам его не обрежет).
+    bf_limit = BACKFILL_REQUEST_LIMIT_PER_EXCHANGE.get(ccxt_id, BACKFILL_REQUEST_LIMIT)
+
+    try:
+        if last_ts == 0 and BACKFILL_NEW_TABLES:
+            # НОВАЯ ТАБЛИЦА (напр. свежедобавленный перп при perp-first):
+            # качаем ВСЮ доступную историю пагинацией, а не последние UPDATE_DAYS.
+            cs = []
+            backfill_ms = int(datetime.datetime.strptime(
+                BACKFILL_START_DATE, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
+            cursor_ms = backfill_ms
+            seen_ts: Set[int] = set()
+            for _ in range(BACKFILL_MAX_ITERATIONS):
+                batch = await exchange.fetch_ohlcv(
+                    symbol, "1d", since=cursor_ms, limit=bf_limit)
+                if not batch:
+                    break
+                new_rows = [c for c in batch if int(c[0]) not in seen_ts]
+                if not new_rows:
+                    break  # биржа вернула только уже виденные свечи — конец
+                for c in new_rows:
+                    seen_ts.add(int(c[0]))
+                cs.extend(new_rows)
+                if len(batch) < bf_limit:
+                    break  # биржа вернула меньше лимита — история исчерпана
+                cursor_ms = int(new_rows[-1][0]) + 86400000  # следующий день
+        else:
+            cs = await exchange.fetch_ohlcv(symbol, "1d", since=since_ts * 1000, limit=50)
+
+            # ОБРАТНЫЙ БЭКОФИЛЛ: таблица уже есть, но её самая ранняя свеча
+            # позже BACKFILL_START_DATE (напр. создана старым прогоном, который
+            # качал только UPDATE_DAYS дней). Докачиваем историю ВГЛУБЬ,
+            # листая окно since <- first_ts назад, пока биржа отдаёт более
+            # ранние бары. Новые короткие таблицы при perp-first залил именно
+            # такой "обрезанный" прогон — это лечится здесь автоматически.
+            backfill_ms = int(datetime.datetime.strptime(
+                BACKFILL_START_DATE, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
+            if BACKFILL_OLDER_EXISTING_TABLES and first_ts > 0 \
+                    and first_ts * 1000 > backfill_ms:
+                old_cs = []
+                cursor_ms = first_ts * 1000  # самая ранняя свеча в БД (ms)
+                seen_old: Set[int] = set()
+                for _ in range(BACKFILL_MAX_ITERATIONS):
+                    window_start = max(backfill_ms,
+                                       cursor_ms - bf_limit * 86400000)
+                    batch = await exchange.fetch_ohlcv(
+                        symbol, "1d", since=window_start, limit=bf_limit)
+                    if not batch:
+                        break
+                    new_rows = [c for c in batch
+                                if int(c[0]) < cursor_ms and int(c[0]) not in seen_old]
+                    if not new_rows:
+                        break  # раньше cursor биржа ничего не отдаёт — конец окна
+                    for c in new_rows:
+                        seen_old.add(int(c[0]))
+                    old_cs.extend(new_rows)
+                    if window_start <= backfill_ms:
+                        break  # дошли до нижней границы бэкофилла
+                    cursor_ms = min(int(c[0]) for c in new_rows)
+                if old_cs:
+                    # Вставляем старые бары ОТДЕЛЬНО от основного пути: основной
+                    # DELETE >= min(df) стёр бы уже существующие строки таблицы,
+                    # которых нет в df (пробел между бэкофиллом и свежим хвостом).
+                    # Здесь сносим только диапазон СТАРЕЕ first_ts и вставляем
+                    # докачанную историю — существующие строки не трогаем.
+                    df_old = pd.DataFrame(old_cs, columns=["ts", "open", "high", "low", "close", "volume"])
+                    df_old["Timestamp"] = (df_old["ts"] // 1000).astype("int64")
+                    df_old["ticker"], df_old["exchange"] = symbol, ccxt_id
+                    df_old["volume_x_low"] = df_old["volume"] * df_old["low"]
+                    df_old["volume_x_close"] = df_old["volume"] * df_old["close"]
+                    _is_swap_old = ":" in symbol
+                    df_old["asset_type"] = "swap" if _is_swap_old else "spot"
+                    _spot_url = get_exchange_url(ccxt_id, symbol)
+                    _swap_url = get_swap_url(ccxt_id, symbol)
+                    if _is_swap_old:
+                        df_old["url_of_trading_pair"] = _swap_url if _swap_url else None
+                        df_old["url_of_swap_contract_if_it_exists"] = None
+                    else:
+                        df_old["url_of_trading_pair"] = _spot_url if _spot_url else None
+                        df_old["url_of_swap_contract_if_it_exists"] = _swap_url if _swap_url else None
+                    _dt_old = pd.to_datetime(df_old['Timestamp'], unit='s', utc=True)
+                    df_old['open_time_msk'] = _dt_old.dt.tz_convert(MSK_TZ).dt.strftime("%Y-%m-%d %H:%M:%S")
+                    df_old['open_time_almaty'] = _dt_old.dt.tz_convert(ALMATY_TZ).dt.strftime("%Y-%m-%d %H:%M:%S")
+                    old_cols = list(ALL_COLUMNS_SQL.keys())
+                    tuples_old = [tuple(None if pd.isna(x) else x for x in row)
+                                  for row in df_old[old_cols].to_numpy()]
+                    async with db_pools[current_db].acquire() as oconn:
+                        existing_cols_o = {r['column_name'] for r in
+                                           await oconn.fetch("SELECT column_name FROM information_schema.columns WHERE table_name=$1",
+                                                             tbl)}
+                        for col in old_cols:
+                            if col not in existing_cols_o:
+                                await oconn.execute(
+                                    f'ALTER TABLE "{tbl}" ADD COLUMN "{col}" {ALL_COLUMNS_SQL[col]}')
+                        async with oconn.transaction():
+                            await oconn.execute(
+                                f'DELETE FROM "{tbl}" WHERE "Timestamp" < $1', first_ts)
+                            await oconn.copy_records_to_table(
+                                tbl, records=tuples_old, columns=old_cols)
+                        await oconn.execute(f'''
+                            DELETE FROM "{tbl}" t USING (
+                                SELECT "Timestamp",
+                                       row_number() OVER (
+                                           PARTITION BY ("Timestamp" / 86400)
+                                           ORDER BY COALESCE(volume, 0) DESC, "Timestamp" DESC
+                                       ) AS rn
+                                FROM "{tbl}"
+                            ) d
+                            WHERE t."Timestamp" = d."Timestamp" AND d.rn > 1
+                        ''')
+                    log(f"    ⏪ [BACKFILL-OLD] {symbol}: +{len(old_cs)} старых свечей")
+
+        if not cs:
+            # Свежих свечей биржа не дала — но гэпы в уже сохранённой
+            # истории всё равно нужно проверить и заделать.
+            if CHECK_AND_FILL_GAPS and current_db:
+                try:
+                    await fill_history_gaps(exchange, symbol, ccxt_id, tbl, current_db, bf_limit)
+                except Exception as e_g0:
+                    if DEBUG_ORDERBOOK:
+                        log(f"    ⚠️ [GAPS] {symbol}: проверка истории не удалась: {e_g0}")
+            return 0
+
+        df = pd.DataFrame(cs, columns=["ts", "open", "high", "low", "close", "volume"])
+        df["Timestamp"] = df["ts"] // 1000
+        df["ticker"], df["exchange"] = symbol, ccxt_id
+        df["volume_x_low"] = df["volume"] * df["low"]
+        df["volume_x_close"] = df["volume"] * df["close"]
+        # PERP-FIRST: ':' в символе => это перп (BTC/USDT:USDT).
+        is_swap = ":" in symbol
+        df["asset_type"] = "swap" if is_swap else "spot"
+        spot_url = get_exchange_url(ccxt_id, symbol)
+        swap_url = get_swap_url(ccxt_id, symbol)
+        if is_swap:
+            # Инструмент — перп; url_of_trading_pair ведёт на реальный (перп) рынок,
+            # колонку "swap if exists" оставляем NULL (сам он и есть swap).
+            df["url_of_trading_pair"] = swap_url if swap_url else None
+            df["url_of_swap_contract_if_it_exists"] = None
+        else:
+            df["url_of_trading_pair"] = spot_url if spot_url else None
+            df["url_of_swap_contract_if_it_exists"] = swap_url if swap_url else None
+
+        dt_utc = pd.to_datetime(df['Timestamp'], unit='s', utc=True)
+        df['open_time_msk'] = dt_utc.dt.tz_convert(MSK_TZ).dt.strftime("%Y-%m-%d %H:%M:%S")
+        df['open_time_almaty'] = dt_utc.dt.tz_convert(ALMATY_TZ).dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        if not current_db:
+            current_db = DB_LOW
+            async with db_pools[current_db].acquire() as conn:
+                cols = [f'"{c}" {t}' for c, t in ALL_COLUMNS_SQL.items()]
+                await conn.execute(f'CREATE TABLE "{tbl}" ({", ".join(cols)})')
+
+        async with db_pools[current_db].acquire() as conn:
+            actual_cols = list(ALL_COLUMNS_SQL.keys())
+            # Проверяем наличие колонок (migration)
+            existing_cols = {r['column_name'] for r in
+                             await conn.fetch("SELECT column_name FROM information_schema.columns WHERE table_name=$1",
+                                              tbl)}
+            for col in actual_cols:
+                if col not in existing_cols:
+                    await conn.execute(f'ALTER TABLE "{tbl}" ADD COLUMN "{col}" {ALL_COLUMNS_SQL[col]}')
+
+            tuples = [tuple(None if pd.isna(x) else x for x in row) for row in df[actual_cols].to_numpy()]
+
+            # Удаляем пересекающиеся дни (в т.ч. последний НЕЗАКРЫТЫЙ бар) и
+            # вставляем свежие — так последний день перезаписывается, а дублей нет.
+            # DELETE + COPY в одной транзакции, чтобы не потерять данные при сбое.
+            min_new_ts = int(df["Timestamp"].min())
+            async with conn.transaction():
+                await conn.execute(
+                    f'DELETE FROM "{tbl}" WHERE "Timestamp" >= $1', min_new_ts
+                )
+                await conn.copy_records_to_table(tbl, records=tuples, columns=actual_cols)
+
+                # ДЕДУП ПО ЛОГИЧЕСКОМУ ДНЮ: если в таблице оказались бары одного
+                # календарного дня UTC с РАЗНЫМ часом открытия (напр. старый 16:00
+                # и новый 00:00), оставляем ОДИН — с БОЛЬШИМ объёмом (полный бар).
+                # Это устраняет «задвоение» баров на графике на будущее.
+                await conn.execute(f'''
+                    DELETE FROM "{tbl}" t USING (
+                        SELECT "Timestamp",
+                               row_number() OVER (
+                                   PARTITION BY ("Timestamp" / 86400)
+                                   ORDER BY COALESCE(volume, 0) DESC, "Timestamp" DESC
+                               ) AS rn
+                        FROM "{tbl}"
+                    ) d
+                    WHERE t."Timestamp" = d."Timestamp" AND d.rn > 1
+                ''')
+
+        # ПРОВЕРКА НА ГЭПЫ: в сохранённой истории не должно быть пропущенных
+        # дней. Пропуски (сбой прошлого прогона, пропажа данных при переезде
+        # таблицы и т.п.) докачиваются с биржи и вставляются.
+        if CHECK_AND_FILL_GAPS:
+            try:
+                await fill_history_gaps(exchange, symbol, ccxt_id, tbl, current_db, bf_limit)
+            except Exception as e_g:
+                if DEBUG_ORDERBOOK:
+                    log(f"    ⚠️ [GAPS] {symbol}: проверка истории не удалась: {e_g}")
+
+        # Проверка на HIGH/LOW.
+        # ВАЖНО #1: считаем по последним MIN_DAYS_VOLUME_CHECK барам ИЗ БД, а не из df
+        # (df при часовом обновлении = 1-2 свежих бара, старое условие не срабатывало).
+        # ВАЖНО #2: ИСКЛЮЧАЕМ ТЕКУЩИЙ (незакрытый) день! Его объём неполный (день ещё
+        # идёт), и если его учитывать, у него будет заниженный volume*low → он станет
+        # минимумом → куча ЛИКВИДНЫХ монет ошибочно уехала бы в LOW. Дневной бар
+        # считаем ЗАКРЫТЫМ, только если прошло >= 86400 сек с его открытия
+        # (работает для любой биржи, включая htx с открытием в 16:00 UTC).
+        try:
+            closed_cutoff = int(time.time()) - 86400  # бары с Timestamp <= cutoff уже закрыты
+            async with db_pools[current_db].acquire() as vconn:
+                vrows = await vconn.fetch(
+                    f'SELECT low, volume FROM "{tbl}" '
+                    f'WHERE "Timestamp" <= $1 '
+                    f'ORDER BY "Timestamp" DESC LIMIT {MIN_DAYS_VOLUME_CHECK}',
+                    closed_cutoff,
+                )
+            if len(vrows) >= MIN_DAYS_VOLUME_CHECK:
+                vols = [
+                    (float(r["volume"]) if r["volume"] is not None else 0.0)
+                    * (float(r["low"]) if r["low"] is not None else 0.0)
+                    for r in vrows
+                ]
+                min_vol = min(vols) if vols else 0.0
+                target_db = DB_HIGH if min_vol >= HARD_FLOOR_USD else DB_LOW
+                if target_db != current_db:
+                    log(f"    🔄 MOVE {symbol} -> {'HIGH' if target_db==DB_HIGH else 'LOW'} (${min_vol:,.0f})")
+                    await move_table(tbl, current_db, target_db)
+                    current_db = target_db
+        except Exception as e_mv:
+            if DEBUG_ORDERBOOK:
+                log(f"    ⚠️ [MOVE] {symbol}: проверка HIGH/LOW не удалась: {e_mv}")
+
+        # ------------------------------------------------------------------
+        # НОВОЕ: снимок текущей книги ордеров / ленты и запись в ob_*-колонки.
+        # Считаем Герчиковский ATR по загруженным дневным барам, снимаем стакан
+        # и ленту, пишем в САМУЮ СВЕЖУЮ строку таблицы (в её актуальной БД).
+        # Любые ошибки здесь НЕ ломают апдейтер OHLCV.
+        # ------------------------------------------------------------------
+        if COLLECT_ORDERBOOK:
+            try:
+                # Полная история из БД нужна, чтобы ATR/мин.объём считались по
+                # всем барам, а не только по свежедобавленным.
+                async with db_pools[current_db].acquire() as rconn:
+                    hist = await rconn.fetch(
+                        f'SELECT "Timestamp", high, low, close, volume FROM "{tbl}" '
+                        f'ORDER BY "Timestamp" ASC'
+                    )
+                if hist:
+                    full_df = pd.DataFrame(
+                        hist, columns=["Timestamp", "high", "low", "close", "volume"]
+                    )
+                    g_atr = compute_gerchik_atr(
+                        full_df["high"].to_numpy(dtype=float),
+                        full_df["low"].to_numpy(dtype=float),
+                        full_df["close"].to_numpy(dtype=float),
+                    )
+                    snap = await fetch_orderbook_snapshot(exchange, symbol, g_atr)
+                    await save_orderbook_snapshot(current_db, tbl, full_df, snap)
+            except Exception as e_ob:
+                if DEBUG_ORDERBOOK:
+                    log(f"    ⚠️ [OB] {symbol}: снимок книги ордеров не удался: {e_ob}")
+
+        return len(cs)
+    except Exception as e:
+        return 0
+
+
+# ==========================================================================
+#   НОВОЕ: ГЛОБАЛЬНЫЙ ПРОГРЕСС + ETA ПО ВСЕМ БИРЖАМ ВМЕСТЕ
+# ==========================================================================
+# Раз в сколько обработанных пар (по всем биржам) писать строку прогресса.
+PROGRESS_LOG_EVERY: int = 25
+# Предварительно посчитать число пар на всех биржах, чтобы ETA был точным
+# с самого начала. Стоит один лишний load_markets на биржу в начале цикла.
+# False — total уточняется по ходу (ETA точнее ближе к концу).
+PRECOUNT_PAIRS: bool = True
+
+
+def _fmt_eta(seconds: float) -> str:
+    """Форматирует секунды в h:mm:ss / m:ss."""
+    try:
+        s = int(max(0, round(seconds)))
+    except Exception:
+        return "?"
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{sec:02d}"
+    return f"{m}:{sec:02d}"
+
+
+class GlobalProgress:
+    """
+    Единый прогресс по ВСЕМ биржам вместе (а не по каждой отдельно).
+
+    - total: суммарное число пар по всем биржам (может уточняться по ходу,
+             если предварительный подсчёт не делался).
+    - done:  сколько пар обработано суммарно.
+    - ETA считается от фактической скорости: elapsed/done * (total - done).
+    """
+    def __init__(self):
+        self.total = 0
+        self.done = 0
+        self.start_ts = time.time()
+        self.total_prefilled = False  # True, если total задан предподсчётом
+
+    def reset(self, total: int = 0):
+        self.total = total
+        self.done = 0
+        self.start_ts = time.time()
+        self.total_prefilled = total > 0
+
+    def set_total(self, total: int):
+        self.total = int(total)
+        self.total_prefilled = int(total) > 0
+
+    def add_to_total(self, n: int):
+        # Если total уже посчитан заранее (предподсчёт) — не удваиваем.
+        if self.total_prefilled:
+            return
+        self.total += int(n)
+
+    def tick(self) -> Tuple[int, int, str, float]:
+        """+1 к обработанным, вернуть (done, total, eta_str, percent)."""
+        self.done += 1
+        done, total = self.done, max(self.total, self.done)
+        elapsed = time.time() - self.start_ts
+        if done > 0 and total > done and elapsed > 0:
+            rate = done / elapsed                 # пар/сек по всем биржам
+            remaining = (total - done) / rate if rate > 0 else 0
+            eta_str = _fmt_eta(remaining)
+        elif done >= total:
+            eta_str = "0:00"
+        else:
+            eta_str = "?"
+        pct = (done / total * 100.0) if total > 0 else 0.0
+        return done, total, eta_str, pct
+
+
+# Глобальный экземпляр (создаётся в main на каждый цикл).
+GLOBAL_PROGRESS: Optional["GlobalProgress"] = None
+
+
+async def close_exchange_safely(exchange, name: str = "") -> None:
+    """
+    Надёжно освобождает ресурсы биржи при SOCKS5 (иначе aiohttp/ccxt пишут
+    'Unclosed client session' / 'requires to release all resources' из __del__).
+    Закрываем ВСЁ явно, а не только exchange.close().
+    """
+    try:
+        await exchange.close()
+    except Exception:
+        pass
+    try:
+        if getattr(exchange, "session", None) is not None:
+            try:
+                if getattr(exchange, "own_session", True):
+                    await exchange.session.close()
+            except Exception:
+                pass
+            exchange.session = None
+    except Exception:
+        pass
+    for attr in ("tcp_connector", "aiohttp_socks_connector"):
+        try:
+            conn = getattr(exchange, attr, None)
+            if conn is not None:
+                try:
+                    await conn.close()
+                except Exception:
+                    pass
+                setattr(exchange, attr, None)
+        except Exception:
+            pass
+    try:
+        sps = getattr(exchange, "socks_proxy_sessions", None)
+        if sps:
+            for url in list(sps):
+                try:
+                    await sps[url].close()
+                except Exception:
+                    pass
+            exchange.socks_proxy_sessions = None
+    except Exception:
+        try:
+            exchange.socks_proxy_sessions = None
+        except Exception:
+            pass
+    await asyncio.sleep(0.25)
+
+
+async def count_pairs_for_exchange(ccxt_name: str) -> int:
+    """
+    Быстрый предварительный подсчёт числа пар /USDT на бирже (для точного ETA
+    с самого начала). Загружает markets и сразу закрывает биржу.
+    При ошибке возвращает 0 (тогда ETA уточнится по ходу).
+    PERP-FIRST: считаются перпы + спот-без-перпов (select_symbols_for_exchange).
+    """
+    ccxt_id = EXCHANGE_MAP.get(ccxt_name, ccxt_name)
+    exchange = _make_exchange(ccxt_id)
+    try:
+        await exchange.load_markets()
+        syms = select_symbols_for_exchange(exchange.symbols, exchange.markets, ccxt_name)
+        return len(syms)
+    except Exception as e:
+        log(f"  [PRECOUNT] {ccxt_name}: не удалось посчитать пары: {e}")
+        return 0
+    finally:
+        await close_exchange_safely(exchange, ccxt_name)
+
+
+async def process_exchange(ccxt_name):
+    ccxt_id = EXCHANGE_MAP.get(ccxt_name, ccxt_name)
+    log(f"--- Exchange: {ccxt_name} ---")
+
+    # Решение ошибки multiple proxies: передаем только один тип
+    exchange = _make_exchange(ccxt_id)
+
+    try:
+        await exchange.load_markets()
+        # PERP-FIRST: перп, если есть; иначе спот.
+        syms = select_symbols_for_exchange(exchange.symbols, exchange.markets, ccxt_name)
+        total = len(syms)
+        sem = asyncio.Semaphore(CONCURRENT_PER_EXCHANGE)
+
+        # Регистрируем пары этой биржи в ГЛОБАЛЬНОМ прогрессе (все биржи вместе).
+        if GLOBAL_PROGRESS is not None:
+            GLOBAL_PROGRESS.add_to_total(total)
+
+        processed = 0
+
+        async def worker(s):
+            nonlocal processed
+            async with sem:
+                count = await process_pair(exchange, s, ccxt_name)
+                processed += 1
+                # Глобальный счётчик (по всем биржам сразу) + ETA.
+                if GLOBAL_PROGRESS is not None:
+                    g_done, g_total, eta_str, pct = GLOBAL_PROGRESS.tick()
+                    if count > 0 or g_done % PROGRESS_LOG_EVERY == 0:
+                        log(f"  [ALL {g_done}/{g_total} · {pct:.1f}% · ETA {eta_str}] "
+                            f"[{ccxt_name} {processed}/{total}] {s}: +{count} candles")
+                else:
+                    if count > 0 or processed % 50 == 0:
+                        log(f"  [{ccxt_name}] {processed}/{total} | {s}: +{count} candles")
+
+        await asyncio.gather(*[worker(s) for s in syms])
+    finally:
+        # --- Корректное освобождение ресурсов биржи ---
+        #
+        # Причина варнинга "requires to release all resources":
+        # ccxt.__del__ ругается, если self.session ИЛИ
+        # self.socks_proxy_sessions != None. Метод close() обнуляет
+        # socks_proxy_sessions САМЫМ ПОСЛЕДНИМ шагом, поэтому если
+        # внутри close() (на закрытии SOCKS-коннектора) вылетит
+        # исключение — поля не обнулятся и __del__ потом напечатает варнинг.
+        #
+        # Поэтому: НЕ глушим ошибку, а логируем её полностью (exc_info),
+        # и при сбое сами доводим освобождение ресурсов до конца, чтобы
+        # инвариант __del__ (оба поля == None) был соблюдён.
+        try:
+            await exchange.close()
+        except Exception:
+            logger.exception(f"  [CLOSE-ERROR] {ccxt_name}: exchange.close() упал, добиваю ресурсы вручную")
+            # Ручное закрытие в правильном порядке (как в ccxt.close),
+            # каждый шаг изолирован, чтобы дойти до обнуления обоих полей.
+            try:
+                if getattr(exchange, "session", None) is not None:
+                    if getattr(exchange, "own_session", True):
+                        await exchange.session.close()
+                    exchange.session = None
+            except Exception:
+                logger.exception(f"  [CLOSE-ERROR] {ccxt_name}: не удалось закрыть session")
+                exchange.session = None  # обнуляем, чтобы __del__ не ругался
+            try:
+                if getattr(exchange, "tcp_connector", None) is not None:
+                    await exchange.tcp_connector.close()
+                    exchange.tcp_connector = None
+                if getattr(exchange, "aiohttp_socks_connector", None) is not None:
+                    await exchange.aiohttp_socks_connector.close()
+                    exchange.aiohttp_socks_connector = None
+            except Exception:
+                logger.exception(f"  [CLOSE-ERROR] {ccxt_name}: не удалось закрыть connector")
+            try:
+                if getattr(exchange, "socks_proxy_sessions", None) is not None:
+                    for url in list(exchange.socks_proxy_sessions):
+                        try:
+                            await exchange.socks_proxy_sessions[url].close()
+                        except Exception:
+                            logger.exception(f"  [CLOSE-ERROR] {ccxt_name}: socks-сессия {url}")
+                    exchange.socks_proxy_sessions = None
+            except Exception:
+                logger.exception(f"  [CLOSE-ERROR] {ccxt_name}: не удалось закрыть socks_proxy_sessions")
+                exchange.socks_proxy_sessions = None  # обнуляем, чтобы __del__ не ругался
+
+        # Один тик loop'а: aiohttp с enable_cleanup_closed=True
+        # дозакрывает транспорты на следующей итерации event loop.
+        await asyncio.sleep(0.25)
+
+
+async def cleanup_duplicate_spot_tables() -> None:
+    """
+    Чистка спот-таблиц, замещённых перпами (perp-first).
+
+    Спот-таблица вида '<x>_usdt_on_<ex>' больше не обновляется, если для базы
+    выбран перп (таблица '<x>_usdt:usdt_on_<ex>'). Удаляем такую спот-таблицу,
+    ЕСЛИ её история НЕ длиннее перповой (min Timestamp спота >= перпового) —
+    смысла её хранить нет: актуальности она не получит, глубины не даёт.
+
+    Если спот-история ДЛИННЕЕ (KEEP_SPOT_IF_LONGER_HISTORY=True) — оставляем:
+    она хранит данные за период, которого у перпа ещё не существует.
+    """
+    if not CLEANUP_DUPLICATE_SPOT_TABLES:
+        return
+
+    log("=" * 60)
+    log("🧹 ЧИСТКА СПОТ-ТАБЛИЦ, ЗАМЕЩЁННЫХ ПЕРПАМИ (perp-first)")
+    log("=" * 60)
+
+    total_dropped = 0
+    for db, pool in db_pools.items():
+        dropped = 0
+        kept = 0
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema='public' AND table_name LIKE '%_on_%'"
+            )
+            names = {r["table_name"] for r in rows}
+            for tbl in sorted(names):
+                # Перп-таблицы имеют ':' в имени (xxx_usdt:usdt_on_ex) — их не трогаем.
+                if ":" in tbl:
+                    continue
+                # Спот-таблица: <pair>_on_<ex>, пара вида btc_usdt.
+                if "_on_" not in tbl:
+                    continue
+                pair_part, exch = tbl.rsplit("_on_", 1)
+                if not pair_part.endswith("_usdt"):
+                    continue
+                # Имя перп-таблицы той же монеты на той же бирже.
+                perp_tbl = pair_part[:-len("_usdt")] + "_usdt:usdt_on_" + exch
+                if perp_tbl not in names:
+                    continue  # перпа нет — спот актуален, оставляем
+
+                # Сравниваем глубину истории (min Timestamp обеих таблиц).
+                spot_min = await conn.fetchval(f'SELECT MIN("Timestamp") FROM "{tbl}"')
+                perp_min = await conn.fetchval(f'SELECT MIN("Timestamp") FROM "{perp_tbl}"')
+                if (KEEP_SPOT_IF_LONGER_HISTORY
+                        and spot_min is not None and perp_min is not None
+                        and spot_min < perp_min):
+                    kept += 1  # спот глубже перпа — архив длиннее перп-истории, храним
+                    continue
+
+                await conn.execute(f'DROP TABLE IF EXISTS "{tbl}" CASCADE')
+                dropped += 1
+                total_dropped += 1
+                if dropped <= 20 or dropped % 100 == 0:
+                    log(f"  🗑️ [{db}] DROP {tbl} (есть перп {perp_tbl}, история не длиннее)")
+        log(f"  ✅ [{db}] удалено спот-таблиц: {dropped}, оставлено длинных: {kept}")
+
+    log(f"✅ Чистка завершена. Всего удалено таблиц: {total_dropped}")
+    log("=" * 60)
+
+
+async def main():
+    for db in [DB_HIGH, DB_LOW]:
+        c = await asyncpg.connect(user=db_config.user, password=db_config.password, host=db_config.host,
+                                  port=db_config.port, database="postgres")
+        if not await c.fetchval("SELECT 1 FROM pg_database WHERE datname = $1", db):
+            await c.execute(f'CREATE DATABASE "{db}"')
+        await c.close()
+
+    await init_db_pools()
+
+    global GLOBAL_PROGRESS
+    while True:
+        # Новый прогресс на КАЖДЫЙ цикл (по всем биржам сразу).
+        GLOBAL_PROGRESS = GlobalProgress()
+
+        # Предподсчёт общего числа пар по всем биржам → точный ETA с самого старта.
+        if PRECOUNT_PAIRS:
+            log("Предварительный подсчёт пар по всем биржам...")
+            counts = await asyncio.gather(*[count_pairs_for_exchange(eid)
+                                            for eid in EXCHANGE_MAP.keys()])
+            grand_total = sum(counts)
+            GLOBAL_PROGRESS.reset(grand_total)
+            log(f"Всего пар к обработке (все биржи): {grand_total}")
+        else:
+            GLOBAL_PROGRESS.reset(0)
+
+        cycle_start = time.time()
+        # ВСЕ БИРЖИ ПАРАЛЛЕЛЬНО: у каждой свой объект ccxt со своим throttler
+        # (enableRateLimit=True) и свой семафор CONCURRENT_PER_EXCHANGE —
+        # рейт лимит соблюдается независимо на КАЖДОЙ бирже, а общее время
+        # цикла = время самой медленной биржи вместо суммы всех.
+        results = await asyncio.gather(
+            *[process_exchange(eid) for eid in EXCHANGE_MAP.keys()],
+            return_exceptions=True,
+        )
+        for eid, res in zip(EXCHANGE_MAP.keys(), results):
+            if isinstance(res, Exception):
+                log(f"  [CRITICAL] {eid} failed: {res}")
+
+        # Чистим замороженные спот-таблицы, замещённые перпами (perp-first).
+        # ВЫЗЫВАЕТСЯ В КОНЦЕ ЦИКЛА: к этому моменту все перп-таблицы уже
+        # скачаны (в т.ч. свежесозданные — с полным бэкофиллом истории),
+        # поэтому спот-дубликаты удаляются в том же прогоне, а не со следующего.
+        await cleanup_duplicate_spot_tables()
+
+        elapsed = time.time() - cycle_start
+        log(f"Cycle complete. Обработано {GLOBAL_PROGRESS.done}/{GLOBAL_PROGRESS.total} "
+            f"пар по всем биржам за {_fmt_eta(elapsed)}. Waiting 1 hour.")
+        await asyncio.sleep(UPDATE_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        sys.exit(0)
+
