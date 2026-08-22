@@ -9,8 +9,6 @@ Performance-first design:
   pairs is instant instead of re-scanning every table in the 4 databases.
 * The summary scan runs tables in parallel through an asyncpg connection pool.
 * Charts load only the last N candles (configurable), never the full history.
-* Rolling ATR channels are computed with the O(n) `compute_rolling_atr_no_paranormal_bars`
-  instead of re-scanning the full prefix on every bar (O(n^2)).
 * Live orderbook data never blocks the charts: charts render first, then metrics.
 
 Layout: the Charts tab is first — 15m chart on top, 1D chart below, with
@@ -31,10 +29,7 @@ import streamlit.components.v1 as components
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from config.settings import settings
-from src.analytics.atr_filtered import (
-    compute_atr_no_paranormal_bars,
-    compute_rolling_atr_no_paranormal_bars,
-)
+from src.analytics.atr_filtered import compute_atr_no_paranormal_bars
 from src.analytics.orderbook import fetch_orderbook_snapshot
 from src.exchanges.client import create_exchange, close_exchange_safely
 from dashboard.helpers import (
@@ -227,10 +222,9 @@ def get_candles(timeframe: str, row: dict, limit: int, demo: bool) -> pd.DataFra
 # Charts
 # ---------------------------------------------------------------------------
 
-def build_series_payloads(hist_df: pd.DataFrame, atr_days: int):
+def build_series_payloads(hist_df: pd.DataFrame):
     """
-    Builds lightweight-charts payloads (int-epoch times) plus the O(n) rolling
-    ATR array. Returns (candles, volume_data, upper_atr, lower_atr, atr_array).
+    Builds lightweight-charts payloads (int-epoch times): candles + volume.
     """
     t = hist_df["ts"].to_numpy(dtype=np.int64)
     o = hist_df["open"].to_numpy(dtype=float)
@@ -238,13 +232,6 @@ def build_series_payloads(hist_df: pd.DataFrame, atr_days: int):
     l = hist_df["low"].to_numpy(dtype=float)
     c = hist_df["close"].to_numpy(dtype=float)
     v = np.nan_to_num(hist_df["volume"].to_numpy(dtype=float))
-
-    atr_arr = compute_rolling_atr_no_paranormal_bars(
-        h, l, c,
-        period=atr_days,
-        small_threshold=settings.atr_small_threshold,
-        large_threshold=settings.atr_large_threshold,
-    )
 
     candles = [
         {"time": int(t[i]), "open": float(o[i]), "high": float(h[i]), "low": float(l[i]), "close": float(c[i])}
@@ -258,22 +245,13 @@ def build_series_payloads(hist_df: pd.DataFrame, atr_days: int):
         }
         for i in range(len(t))
     ]
-    upper_atr = [
-        {"time": int(t[i]), "value": float(c[i] + atr_arr[i])}
-        for i in range(len(t)) if atr_arr[i] > 0
-    ]
-    lower_atr = [
-        {"time": int(t[i]), "value": float(max(0.0, c[i] - atr_arr[i]))}
-        for i in range(len(t)) if atr_arr[i] > 0
-    ]
-    return candles, volume_data, upper_atr, lower_atr, atr_arr
+    return candles, volume_data
 
 
 def render_tradingview_lightweight_chart(
     hist_df: pd.DataFrame,
     ticker: str,
     exchange: str,
-    atr_days: int,
     tf_label: str,
     chart_height: int = 470,
     chart_style: str = "OHLCV Bars",
@@ -283,9 +261,9 @@ def render_tradingview_lightweight_chart(
     volume histogram, crosshair tooltips, and fast rolling ATR channels."""
     if hist_df is None or hist_df.empty:
         st.info(f"No {tf_label} candles available for {ticker} ({exchange}).")
-        return None
+        return
 
-    candles, volume_data, upper_atr, lower_atr, atr_arr = build_series_payloads(hist_df, atr_days)
+    candles, volume_data = build_series_payloads(hist_df)
 
     if chart_style == "OHLCV Bars":
         series_js_code = """
@@ -314,12 +292,10 @@ def render_tradingview_lightweight_chart(
         <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
         <style>
             body {{ margin: 0; padding: 0; background-color: #131722; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; }}
-            #chart-title {{ color: #d1d4dc; font-size: 15px; font-weight: 600; padding: 8px 15px 4px 15px; }}
             #tv-chart {{ width: 100%; height: {chart_height}px; }}
         </style>
     </head>
     <body>
-        <div id="chart-title">📈 {ticker} ({exchange.upper()}) — {tf_label} — {chart_style} — ATR Channels ({atr_days} bars)</div>
         <div id="tv-chart"></div>
         <script>
             const chartElement = document.getElementById('tv-chart');
@@ -358,22 +334,6 @@ def render_tradingview_lightweight_chart(
             }});
             volumeSeries.setData({dumps(volume_data)});
 
-            const upperAtrSeries = chart.addLineSeries({{
-                color: '#ff9800',
-                lineWidth: 2,
-                lineStyle: LightweightCharts.LineStyle.Dashed,
-                title: 'Upper ATR Band',
-            }});
-            upperAtrSeries.setData({dumps(upper_atr)});
-
-            const lowerAtrSeries = chart.addLineSeries({{
-                color: '#ff9800',
-                lineWidth: 2,
-                lineStyle: LightweightCharts.LineStyle.Dashed,
-                title: 'Lower ATR Band',
-            }});
-            lowerAtrSeries.setData({dumps(lower_atr)});
-
             chart.timeScale().fitContent();
 
             window.addEventListener('resize', () => {{
@@ -383,8 +343,7 @@ def render_tradingview_lightweight_chart(
     </body>
     </html>
     """
-    _html_component(html_code, chart_height + 45)
-    return atr_arr
+    _html_component(html_code, chart_height + 10)
 
 
 def render_tradingview_official_widget(ticker: str, exchange: str, interval: str = "D", style_code: str = "0"):
@@ -418,21 +377,11 @@ def render_tradingview_official_widget(ticker: str, exchange: str, interval: str
     _html_component(html_code, 550)
 
 
-def render_plotly_chart(hist_df: pd.DataFrame, ticker: str, exchange: str, atr_days: int, tf_label: str, chart_style: str):
-    """Plotly dark chart with fast rolling ATR channels."""
+def render_plotly_chart(hist_df: pd.DataFrame, ticker: str, exchange: str, tf_label: str, chart_style: str):
+    """Plotly dark price chart."""
     if hist_df is None or hist_df.empty:
         st.info(f"No {tf_label} candles available for {ticker} ({exchange}).")
-        return None
-
-    closes = hist_df["close"].to_numpy(dtype=float)
-    atr_arr = compute_rolling_atr_no_paranormal_bars(
-        hist_df["high"].to_numpy(dtype=float),
-        hist_df["low"].to_numpy(dtype=float),
-        closes,
-        period=atr_days,
-        small_threshold=settings.atr_small_threshold,
-        large_threshold=settings.atr_large_threshold,
-    )
+        return
 
     fig = go.Figure()
     if chart_style == "OHLCV Bars":
@@ -446,23 +395,13 @@ def render_plotly_chart(hist_df: pd.DataFrame, ticker: str, exchange: str, atr_d
             low=hist_df["low"], close=hist_df["close"], name="Candlesticks"
         ))
 
-    fig.add_trace(go.Scatter(
-        x=hist_df["time"], y=closes + atr_arr, mode="lines",
-        name=f"Upper ATR Channel ({atr_days})", line=dict(color="orange", dash="dash")
-    ))
-    fig.add_trace(go.Scatter(
-        x=hist_df["time"], y=closes - atr_arr, mode="lines",
-        name=f"Lower ATR Channel ({atr_days})", line=dict(color="orange", dash="dash")
-    ))
-
     fig.update_layout(
-        title=f"{ticker} ({exchange}) — {tf_label} — ATR without Paranormal Bars ({atr_days})",
+        title=f"{ticker} ({exchange}) — {tf_label} — {chart_style}",
         xaxis_rangeslider_visible=False,
         template="plotly_dark",
         height=500,
     )
     st.plotly_chart(fig, width="stretch")
-    return atr_arr
 
 
 # ---------------------------------------------------------------------------
@@ -498,11 +437,21 @@ if st.sidebar.button("🔄 Refresh data (clear caches)"):
     fetch_live_cached.clear()
     st.rerun()
 
-st.title("⚡ Timescale Crypto OHLCV Collector — Dashboard")
+# Compact layout: no big page title — charts come first with minimal top padding
+st.markdown(
+    """
+    <style>
+        .block-container {padding-top: 0.6rem !important; padding-bottom: 0.5rem !important;}
+        .stTabs [data-baseweb="tab-list"] {gap: 6px; margin-bottom: 4px; height: 38px;}
+        .stTabs [data-baseweb="tab"] {font-size: 14px; padding: 4px 12px;}
+        h3 {margin-top: 0.2rem !important;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 if demo_mode:
-    st.markdown("🧪 **Demo mode** — synthetic data (no database). Uncheck in the sidebar to connect to TimescaleDB.")
-else:
-    st.markdown("Connected to the **4 Historical Databases** (summaries cached 10 min, candles cached 60 s).")
+    st.caption("🧪 Demo mode — synthetic data (uncheck in sidebar to connect to TimescaleDB)")
 
 # ---------------------------------------------------------------------------
 # Load summaries for BOTH timeframes (cached)
@@ -524,20 +473,6 @@ if df_15m.empty and df_1d.empty:
     )
     st.stop()
 
-# Top metrics row
-with st.container():
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Total Pair Tables (1D)", f"{len(df_1d):,}")
-    col2.metric("Total Pair Tables (15M)", f"{len(df_15m):,}")
-    col3.metric("Liquid HIGH Tier (1D)", f"{0 if df_1d.empty else len(df_1d[df_1d['volume_tier'] == 'HIGH']):,}")
-    col4.metric("Active Exchanges (1D)", 0 if df_1d.empty else len(df_1d["exchange"].dropna().unique()))
-    col5.metric(
-        "Vitality Grade A/B (1D)",
-        0 if df_1d.empty else len(df_1d[df_1d["ob_vitality_grade"].isin(["A", "B"])]),
-    )
-
-st.markdown("---")
-
 # ---------------------------------------------------------------------------
 # Tabs: charts first
 # ---------------------------------------------------------------------------
@@ -556,38 +491,53 @@ TICKER_OPTIONS = _unique_sorted(
     + ([] if df_1d.empty else df_1d["ticker"].dropna().tolist())
 )
 
+
+def _nav(delta: int):
+    """
+    Queues a Prev/Next pair switch and reruns.
+    The pending value is applied BEFORE the selectbox (key="sym_ticker") is
+    instantiated on the next run — directly modifying st.session_state.sym_ticker
+    after widget creation raises StreamlitAPIException.
+    """
+    st.session_state.nav_ticker = shift_option(TICKER_OPTIONS, st.session_state.get("sym_ticker"), delta)
+    st.rerun()
+
 with tab_charts:
-    # --- Pair selection row with Prev / Next -------------------------------
+    # --- Pair selection row with Prev / Next (compact, single row) -----------
     nav_l, sel_c, sel_e, nav_r = st.columns([1, 3, 2, 1])
 
     if "sym_ticker" not in st.session_state or st.session_state.sym_ticker not in TICKER_OPTIONS:
         st.session_state.sym_ticker = TICKER_OPTIONS[0]
 
+    # Apply pending Prev/Next navigation BEFORE the pair selectbox is instantiated
+    pending = st.session_state.pop("nav_ticker", None)
+    if pending in TICKER_OPTIONS:
+        st.session_state.sym_ticker = pending
+
     with nav_l:
-        if st.button("◀ Prev", key="sel_prev", use_container_width=True, help="Previous pair"):
-            st.session_state.sym_ticker = shift_option(TICKER_OPTIONS, st.session_state.sym_ticker, -1)
-            st.rerun()
+        if st.button("◀", key="sel_prev", use_container_width=True, help="Previous pair"):
+            _nav(-1)
     with nav_r:
-        if st.button("Next ▶", key="sel_next", use_container_width=True, help="Next pair"):
-            st.session_state.sym_ticker = shift_option(TICKER_OPTIONS, st.session_state.sym_ticker, +1)
-            st.rerun()
+        if st.button("▶", key="sel_next", use_container_width=True, help="Next pair"):
+            _nav(+1)
 
     with sel_c:
-        sym_ticker = st.selectbox("Pair", options=TICKER_OPTIONS, key="sym_ticker")
+        sym_ticker = st.selectbox("Pair", options=TICKER_OPTIONS, key="sym_ticker", label_visibility="collapsed")
     with sel_e:
         ex_opts = _unique_sorted(exchanges_for_ticker(df_15m, sym_ticker) + exchanges_for_ticker(df_1d, sym_ticker))
         if not ex_opts or st.session_state.get("sym_ex") not in ex_opts:
             st.session_state.sym_ex = ex_opts[0] if ex_opts else None
-        sym_ex = st.selectbox("Exchange", options=ex_opts, key="sym_ex")
+        sym_ex = st.selectbox("Exchange", options=ex_opts, key="sym_ex", label_visibility="collapsed")
 
-    # --- Chart option row ----------------------------------------------------
-    opt1, opt2, opt3 = st.columns([2, 2, 2])
-    atr_days = opt1.slider("🎯 ATR Period (bars)", min_value=1, max_value=30, value=5, step=1)
-    chart_engine = opt2.selectbox(
-        "📈 Chart Engine",
-        options=["TradingView Lightweight Canvas", "TradingView Official Widget", "Plotly Dark"],
-    )
-    chart_style = opt3.selectbox("📊 Chart Style", options=["OHLCV Bars", "Candlesticks"], index=0)
+    # --- Chart options (collapsed by default to save vertical space) ---------
+    with st.expander("⚙️ Chart options", expanded=False):
+        opt1, opt2, opt3 = st.columns([2, 2, 2])
+        atr_days = opt1.slider("🎯 ATR Period (bars)", min_value=1, max_value=30, value=5, step=1)
+        chart_engine = opt2.selectbox(
+            "📈 Chart Engine",
+            options=["TradingView Lightweight Canvas", "TradingView Official Widget", "Plotly Dark"],
+        )
+        chart_style = opt3.selectbox("📊 Chart Style", options=["OHLCV Bars", "Candlesticks"], index=0)
 
     # Resolve table rows per timeframe (same exchange preferred)
     row_15m = find_table_row(df_15m, sym_ticker, sym_ex)
@@ -607,11 +557,9 @@ with tab_charts:
             st.markdown("<div style='height:180px'></div>", unsafe_allow_html=True)
 
         if prev_hit:
-            st.session_state.sym_ticker = shift_option(TICKER_OPTIONS, st.session_state.sym_ticker, -1)
-            st.rerun()
+            _nav(-1)
         if next_hit:
-            st.session_state.sym_ticker = shift_option(TICKER_OPTIONS, st.session_state.sym_ticker, +1)
-            st.rerun()
+            _nav(+1)
 
         with center:
             if row is None:
@@ -621,8 +569,8 @@ with tab_charts:
             hist_df = get_candles(tf_label, row, limit, demo_mode)
 
             if chart_engine == "TradingView Lightweight Canvas":
-                return render_tradingview_lightweight_chart(
-                    hist_df, sym_ticker, sym_ex, atr_days, tf_label,
+                render_tradingview_lightweight_chart(
+                    hist_df, sym_ticker, sym_ex, tf_label,
                     chart_style=chart_style,
                 )
             elif chart_engine == "TradingView Official Widget":
@@ -630,21 +578,27 @@ with tab_charts:
                 render_tradingview_official_widget(sym_ticker, sym_ex, interval=interval, style_code=style_code)
                 return None
             else:
-                return render_plotly_chart(hist_df, sym_ticker, sym_ex, atr_days, tf_label, chart_style)
+                render_plotly_chart(hist_df, sym_ticker, sym_ex, tf_label, chart_style)
 
     # 15 MINUTES chart — first, on top
-    st.markdown(f"### ⏱ 15m — {sym_ticker}")
+    st.markdown(
+        f"<div style='font-size:15px;margin:2px 0 2px 6px;'>⏱ <b>{sym_ticker}</b> · 15m · {sym_ex}</div>",
+        unsafe_allow_html=True,
+    )
     _render_tf_chart(row_15m, "15m", limit_15m, interval="15")
 
-    st.markdown("---")
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
     # 1 DAY chart — below
-    st.markdown(f"### 📅 1D — {sym_ticker}")
-    atr_1d_arr = _render_tf_chart(row_1d, "1D", limit_1d, interval="D")
+    st.markdown(
+        f"<div style='font-size:15px;margin:2px 0 2px 6px;'>📅 <b>{sym_ticker}</b> · 1D · {sym_ex}</div>",
+        unsafe_allow_html=True,
+    )
+    _render_tf_chart(row_1d, "1D", limit_1d, interval="D")
 
     # --- Live market & orderbook metrics (below charts, never blocks them) ---
     st.markdown("---")
-    st.markdown("### 🔴 Live Market & Orderbook Metrics")
+    st.markdown("#### 🔴 Live Market & Orderbook Metrics")
 
     hist_1d = None
     if row_1d is not None:
@@ -695,7 +649,7 @@ with tab_charts:
     mcol4.metric("Spread % of ATR", f"{spread_atr_pct:.2f}%", delta=f"Relative to {atr_days}d ATR")
     mcol5.metric("Vitality Score", f"{g('ob_vitality_score'):.1f} / 10", delta=f"Grade {src.get('ob_vitality_grade', 'N/A')}")
 
-    st.markdown("#### 📖 Live Orderbook & Trade Tape Metrics")
+    st.markdown("##### 📖 Live Orderbook & Trade Tape Metrics")
     dcol1, dcol2, dcol3, dcol4 = st.columns(4)
     dcol1.metric(
         "Total Depth (±1% $)", f"${g('ob_total_depth_usd'):,.2f}",
@@ -706,6 +660,16 @@ with tab_charts:
     dcol4.metric("Trade Activity", f"{g('ob_trades_per_min'):.1f} trades/min")
 
 with tab_liquidity:
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Total Pair Tables (1D)", f"{len(df_1d):,}")
+    col2.metric("Total Pair Tables (15M)", f"{len(df_15m):,}")
+    col3.metric("Liquid HIGH Tier (1D)", f"{0 if df_1d.empty else len(df_1d[df_1d['volume_tier'] == 'HIGH']):,}")
+    col4.metric("Active Exchanges (1D)", 0 if df_1d.empty else len(df_1d["exchange"].dropna().unique()))
+    col5.metric(
+        "Vitality Grade A/B (1D)",
+        0 if df_1d.empty else len(df_1d[df_1d["ob_vitality_grade"].isin(["A", "B"])]),
+    )
+
     st.subheader(f"Liquidity & Orderbook Metrics Table ({table_tf})")
 
     if df_table.empty:
@@ -769,8 +733,8 @@ with tab_info:
     The Charts tab renders the **15m chart on top and the 1D chart below** for the selected pair,
     with **⏪ Prev / Next ⏭** buttons flanking every chart. Table summaries are cached for 10 minutes,
     candle frames for 60 seconds, and each chart loads only the last N candles (configurable in the
-    sidebar) — so switching pairs is effectively instant. Historical ATR channels use the O(n)
-    rolling implementation of the filtered ATR.
+    sidebar) — so switching pairs is effectively instant. The filtered ATR value itself is still
+    computed live for the metrics cards below the charts.
 
     ---
 
