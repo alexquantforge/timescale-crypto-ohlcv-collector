@@ -60,7 +60,8 @@ class MarketDataEngine:
 
     def get_configured_exchanges(self) -> List[str]:
         """Returns list of allowed exchanges filtered by ALLOWED_EXCHANGES setting."""
-        ex_keys = list(settings.exchange_map.keys())
+        exchange_map = settings.exchange_map_15m if self.timeframe == "15m" else settings.exchange_map_1d
+        ex_keys = list(exchange_map.keys())
         if settings.allowed_exchanges:
             allowed = set(settings.allowed_exchanges)
             ex_keys = [k for k in ex_keys if k in allowed]
@@ -204,9 +205,9 @@ class MarketDataEngine:
             # --- Check Volume Floor & Move Table (HIGH <-> LOW) ---
             if current_db:
                 floor_usd = (
-                    settings.hard_floor_usd / 4.0
+                    settings.hard_floor_usd_15m
                     if self.timeframe == "15m"
-                    else settings.hard_floor_usd
+                    else settings.hard_floor_usd_1d
                 )
                 current_db = await self.repository.check_volume_floor_and_move(
                     table_name=tbl_name,
@@ -281,7 +282,8 @@ class MarketDataEngine:
 
     async def precount_exchange_pairs(self, ccxt_name: str) -> int:
         """Counts symbols for exchange using Perp-First selection."""
-        ccxt_id = settings.exchange_map.get(ccxt_name, ccxt_name)
+        exchange_map = settings.exchange_map_15m if self.timeframe == "15m" else settings.exchange_map_1d
+        ccxt_id = exchange_map.get(ccxt_name, ccxt_name)
         exchange = create_exchange(ccxt_id)
         try:
             await asyncio.wait_for(exchange.load_markets(), timeout=12.0)
@@ -295,7 +297,8 @@ class MarketDataEngine:
 
     async def process_exchange(self, ccxt_name: str) -> None:
         """Processes all selected symbols for an exchange in parallel."""
-        ccxt_id = settings.exchange_map.get(ccxt_name, ccxt_name)
+        exchange_map = settings.exchange_map_15m if self.timeframe == "15m" else settings.exchange_map_1d
+        ccxt_id = exchange_map.get(ccxt_name, ccxt_name)
         logger.info(f"--- Processing Exchange: {ccxt_name} ({ccxt_id}) [{self.timeframe}] ---")
 
         exchange = create_exchange(ccxt_id)
@@ -370,9 +373,9 @@ class MarketDataEngine:
         """Starts continuous execution loop."""
         await self.initialize()
         interval = (
-            300
+            settings.update_interval_seconds_15m
             if self.timeframe == "15m"
-            else settings.update_interval_seconds
+            else settings.update_interval_seconds_1d
         )
         while True:
             try:

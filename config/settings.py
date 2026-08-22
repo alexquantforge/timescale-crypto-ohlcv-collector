@@ -63,6 +63,7 @@ class Settings(BaseSettings):
     # Timeframe & Data Retention
     timeframe: str = Field(default="1d", alias="TIMEFRAME")  # "1d" or "15m"
     data_retention_days: int = Field(default=180, alias="DATA_RETENTION_DAYS")  # 180 days retention for 15m
+    update_days: int = Field(default=10, alias="UPDATE_DAYS")  # how many days back to fetch per update
 
     # Exchange Mapping for 1D (all 9 exchanges)
     exchange_map_1d: Dict[str, str] = {
@@ -85,6 +86,9 @@ class Settings(BaseSettings):
         "okx": "okx",
         "bingx": "bingx",
     }
+
+    # Optional whitelist of exchanges to run (empty = all exchanges from the map)
+    allowed_exchanges: List[str] = Field(default_factory=list, alias="ALLOWED_EXCHANGES")
 
     # Volume & Liquidity Tiering Thresholds
     hard_floor_usd_1d: float = Field(default=500000.0, alias="HARD_FLOOR_USD_1D")  # $500k USD for 1d
@@ -113,6 +117,8 @@ class Settings(BaseSettings):
         "coinex": 1000,
         "okx": 100,
     }
+
+    gap_max_pages_per_range: int = Field(default=50, alias="GAP_MAX_PAGES_PER_RANGE")  # max OHLCV pages per gap fill
 
     check_and_fill_gaps: bool = Field(default=True, alias="CHECK_AND_FILL_GAPS")
     gap_tolerance_sec_15m: int = Field(default=1800, alias="GAP_TOLERANCE_SEC_15M")  # 30 min tolerance
