@@ -105,12 +105,13 @@ async def load_table_history(db_host, db_port, db_user, db_pass, db_name, table_
         return pd.DataFrame()
 
 
-async def fetch_live_orderbook_data(ticker: str, exchange_name: str, atr_days: int, hist_df: pd.DataFrame):
+async def fetch_live_orderbook_data(ticker: str, exchange_name: str, atr_days: int, hist_df: pd.DataFrame, timeframe: str = "1d"):
     """
     Fetches live market data (price, orderbook depth, spread, trades) directly from exchange
     and calculates dynamic ATR without paranormal bars for user-selected period (atr_days).
     """
-    ccxt_id = settings.exchange_map.get(exchange_name, exchange_name)
+    exchange_map = settings.exchange_map_15m if timeframe == "15m" else settings.exchange_map_1d
+    ccxt_id = exchange_map.get(exchange_name, exchange_name)
     
     atr_val = 0.0
     if not hist_df.empty and len(hist_df) >= 3:
@@ -387,7 +388,7 @@ else:
 
         st.dataframe(
             filtered_df[available_cols].sort_values(by="ob_vitality_score", ascending=False),
-            use_container_width=True,
+            width="stretch",
             column_config={
                 "close": st.column_config.NumberColumn("Close Price", format="$%.4f"),
                 "ob_spread_pct": st.column_config.NumberColumn("Spread %", format="%.3f%%"),
@@ -431,7 +432,7 @@ else:
             hist_df = asyncio.run(load_table_history(db_host, db_port, db_user, db_pass, db_name, tbl_name))
 
             with st.spinner(f"Fetching Live Market Orderbook & Price for {sym_ticker} on {sym_ex}..."):
-                snap, atr_val = asyncio.run(fetch_live_orderbook_data(sym_ticker, sym_ex, atr_days, hist_df))
+                snap, atr_val = asyncio.run(fetch_live_orderbook_data(sym_ticker, sym_ex, atr_days, hist_df, timeframe=selected_tf))
 
             if snap:
                 best_bid = snap.get("ob_best_bid", 0.0)
@@ -555,7 +556,7 @@ else:
                         template="plotly_dark",
                         height=550,
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
     with tab3:
         st.subheader("ℹ️ Methodology & Key Algorithms")
