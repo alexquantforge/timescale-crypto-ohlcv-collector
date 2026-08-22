@@ -18,6 +18,7 @@ Async Crypto Market Data Collector (**Perpetual Swaps & Spot Markets**) with Fil
 * 📈 **L2/L3 Orderbook & Trade Tape Snapshots:** Computes spread tightness (% relative to ATR without paranormal bars), orderbook depth (Bid/Ask/Total USD), Cumulative Volume Delta (CVD & 5m CVD), and liquidity grade (**Vitality Score A–F**).
 * 🔀 **Dynamic Liquidity Tiering:** Classifies coins into `HIGH` ($\ge \$500,000$ USD/day) and `LOW` volume tiers.
 * 🌐 **Interactive Web Dashboard:** Streamlit dashboard featuring Plotly & **TradingView Lightweight Charts** (OHLCV Bars & Candlesticks) with volatility channels, metric tables, and multi-exchange filters.
+* ⚡ **Fast Dual-Timeframe Charts:** the Charts tab shows the **15m chart on top and the 1D chart below** with **⏪ Prev / Next ⏭** buttons flanking every chart. Table summaries are cached 10 min, candle frames 60 s, and each chart loads only the last N candles — pair switching is effectively instant. Historical ATR channels use an O(n) rolling implementation of the filtered ATR (`compute_rolling_atr_no_paranormal_bars`).
 
 ---
 
