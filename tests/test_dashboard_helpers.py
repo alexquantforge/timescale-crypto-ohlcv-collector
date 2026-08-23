@@ -78,3 +78,79 @@ def test_demo_generators_shape_and_determinism():
         # Deterministic for the same seed inputs
         candles2 = generate_demo_candles(tf, "BTC/USDT:USDT", "bybit", n=300)
         pd.testing.assert_frame_equal(candles, candles2)
+
+
+# ---------------------------------------------------------------------------
+# Health strip
+# ---------------------------------------------------------------------------
+
+def test_health_score_boundaries():
+    from dashboard.helpers import (
+        score_trades_per_min, score_depth_usd, score_spread_atr_pct, score_min_volume_usd,
+    )
+
+    assert score_trades_per_min(0) == 0.0
+    assert score_trades_per_min(60) == 0.5
+    assert score_trades_per_min(500) == 1.0
+    assert score_trades_per_min(None) == 0.0
+
+    assert score_depth_usd(500) == 0.0
+    assert score_depth_usd(50_000) == 1.0
+    assert score_depth_usd(2_000_000) == 1.0
+
+    assert score_spread_atr_pct(3.0) == 1.0
+    assert score_spread_atr_pct(5.0) == 1.0   # user criterion: <5% of daily ATR = green
+    assert score_spread_atr_pct(10.0) == 0.5
+    assert score_spread_atr_pct(25.0) == 0.0
+
+    assert score_min_volume_usd(50_000) == 0.0
+    assert score_min_volume_usd(500_000) == 1.0
+    assert score_min_volume_usd(None) == 0.0
+
+
+def test_fmt_usd_compact():
+    from dashboard.helpers import fmt_usd_compact
+    assert fmt_usd_compact(1_500_000) == "$1.5M"
+    assert fmt_usd_compact(850_000) == "$850K"
+    assert fmt_usd_compact(950) == "$950"
+    assert fmt_usd_compact(2_300_000_000) == "$2.3B"
+    assert fmt_usd_compact(None) == "n/a"
+
+
+def test_build_health_strip_html_chips_and_colors():
+    from dashboard.helpers import build_health_strip_html
+    row = {
+        "ob_trades_per_min": 55.0,
+        "ob_total_depth_usd": 120_000.0,
+        "ob_spread_atr_pct": 2.1,
+        "ob_min_7d_volume_usd": 700_000.0,
+    }
+    html = build_health_strip_html(row)
+    for label in ["Tape", "Depth", "Spread", "Min 7d"]:
+        assert label in html
+    assert "55/min" in html and "$120K" in html and "2.1%" in html and "$700K" in html
+    # green chips present (score 1 -> hsl(140))
+    assert "hsl(140" in html
+    assert "DEAD" not in html
+
+
+def test_build_health_strip_dead_market():
+    from dashboard.helpers import build_health_strip_html
+    row = {
+        "ob_trades_per_min": 1.2,
+        "ob_total_depth_usd": 400.0,
+        "ob_spread_atr_pct": 30.0,
+        "ob_min_7d_volume_usd": 20_000.0,
+        "ob_is_barcode": False,
+    }
+    html = build_health_strip_html(row)
+    assert "DEAD" in html
+    # red chips (score ~0 -> hsl(0))
+    assert "hsl(0" in html
+
+
+def test_build_health_strip_empty_row_is_safe():
+    from dashboard.helpers import build_health_strip_html
+    html = build_health_strip_html({})
+    assert html.count("n/a") >= 3
+    assert "hsl(0" in html

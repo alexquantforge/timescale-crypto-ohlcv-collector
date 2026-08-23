@@ -38,6 +38,7 @@ from dashboard.helpers import (
     find_table_row,
     generate_demo_summary,
     generate_demo_candles,
+    build_health_strip_html,
 )
 
 st.set_page_config(
@@ -61,7 +62,7 @@ SUMMARY_COLUMNS = """
     ob_spread_abs, ob_spread_pct, ob_spread_atr_pct, ob_atr_no_paranormal,
     ob_best_bid, ob_best_ask, ob_bid_depth_usd, ob_ask_depth_usd,
     ob_cvd_5m, ob_total_depth_usd, ob_min_7d_volume_usd,
-    ob_imbalance, ob_trades_per_min, ob_buy_pressure_pct
+    ob_imbalance, ob_trades_per_min, ob_buy_pressure_pct, ob_is_barcode
 """
 
 
@@ -512,7 +513,7 @@ def _nav(delta: int):
 
 with tab_charts:
     # --- Pair selection row with Prev / Next (compact, single row) -----------
-    nav_l, sel_c, sel_e, nav_r = st.columns([1, 3, 2, 1])
+    nav_l, sel_c, sel_e, lay_c, nav_r = st.columns([1, 3, 2, 2, 1])
 
     if "sym_ticker" not in st.session_state or st.session_state.sym_ticker not in TICKER_OPTIONS:
         st.session_state.sym_ticker = TICKER_OPTIONS[0]
@@ -537,6 +538,14 @@ with tab_charts:
             st.session_state.sym_ex = ex_opts[0] if ex_opts else None
         sym_ex = st.selectbox("Exchange", options=ex_opts, key="sym_ex", label_visibility="collapsed")
 
+    with lay_c:
+        stacked_layout = st.toggle(
+            "⬓ Large stacked",
+            value=False,
+            key="stacked_layout",
+            help="OFF: compact — 15m left, 1D right. ON: large — 15m top, 1D bottom.",
+        )
+
     # --- Chart options (collapsed by default to save vertical space) ---------
     with st.expander("⚙️ Chart options", expanded=False):
         opt1, opt2, opt3, opt4 = st.columns([2, 2, 2, 1])
@@ -552,59 +561,76 @@ with tab_charts:
     row_15m = find_table_row(df_15m, sym_ticker, sym_ex)
     row_1d = find_table_row(df_1d, sym_ticker, sym_ex)
 
-    def _render_tf_chart(row, tf_label, limit, interval):
-        """Renders one timeframe chart with ⏪/⏩ nav buttons on both sides."""
+    # --- Compact health strip (latest collector snapshot) --------------------
+    health_row = row_1d or row_15m
+    if health_row:
+        st.markdown(build_health_strip_html(health_row), unsafe_allow_html=True)
+
+    def render_chart(row, tf_label, limit, interval, chart_height=470):
+        """Renders one timeframe chart into the current container."""
+        if row is None:
+            st.info(f"No {tf_label} table for {sym_ticker}.")
+            return
+        hist_df = get_candles(tf_label, row, limit, demo_mode)
+        if chart_engine == "TradingView Lightweight Canvas":
+            render_tradingview_lightweight_chart(
+                hist_df, sym_ticker, sym_ex, tf_label,
+                chart_height=chart_height,
+                chart_style=chart_style,
+                show_volume=show_volume,
+            )
+        elif chart_engine == "TradingView Official Widget":
+            style_code = "0" if chart_style == "OHLCV Bars" else "1"
+            render_tradingview_official_widget(sym_ticker, sym_ex, interval=interval, style_code=style_code)
+        else:
+            render_plotly_chart(hist_df, sym_ticker, sym_ex, tf_label, chart_style)
+
+    def _slim_header(icon, tf_name):
+        st.markdown(
+            f"<div style='font-size:15px;margin:2px 0 2px 6px;'>{icon} <b>{sym_ticker}</b> · {tf_name} · {sym_ex}</div>",
+            unsafe_allow_html=True,
+        )
+
+    def _side_nav_button(delta, key):
+        if st.button("⏪" if delta < 0 else "⏭", key=key, use_container_width=True,
+                     help="Previous pair" if delta < 0 else "Next pair"):
+            _nav(delta)
+        st.markdown("<div style='height:170px'></div>", unsafe_allow_html=True)
+
+    if stacked_layout:
+        # LARGE MODE: 15m on top, 1D below, nav buttons flanking each chart
+        _slim_header("⏱", "15m")
         left, center, right = st.columns([1, 30, 1])
-
         with left:
-            prev_hit = st.button("⏪", key=f"nav_prev_{tf_label}", use_container_width=True,
-                                 help="Previous pair")
-            st.markdown("<div style='height:180px'></div>", unsafe_allow_html=True)
+            _side_nav_button(-1, "nav_prev_15m")
         with right:
-            next_hit = st.button("⏭", key=f"nav_next_{tf_label}", use_container_width=True,
-                                 help="Next pair")
-            st.markdown("<div style='height:180px'></div>", unsafe_allow_html=True)
-
-        if prev_hit:
-            _nav(-1)
-        if next_hit:
-            _nav(+1)
-
+            _side_nav_button(+1, "nav_next_15m")
         with center:
-            if row is None:
-                st.info(f"No {tf_label} table for {sym_ticker}.")
-                return None
+            render_chart(row_15m, "15m", limit_15m, "15", chart_height=470)
 
-            hist_df = get_candles(tf_label, row, limit, demo_mode)
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
-            if chart_engine == "TradingView Lightweight Canvas":
-                render_tradingview_lightweight_chart(
-                    hist_df, sym_ticker, sym_ex, tf_label,
-                    chart_style=chart_style,
-                    show_volume=show_volume,
-                )
-            elif chart_engine == "TradingView Official Widget":
-                style_code = "0" if chart_style == "OHLCV Bars" else "1"
-                render_tradingview_official_widget(sym_ticker, sym_ex, interval=interval, style_code=style_code)
-                return None
-            else:
-                render_plotly_chart(hist_df, sym_ticker, sym_ex, tf_label, chart_style)
-
-    # 15 MINUTES chart — first, on top
-    st.markdown(
-        f"<div style='font-size:15px;margin:2px 0 2px 6px;'>⏱ <b>{sym_ticker}</b> · 15m · {sym_ex}</div>",
-        unsafe_allow_html=True,
-    )
-    _render_tf_chart(row_15m, "15m", limit_15m, interval="15")
-
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-
-    # 1 DAY chart — below
-    st.markdown(
-        f"<div style='font-size:15px;margin:2px 0 2px 6px;'>📅 <b>{sym_ticker}</b> · 1D · {sym_ex}</div>",
-        unsafe_allow_html=True,
-    )
-    _render_tf_chart(row_1d, "1D", limit_1d, interval="D")
+        _slim_header("📅", "1D")
+        left2, center2, right2 = st.columns([1, 30, 1])
+        with left2:
+            _side_nav_button(-1, "nav_prev_1D")
+        with right2:
+            _side_nav_button(+1, "nav_next_1D")
+        with center2:
+            render_chart(row_1d, "1D", limit_1d, "D", chart_height=470)
+    else:
+        # COMPACT MODE (default): 15m on the LEFT, 1D on the RIGHT, shared nav
+        nvl, c15, c1d, nvr = st.columns([1, 15, 15, 1])
+        with nvl:
+            _side_nav_button(-1, "nav_prev_pair")
+        with nvr:
+            _side_nav_button(+1, "nav_next_pair")
+        with c15:
+            _slim_header("⏱", "15m")
+            render_chart(row_15m, "15m", limit_15m, "15", chart_height=430)
+        with c1d:
+            _slim_header("📅", "1D")
+            render_chart(row_1d, "1D", limit_1d, "D", chart_height=430)
 
     # --- Live market & orderbook metrics (below charts, never blocks them) ---
     st.markdown("---")

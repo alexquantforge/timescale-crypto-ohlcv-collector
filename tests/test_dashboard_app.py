@@ -40,7 +40,7 @@ def test_chart_side_next_button_switches_pair(app_test):
     before, options = _pair(app_test)
     expected = options[(options.index(before) + 1) % len(options)]
 
-    app_test.button(key="nav_next_15m").click()
+    app_test.button(key="nav_next_pair").click()
     app_test.run()
 
     assert not app_test.exception, f"Next button raised: {[e.value for e in app_test.exception]}"
@@ -52,7 +52,7 @@ def test_chart_side_prev_button_switches_pair(app_test):
     before, options = _pair(app_test)
     expected = options[(options.index(before) - 1) % len(options)]
 
-    app_test.button(key="nav_prev_1D").click()
+    app_test.button(key="nav_prev_pair").click()
     app_test.run()
 
     assert not app_test.exception, f"Prev button raised: {[e.value for e in app_test.exception]}"
@@ -80,3 +80,18 @@ def test_volume_toggle_renders_without_errors(app_test):
     app_test.checkbox(key="show_volume").uncheck()
     app_test.run()
     assert not app_test.exception
+
+
+def test_stacked_layout_toggle_and_nav(app_test):
+    """'Large stacked' toggle switches to 15m-top/1D-bottom with per-chart nav."""
+    app_test.toggle(key="stacked_layout").set_value(True)
+    app_test.run()
+    assert not app_test.exception, f"Stacked layout raised: {[e.value for e in app_test.exception]}"
+
+    before, options = _pair(app_test)
+    expected = options[(options.index(before) + 1) % len(options)]
+    app_test.button(key="nav_next_15m").click()
+    app_test.run()
+    assert not app_test.exception
+    after, _ = _pair(app_test)
+    assert after == expected

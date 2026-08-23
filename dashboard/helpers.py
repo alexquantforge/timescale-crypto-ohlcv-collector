@@ -157,3 +157,118 @@ def generate_demo_candles(timeframe: str, ticker: str, exchange: str, n: int = 1
         "close": closes,
         "volume": vols,
     })
+
+
+# ---------------------------------------------------------------------------
+# Health strip (compact green→red indicators at the top of the Charts tab)
+# ---------------------------------------------------------------------------
+
+def _clamp01(x) -> float:
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return 0.0
+    if np.isnan(x):
+        return 0.0
+    return max(0.0, min(1.0, x))
+
+
+def score_trades_per_min(tpm) -> float:
+    """0 = dead tape (<3 trades/min), 1 = blazing (>=120 trades/min). Linear."""
+    if tpm is None:
+        return 0.0
+    return _clamp01(float(tpm) / 120.0)
+
+
+def score_depth_usd(depth) -> float:
+    """0 = thin orderbook (<$1K within ±1%), 1 = deep (>=$50K). Log scale."""
+    if depth is None or depth <= 0:
+        return 0.0
+    return _clamp01((np.log10(float(depth)) - 3.0) / (np.log10(50_000.0) - 3.0))
+
+
+def score_spread_atr_pct(pct) -> float:
+    """1 = spread below 5% of daily filtered ATR, 0 = 15% or wider."""
+    if pct is None:
+        return 0.0
+    pct = float(pct)
+    if pct <= 5.0:
+        return 1.0
+    if pct >= 15.0:
+        return 0.0
+    return (15.0 - pct) / 10.0
+
+
+def score_min_volume_usd(v) -> float:
+    """0 = <$100K/day (LOW tier floor), 1 = >=$500K/day (HIGH tier floor). Log scale."""
+    if v is None or v <= 0:
+        return 0.0
+    return _clamp01((np.log10(float(v)) - 5.0) / (np.log10(500_000.0) - 5.0))
+
+
+def fmt_usd_compact(v) -> str:
+    """$1.5B / $1.2M / $850K / $950 / n/a."""
+    if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
+        return "n/a"
+    v = float(v)
+    if v >= 1e9:
+        return f"${v / 1e9:.1f}B"
+    if v >= 1e6:
+        return f"${v / 1e6:.1f}M"
+    if v >= 1e3:
+        return f"${v / 1e3:.0f}K"
+    return f"${v:,.0f}"
+
+
+def _health_chip(label: str, value: str, score: float, hint: str = "") -> str:
+    hue = int(140 * _clamp01(score))
+    hint = hint.replace('"', "&quot;")
+    return (
+        f"<span title=\"{hint}\" style='display:inline-block;background:hsl({hue},62%,26%);"
+        f"border:1px solid hsl({hue},62%,45%);color:#f1f3f6;border-radius:12px;"
+        f"padding:3px 10px;white-space:nowrap;'>{label} <b>{value}</b></span>"
+    )
+
+
+def build_health_strip_html(row: dict) -> str:
+    """
+    Compact one-line health strip (green→red chips) from the latest collector
+    snapshot row: trade tape activity, orderbook density, spread vs daily ATR,
+    and min(vol×low) dollar volume over the last 7 days.
+    """
+    def _num(key):
+        v = row.get(key)
+        try:
+            v = float(v)
+            return v if np.isfinite(v) else None
+        except (TypeError, ValueError):
+            return None
+
+    tpm = _num("ob_trades_per_min")
+    depth = _num("ob_total_depth_usd")
+    spread_pct = _num("ob_spread_atr_pct")
+    minvol = _num("ob_min_7d_volume_usd")
+
+    dead = bool(row.get("ob_is_barcode")) or (tpm is not None and tpm < 3.0)
+
+    tpm_txt = f"{tpm:.0f}/min" if tpm is not None else "n/a"
+    if dead:
+        tpm_txt += " · DEAD"
+
+    chips = [
+        _health_chip("⚡ Tape", tpm_txt, 0.02 if dead else score_trades_per_min(tpm),
+                     "Trades per minute: live ≥ 42/min, dead < 3/min (barcode market)"),
+        _health_chip("🌊 Depth ±1%", fmt_usd_compact(depth), score_depth_usd(depth),
+                     "Orderbook depth within ±1% of price: deep ≥ $50K, thin < $1K"),
+        _health_chip("↔ Spread % ATR",
+                     f"{spread_pct:.1f}%" if spread_pct is not None else "n/a",
+                     score_spread_atr_pct(spread_pct),
+                     "Spread as % of daily filtered ATR: green < 5%, red ≥ 15%"),
+        _health_chip("💰 Min 7d $Vol", fmt_usd_compact(minvol), score_min_volume_usd(minvol),
+                     "min(vol×low) over the last 7 days: HIGH tier ≥ $500K/day, LOW tier < $100K/day"),
+    ]
+    return (
+        "<div style='display:flex;gap:8px;flex-wrap:wrap;align-items:center;"
+        "padding:2px 0 6px 0;font-size:12.5px;font-family:-apple-system,Segoe UI,Roboto,sans-serif;'>"
+        + "".join(chips) + "</div>"
+    )
