@@ -1,6 +1,7 @@
 """
 Settings and configuration management using Pydantic Settings and db_config.py fallback.
 """
+import json
 import os
 import sys
 from typing import Dict, List, Optional
@@ -88,7 +89,25 @@ class Settings(BaseSettings):
     }
 
     # Optional whitelist of exchanges to run (empty = all exchanges from the map)
-    allowed_exchanges: List[str] = Field(default_factory=list, alias="ALLOWED_EXCHANGES")
+    allowed_exchanges_raw: str = Field(default="", alias="ALLOWED_EXCHANGES")
+
+    @property
+    def allowed_exchanges(self) -> List[str]:
+        """
+        Exchange allow-list. Accepts BOTH formats in .env:
+          ALLOWED_EXCHANGES=bybit,okx,bitget                      (comma-separated)
+          ALLOWED_EXCHANGES=["bybit","okx","bitget"]              (JSON list)
+        Empty/unset = all configured exchanges are allowed.
+        """
+        raw = (self.allowed_exchanges_raw or "").strip()
+        if not raw:
+            return []
+        if raw.startswith("["):
+            try:
+                return [str(x).strip() for x in json.loads(raw) if str(x).strip()]
+            except (ValueError, TypeError):
+                return []
+        return [x.strip() for x in raw.split(",") if x.strip()]
 
     # Volume & Liquidity Tiering Thresholds
     hard_floor_usd_1d: float = Field(default=500000.0, alias="HARD_FLOOR_USD_1D")  # $500k USD for 1d
