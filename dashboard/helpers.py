@@ -357,8 +357,156 @@ def build_pair_links_html(symbol: str, exchange: str, perp_ticker: Optional[str]
 
 
 # ---------------------------------------------------------------------------
+# Lightweight Charts page assembly (pure builder — no streamlit import)
+# ---------------------------------------------------------------------------
+
+
+def build_lightweight_chart_html(
+    candles_json: str,
+    volume_json: Optional[str],
+    chart_height: int,
+    chart_style: str,
+    live_poller_js: str = "",
+) -> str:
+    """
+    Assembles the complete TradingView Lightweight Charts page as a pure
+    string (unit-testable without streamlit).
+
+    The candle/volume payloads are embedded ONCE as JS variables
+    (`candlesData` / `volumeData`) and every consumer — setData, the lastBar
+    initializer, the live badge/line and the browser-side live poller —
+    references those variables.
+
+    Regression note: a previous version built the lastBar line from a JS
+    `candles` variable that was never declared in the page (the payload was
+    inlined only inside setData()). The resulting `ReferenceError: candles is
+    not defined` aborted the whole script tail: the LIVE price line and the
+    1-second exchange poller were never installed, so charts looked frozen
+    while the server-side LIVE chip kept updating.
+    """
+    if chart_style == "OHLCV Bars":
+        series_js_code = """
+            const mainSeries = chart.addBarSeries({
+                upColor: '#26a69a',
+                downColor: '#ef5350',
+            });
+        """
+    else:
+        series_js_code = """
+            const mainSeries = chart.addCandlestickSeries({
+                upColor: '#26a69a',
+                downColor: '#ef5350',
+                borderVisible: false,
+                wickUpColor: '#26a69a',
+                wickDownColor: '#ef5350',
+            });
+        """
+
+    volume_js = ""
+    if volume_json is not None:
+        volume_js = f"""
+            const volumeData = {volume_json};
+            const volumeSeries = chart.addHistogramSeries({{
+                color: '#26a69a',
+                priceFormat: {{ type: 'volume' }},
+                priceScaleId: '',
+                scaleMargins: {{ top: 0.82, bottom: 0 }},
+            }});
+            volumeSeries.setData(volumeData);
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+        <style>
+            body {{ margin: 0; padding: 0; background-color: #131722; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; }}
+            #tv-chart {{ width: 100%; height: {chart_height}px; position: relative; }}
+            #live-badge {{ position: absolute; top: 8px; right: 70px; z-index: 10; display: none;
+                background: rgba(66, 165, 245, 0.15); color: #42a5f5; border: 1px solid rgba(66, 165, 245, 0.4);
+                border-radius: 8px; padding: 2px 8px; font-size: 12px; }}
+        </style>
+    </head>
+    <body>
+        <div id="tv-chart"><div id="live-badge"></div></div>
+        <script>
+            const fmtPrice = (p) => {{
+                const a = Math.abs(p);
+                const trim = (x) => {{
+                    const ax = Math.abs(x);
+                    let s;
+                    if (ax >= 100) s = x.toFixed(0);
+                    else if (ax >= 1) s = x.toFixed(2);
+                    else s = x.toPrecision(4);
+                    return parseFloat(s).toString();
+                }};
+                if (a >= 1e9) return trim(p / 1e9) + 'B';
+                if (a >= 1e6) return trim(p / 1e6) + 'M';
+                if (a >= 1e5) return trim(p / 1e3) + 'K';
+                return trim(p);
+            }};
+            const chartElement = document.getElementById('tv-chart');
+            const chart = LightweightCharts.createChart(chartElement, {{
+                width: chartElement.clientWidth,
+                height: {chart_height},
+                layout: {{
+                    background: {{ type: 'solid', color: '#131722' }},
+                    textColor: '#d1d4dc',
+                }},
+                grid: {{
+                    vertLines: {{ color: 'rgba(42, 46, 57, 0.5)' }},
+                    horzLines: {{ color: 'rgba(42, 46, 57, 0.5)' }},
+                }},
+                crosshair: {{
+                    mode: LightweightCharts.CrosshairMode.Normal,
+                }},
+                rightPriceScale: {{
+                    borderColor: 'rgba(197, 203, 206, 0.8)',
+                }},
+                timeScale: {{
+                    borderColor: 'rgba(197, 203, 206, 0.8)',
+                    timeVisible: true,
+                    rightOffset: 5,
+                }},
+                localization: {{
+                    priceFormatter: fmtPrice,
+                }},
+            }});
+
+            const candlesData = {candles_json};
+            {series_js_code}
+            mainSeries.setData(candlesData);
+
+            {volume_js}
+
+            chart.timeScale().fitContent();
+
+            let lastBar = candlesData.length ? Object.assign({{}}, candlesData[candlesData.length - 1]) : null;
+            let liveLine = null;
+            try {{
+                liveLine = mainSeries.createPriceLine({{
+                    color: '#42a5f5', lineWidth: 1,
+                    lineStyle: LightweightCharts.LineStyle.Dotted,
+                    axisLabelVisible: true, title: 'LIVE',
+                    price: lastBar ? lastBar.close : 0,
+                }});
+            }} catch (e) {{}}
+{live_poller_js}
+
+            window.addEventListener('resize', () => {{
+                chart.applyOptions({{ width: chartElement.clientWidth }});
+            }});
+        </script>
+    </body>
+    </html>
+    """
+
+
+# ---------------------------------------------------------------------------
 # Live data: intraday->daily aggregation & in-browser exchange poller
 # ---------------------------------------------------------------------------
+
 
 def merge_intraday_into_daily(df_1d: pd.DataFrame, df_15m: pd.DataFrame) -> pd.DataFrame:
     """

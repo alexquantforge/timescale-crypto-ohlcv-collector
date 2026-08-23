@@ -377,3 +377,61 @@ def test_stitch_candle_gaps_tail_disabled():
     df = _mk_df([now - 3 * step, now - 2 * step])
     out, added = stitch_candle_gaps(df, lambda r0, r1: [], step, include_tail=False, now_sec=now)
     assert added == 0 and len(out) == len(df)
+
+
+# ---------------------------------------------------------------------------
+# Lightweight Charts page assembly (live-poller regression)
+# ---------------------------------------------------------------------------
+
+
+def _build_chart_html(with_volume=False, poller="POLLER_STUB();"):
+    import json as _json
+    from dashboard.helpers import build_lightweight_chart_html
+
+    candles = [{"time": 1000, "open": 1.0, "high": 1.2, "low": 0.9, "close": 1.1}]
+    vol = [{"time": 1000, "value": 10.0, "color": "rgba(38,166,154,0.5)"}]
+    return build_lightweight_chart_html(
+        candles_json=_json.dumps(candles),
+        volume_json=_json.dumps(vol) if with_volume else None,
+        chart_height=470,
+        chart_style="OHLCV Bars",
+        live_poller_js=poller,
+    )
+
+
+def test_chart_html_declares_candles_data_variable():
+    """Regression: the lastBar initializer must reference a DECLARED JS
+    variable. Previously it used a `candles` identifier that existed only in
+    Python, so every chart died with `ReferenceError: candles is not
+    defined`, the live poller was never installed and charts stayed frozen."""
+    html = _build_chart_html()
+    assert "const candlesData =" in html
+    assert "mainSeries.setData(candlesData)" in html
+    assert "let lastBar = candlesData.length ? Object.assign({}, candlesData[candlesData.length - 1]) : null;" in html
+    # the bug pattern: bare `candles` identifier (never declared)
+    assert "candles.length ? Object.assign({}, candles[" not in html
+    assert "setData(candles);" not in html
+
+
+def test_chart_html_declaration_precedes_all_uses():
+    """`const candlesData` must appear before every identifier that reads it,
+    otherwise the page again dies with a ReferenceError at init."""
+    html = _build_chart_html()
+    decl = html.index("const candlesData =")
+    assert decl < html.index("mainSeries.setData(candlesData)")
+    assert decl < html.index("let lastBar = candlesData.length")
+
+
+def test_chart_html_injects_live_poller_and_badge():
+    html = _build_chart_html()
+    assert "POLLER_STUB();" in html
+    assert 'id="live-badge"' in html
+
+
+def test_chart_html_volume_optional():
+    off = _build_chart_html(with_volume=False)
+    assert "volumeSeries" not in off
+    assert "const volumeData =" not in off
+    on = _build_chart_html(with_volume=True)
+    assert "const volumeData =" in on
+    assert "volumeSeries.setData(volumeData)" in on
