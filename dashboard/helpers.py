@@ -488,7 +488,7 @@ def build_lightweight_chart_html(
                 liveLine = mainSeries.createPriceLine({{
                     color: '#42a5f5', lineWidth: 1,
                     lineStyle: LightweightCharts.LineStyle.Dotted,
-                    axisLabelVisible: true, title: 'LIVE',
+                    axisLabelVisible: true,
                     price: lastBar ? lastBar.close : 0,
                 }});
             }} catch (e) {{}}
