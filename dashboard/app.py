@@ -222,9 +222,9 @@ def get_candles(timeframe: str, row: dict, limit: int, demo: bool) -> pd.DataFra
 # Charts
 # ---------------------------------------------------------------------------
 
-def build_series_payloads(hist_df: pd.DataFrame):
+def build_series_payloads(hist_df: pd.DataFrame, with_volume: bool = True):
     """
-    Builds lightweight-charts payloads (int-epoch times): candles + volume.
+    Builds lightweight-charts payloads (int-epoch times): candles + optional volume.
     """
     t = hist_df["ts"].to_numpy(dtype=np.int64)
     o = hist_df["open"].to_numpy(dtype=float)
@@ -237,14 +237,16 @@ def build_series_payloads(hist_df: pd.DataFrame):
         {"time": int(t[i]), "open": float(o[i]), "high": float(h[i]), "low": float(l[i]), "close": float(c[i])}
         for i in range(len(t))
     ]
-    volume_data = [
-        {
-            "time": int(t[i]),
-            "value": float(v[i]),
-            "color": "rgba(38, 166, 154, 0.5)" if c[i] >= o[i] else "rgba(239, 83, 80, 0.5)",
-        }
-        for i in range(len(t))
-    ]
+    volume_data = []
+    if with_volume:
+        volume_data = [
+            {
+                "time": int(t[i]),
+                "value": float(v[i]),
+                "color": "rgba(38, 166, 154, 0.5)" if c[i] >= o[i] else "rgba(239, 83, 80, 0.5)",
+            }
+            for i in range(len(t))
+        ]
     return candles, volume_data
 
 
@@ -255,7 +257,7 @@ def render_tradingview_lightweight_chart(
     tf_label: str,
     chart_height: int = 470,
     chart_style: str = "OHLCV Bars",
-    key_suffix: str = "",
+    show_volume: bool = False,
 ):
     """Renders a TradingView Lightweight Charts canvas with OHLCV Bars/Candles,
     volume histogram, crosshair tooltips, and fast rolling ATR channels."""
@@ -263,7 +265,7 @@ def render_tradingview_lightweight_chart(
         st.info(f"No {tf_label} candles available for {ticker} ({exchange}).")
         return
 
-    candles, volume_data = build_series_payloads(hist_df)
+    candles, volume_data = build_series_payloads(hist_df, with_volume=show_volume)
 
     if chart_style == "OHLCV Bars":
         series_js_code = """
@@ -284,6 +286,18 @@ def render_tradingview_lightweight_chart(
         """
 
     dumps = lambda x: json.dumps(x, separators=(",", ":"))
+
+    volume_js = ""
+    if show_volume:
+        volume_js = f"""
+            const volumeSeries = chart.addHistogramSeries({{
+                color: '#26a69a',
+                priceFormat: {{ type: 'volume' }},
+                priceScaleId: '',
+                scaleMargins: {{ top: 0.82, bottom: 0 }},
+            }});
+            volumeSeries.setData({dumps(volume_data)});
+        """
 
     html_code = f"""
     <!DOCTYPE html>
@@ -326,13 +340,7 @@ def render_tradingview_lightweight_chart(
             {series_js_code}
             mainSeries.setData({dumps(candles)});
 
-            const volumeSeries = chart.addHistogramSeries({{
-                color: '#26a69a',
-                priceFormat: {{ type: 'volume' }},
-                priceScaleId: '',
-                scaleMargins: {{ top: 0.82, bottom: 0 }},
-            }});
-            volumeSeries.setData({dumps(volume_data)});
+            {volume_js}
 
             chart.timeScale().fitContent();
 
@@ -531,13 +539,14 @@ with tab_charts:
 
     # --- Chart options (collapsed by default to save vertical space) ---------
     with st.expander("⚙️ Chart options", expanded=False):
-        opt1, opt2, opt3 = st.columns([2, 2, 2])
+        opt1, opt2, opt3, opt4 = st.columns([2, 2, 2, 1])
         atr_days = opt1.slider("🎯 ATR Period (bars)", min_value=1, max_value=30, value=5, step=1)
         chart_engine = opt2.selectbox(
             "📈 Chart Engine",
             options=["TradingView Lightweight Canvas", "TradingView Official Widget", "Plotly Dark"],
         )
         chart_style = opt3.selectbox("📊 Chart Style", options=["OHLCV Bars", "Candlesticks"], index=0)
+        show_volume = opt4.checkbox("📊 Show volume bars", value=False, key="show_volume")
 
     # Resolve table rows per timeframe (same exchange preferred)
     row_15m = find_table_row(df_15m, sym_ticker, sym_ex)
@@ -572,6 +581,7 @@ with tab_charts:
                 render_tradingview_lightweight_chart(
                     hist_df, sym_ticker, sym_ex, tf_label,
                     chart_style=chart_style,
+                    show_volume=show_volume,
                 )
             elif chart_engine == "TradingView Official Widget":
                 style_code = "0" if chart_style == "OHLCV Bars" else "1"

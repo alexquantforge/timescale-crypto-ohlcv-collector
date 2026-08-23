@@ -69,3 +69,14 @@ def test_top_row_buttons_switch_pair(app_test):
     assert not app_test.exception
     after, _ = _pair(app_test)
     assert after == options[(options.index(before) + 1) % len(options)]
+
+
+def test_volume_toggle_renders_without_errors(app_test):
+    """Volume bars are hidden by default; enabling the toggle must not break rendering."""
+    app_test.checkbox(key="show_volume").check()
+    app_test.run()
+    assert not app_test.exception, f"Volume toggle raised: {[e.value for e in app_test.exception]}"
+
+    app_test.checkbox(key="show_volume").uncheck()
+    app_test.run()
+    assert not app_test.exception
