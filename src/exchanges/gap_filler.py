@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 from pytz import timezone as pytz_timezone
 
+from src.core.timeouts import hard_wait_for
 from src.exchanges.symbol_selector import get_exchange_url, get_swap_url
 
 logger = logging.getLogger("gap_filler")
@@ -62,9 +63,10 @@ async def fill_history_gaps(
         cursor_day = r0
         for _ in range(max_pages):
             try:
-                batch = await asyncio.wait_for(
+                batch = await hard_wait_for(
                     exchange.fetch_ohlcv(symbol, timeframe, since=cursor_day * step_ms, limit=bf_limit),
-                    timeout=8.0,
+                    8.0,
+                    label=f"{symbol}@{ccxt_id} gap-fill",
                 )
             except Exception as e:
                 logger.debug(f"Notice fetching gap OHLCV for {symbol}: {e}")
@@ -134,9 +136,10 @@ async def fetch_ohlcv_catch_up(
 
     for _ in range(max_pages):
         try:
-            batch = await asyncio.wait_for(
+            batch = await hard_wait_for(
                 exchange.fetch_ohlcv(symbol, timeframe, since=cursor_ms, limit=page_limit),
-                timeout=timeout,
+                timeout,
+                label=f"{symbol} catch-up",
             )
         except ccxt.BadSymbol:
             raise  # let the engine drop the delisted table

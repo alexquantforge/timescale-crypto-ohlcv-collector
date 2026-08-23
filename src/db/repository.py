@@ -15,6 +15,12 @@ from config.settings import settings
 logger = logging.getLogger("repository")
 MSK_TZ = pytz_timezone("Europe/Moscow")
 
+# Hard bound on pool.acquire() waits. Without a timeout, a starving pool
+# (e.g. a nested-acquire deadlock or a pile-up of slow queries) blocks the
+# acquiring task FOREVER — client-side, where Postgres statement/lock
+# timeouts cannot help — and silently freezes the whole collector cycle.
+_ACQUIRE_TIMEOUT = 30.0
+
 ALL_COLUMNS_SQL = {
     "Timestamp": "BIGINT",
     "open": "DOUBLE PRECISION",
@@ -80,7 +86,7 @@ class HistoricalMarketRepository:
             pool = self.pools.get(db)
             if not pool:
                 continue
-            async with pool.acquire() as conn:
+            async with pool.acquire(timeout=_ACQUIRE_TIMEOUT) as conn:
                 exists = await conn.fetchval(
                     "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name=$1)",
                     table_name,
@@ -102,7 +108,7 @@ class HistoricalMarketRepository:
         if not pool:
             return False
         try:
-            async with pool.acquire() as conn:
+            async with pool.acquire(timeout=_ACQUIRE_TIMEOUT) as conn:
                 await conn.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')
             logger.info(f"🗑️ [DROP TABLE] Dropped table '{table_name}' from database '{db_name}'.")
             return True
@@ -120,7 +126,7 @@ class HistoricalMarketRepository:
             pool = self.pools.get(db)
             if not pool:
                 continue
-            async with pool.acquire() as conn:
+            async with pool.acquire(timeout=_ACQUIRE_TIMEOUT) as conn:
                 rows = await conn.fetch(
                     "SELECT table_name FROM information_schema.tables "
                     "WHERE table_schema='public' AND table_name LIKE 'r%_on_bitget%'"
@@ -146,12 +152,12 @@ class HistoricalMarketRepository:
         if not from_pool or not to_pool:
             return
 
-        async with from_pool.acquire() as fc:
+        async with from_pool.acquire(timeout=_ACQUIRE_TIMEOUT) as fc:
             rows = await fc.fetch(f'SELECT * FROM "{table_name}"')
             if not rows:
                 return
 
-        async with to_pool.acquire() as tc:
+        async with to_pool.acquire(timeout=_ACQUIRE_TIMEOUT) as tc:
             cols_sql = ", ".join(
                 [f'"{k}" {ALL_COLUMNS_SQL.get(k, "TEXT")}' for k in rows[0].keys()]
             )
@@ -169,38 +175,59 @@ class HistoricalMarketRepository:
                 columns=list(rows[0].keys()),
             )
 
-        async with from_pool.acquire() as fc2:
+        async with from_pool.acquire(timeout=_ACQUIRE_TIMEOUT) as fc2:
             await fc2.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')
 
         logger.info(f"🔄 Moved table {table_name}: {from_db} -> {to_db}")
 
-    async def ensure_columns(self, pool: asyncpg.Pool, table_name: str) -> None:
-        """Adds missing columns (migrations) to individual symbol table."""
-        async with pool.acquire() as conn:
-            existing = {
-                r["column_name"]
-                for r in await conn.fetch(
-                    "SELECT column_name FROM information_schema.columns WHERE table_name=$1",
-                    table_name,
+    async def ensure_columns(
+        self,
+        pool: asyncpg.Pool,
+        table_name: str,
+        conn: Optional[asyncpg.Connection] = None,
+    ) -> None:
+        """Adds missing columns (migrations) to individual symbol table.
+
+        Pass an already-acquired `conn` when the caller holds one. Acquiring a
+        second connection from the same pool while holding the first is a
+        classic pool-starvation deadlock: once max_pool_size workers each hold
+        one connection and all wait for another, the pool never recovers
+        (pool.acquire() has no default timeout) and every subsequent query
+        queues forever — this froze the whole 1D collector cycle.
+        """
+        if conn is not None:
+            await self._ensure_columns_on(conn, table_name)
+            return
+        async with pool.acquire(timeout=_ACQUIRE_TIMEOUT) as own_conn:
+            await self._ensure_columns_on(own_conn, table_name)
+
+    async def _ensure_columns_on(
+        self, conn: asyncpg.Connection, table_name: str
+    ) -> None:
+        existing = {
+            r["column_name"]
+            for r in await conn.fetch(
+                "SELECT column_name FROM information_schema.columns WHERE table_name=$1",
+                table_name,
+            )
+        }
+        for col, typ in ALL_COLUMNS_SQL.items():
+            if col not in existing:
+                await conn.execute(
+                    f'ALTER TABLE "{table_name}" ADD COLUMN "{col}" {typ}'
                 )
-            }
-            for col, typ in ALL_COLUMNS_SQL.items():
-                if col not in existing:
-                    await conn.execute(
-                        f'ALTER TABLE "{table_name}" ADD COLUMN "{col}" {typ}'
-                    )
-            for col, typ in ORDERBOOK_COLUMNS_SQL.items():
-                if col not in existing:
-                    await conn.execute(
-                        f'ALTER TABLE "{table_name}" ADD COLUMN "{col}" {typ}'
-                    )
+        for col, typ in ORDERBOOK_COLUMNS_SQL.items():
+            if col not in existing:
+                await conn.execute(
+                    f'ALTER TABLE "{table_name}" ADD COLUMN "{col}" {typ}'
+                )
 
     async def create_table_if_not_exists(self, db_name: str, table_name: str) -> None:
         """Creates table_name in db_name with standard schema and TimescaleDB hypertable."""
         pool = self.pools.get(db_name)
         if not pool:
             return
-        async with pool.acquire() as conn:
+        async with pool.acquire(timeout=_ACQUIRE_TIMEOUT) as conn:
             cols = [f'"{c}" {t}' for c, t in ALL_COLUMNS_SQL.items()]
             await conn.execute(
                 f'CREATE TABLE IF NOT EXISTS "{table_name}" ({", ".join(cols)})'
@@ -232,7 +259,7 @@ class HistoricalMarketRepository:
 
         divisor = 900 if timeframe == "15m" else 86400
 
-        async with pool.acquire() as conn:
+        async with pool.acquire(timeout=_ACQUIRE_TIMEOUT) as conn:
             async with conn.transaction():
                 await conn.execute(
                     f'DELETE FROM "{table_name}" WHERE "Timestamp" >= $1', min_new_ts
@@ -274,7 +301,7 @@ class HistoricalMarketRepository:
         if not pool:
             return []
         try:
-            async with pool.acquire() as conn:
+            async with pool.acquire(timeout=_ACQUIRE_TIMEOUT) as conn:
                 rows = await conn.fetch(
                     f'SELECT DISTINCT "Timestamp" / {int(step)} AS bucket '
                     f'FROM "{tbl_name}" ORDER BY bucket ASC'
@@ -323,7 +350,7 @@ class HistoricalMarketRepository:
         ]
         min_ts = int(df["Timestamp"].min())
         try:
-            async with pool.acquire() as conn:
+            async with pool.acquire(timeout=_ACQUIRE_TIMEOUT) as conn:
                 await conn.execute(
                     f'DELETE FROM "{tbl_name}" WHERE "Timestamp" >= $1', min_ts
                 )
@@ -350,8 +377,10 @@ class HistoricalMarketRepository:
         interval_sec = 900 if timeframe == "15m" else 86400
         bars_count = min_days_check * (96 if timeframe == "15m" else 1)
 
-        async with pool.acquire() as conn:
-            await self.ensure_columns(pool, table_name)
+        async with pool.acquire(timeout=_ACQUIRE_TIMEOUT) as conn:
+            # Pass the already-held connection: never acquire a second one from
+            # the same pool here (nested-acquire deadlock — freezes the engine).
+            await self.ensure_columns(pool, table_name, conn=conn)
 
             min_7d = None
             try:
@@ -427,7 +456,7 @@ class HistoricalMarketRepository:
         bars_count = min_days_check * (96 if timeframe == "15m" else 1)
 
         try:
-            async with pool.acquire() as conn:
+            async with pool.acquire(timeout=_ACQUIRE_TIMEOUT) as conn:
                 vrows = await conn.fetch(
                     f'SELECT low, volume FROM "{table_name}" '
                     f'WHERE "Timestamp" <= $1 '

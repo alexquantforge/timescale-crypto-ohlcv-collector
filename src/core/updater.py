@@ -15,6 +15,7 @@ from config.settings import settings
 from src.analytics.atr_filtered import compute_atr_no_paranormal_bars
 from src.analytics.orderbook import fetch_orderbook_snapshot
 from src.core.progress import GlobalProgress
+from src.core.timeouts import hard_wait_for
 from src.db.connection import get_db_pools, close_all_db_pools
 from src.db.migrations import ensure_databases_exist
 from src.db.repository import HistoricalMarketRepository
@@ -31,6 +32,41 @@ MSK_TZ = pytz_timezone("Europe/Moscow")
 ALMATY_TZ = pytz_timezone("Asia/Almaty")
 
 
+def format_await_chain(task: asyncio.Task, max_depth: int = 12) -> str:
+    """
+    Builds the REAL suspension chain of a task by following coroutine
+    `cr_await` links. `Task.get_stack()` only returns the outermost frame of
+    a suspended task (e.g. `worker()` at updater.py:433), which says nothing
+    about whether the task is actually stuck in pool.acquire(), a ccxt fetch
+    or a semaphore — this walker reaches the true innermost await point.
+    """
+    parts: List[str] = []
+    obj = task.get_coro()
+    seen: Set[int] = set()
+    depth = 0
+    while obj is not None and depth < max_depth and id(obj) not in seen:
+        seen.add(id(obj))
+        frame = getattr(obj, "cr_frame", None) or getattr(obj, "gi_frame", None)
+        if frame is not None:
+            parts.append(
+                f"{frame.f_code.co_filename}:{frame.f_lineno} in {frame.f_code.co_name}()"
+            )
+        else:
+            parts.append(repr(obj)[:80])
+        awaited = getattr(obj, "cr_await", None)
+        if awaited is None:
+            awaited = getattr(obj, "gi_await", None)
+        if awaited is None:
+            break
+        if hasattr(awaited, "cr_await") or hasattr(awaited, "gi_await"):
+            obj = awaited
+            depth += 1
+        else:
+            parts.append(f"awaiting {type(awaited).__name__}")
+            break
+    return " <- ".join(parts) if parts else "<no suspension point>"
+
+
 async def load_markets_with_retry(
     exchange, name: str, attempts: int = 3, timeout: float = 30.0
 ) -> bool:
@@ -42,7 +78,7 @@ async def load_markets_with_retry(
     last_err: Optional[BaseException] = None
     for attempt in range(1, attempts + 1):
         try:
-            await asyncio.wait_for(exchange.load_markets(), timeout=timeout)
+            await hard_wait_for(exchange.load_markets(), timeout, label=f"{name}.load_markets")
             return True
         except Exception as e:
             last_err = e
@@ -111,12 +147,7 @@ class MarketDataEngine:
                             break
                         corr = task.get_coro()
                         name = getattr(corr, "__qualname__", str(corr))
-                        where = ""
-                        stack = task.get_stack()
-                        if stack:
-                            f = stack[-1]
-                            where = f" <- stuck at {f.f_code.co_filename}:{f.f_lineno} in {f.f_code.co_name}()"
-                        logger.error(f"  task: {name}{where}")
+                        logger.error(f"  task: {name} <- {format_await_chain(task)}")
                         shown += 1
                     stalled_since = now  # re-arm: dump again if still frozen later
         except asyncio.CancelledError:
@@ -231,9 +262,10 @@ class MarketDataEngine:
 
                 for page_idx in range(settings.backfill_max_iterations):
                     try:
-                        batch = await asyncio.wait_for(
+                        batch = await hard_wait_for(
                             exchange.fetch_ohlcv(symbol, self.timeframe, since=cursor_ms, limit=bf_limit),
-                            timeout=6.0,
+                            6.0,
+                            label=f"{symbol}@{ccxt_id} backfill",
                         )
                     except Exception:
                         break
