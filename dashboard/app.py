@@ -44,6 +44,7 @@ from dashboard.helpers import (
     sanitize_candle_frame,
     merge_intraday_into_daily,
     build_live_poller_js,
+    stitch_candle_gaps,
 )
 
 st.set_page_config(
@@ -236,6 +237,37 @@ def _get_sync_exchange(ccxt_id: str):
     """Persistent synchronous ccxt instance (kept across reruns & sessions)."""
     import ccxt as _ccxt
     return getattr(_ccxt, ccxt_id)({"enableRateLimit": True, "timeout": 8000})
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_missing_candles_cached(ccxt_id: str, symbol: str, timeframe: str, r0: int, r1: int):
+    """Fetches a missing candle range from the exchange (closed bars only -> cache 1h)."""
+    step = 900 if timeframe == "15m" else 86400
+    step_ms = step * 1000
+    ex = _get_sync_exchange(ccxt_id)
+    try:
+        if not ex.markets:
+            ex.load_markets()
+    except Exception:
+        return []
+
+    out = []
+    cursor = r0 * step_ms
+    try:
+        for _ in range(6):  # up to 6 pages per gap range
+            batch = ex.fetch_ohlcv(symbol, timeframe, since=cursor, limit=1000)
+            if not batch:
+                break
+            for c in batch:
+                b = int(c[0]) // step_ms
+                if r0 <= b < r1:
+                    out.append(c)
+            if batch[-1][0] >= (r1 - 1) * step_ms:
+                break
+            cursor = batch[-1][0] + step_ms
+    except Exception:
+        pass
+    return out
 
 
 @st.cache_data(ttl=1, show_spinner=False)
@@ -673,11 +705,13 @@ with tab_charts:
         )
         chart_style = opt3.selectbox("📊 Chart Style", options=["OHLCV Bars", "Candlesticks"], index=0)
         show_volume = opt4.checkbox("📊 Show volume bars", value=False, key="show_volume")
-        opt5, opt6 = st.columns(2)
+        opt5, opt6, opt7 = st.columns(3)
         live_refresh = opt5.selectbox(
             "🔴 Live refresh", options=["1s", "2s", "5s", "Off"], index=0, key="live_refresh",
         )
         auto_reload = opt6.checkbox("Auto-reload DB (60s)", value=True, key="auto_reload")
+        stitch_gaps = opt7.checkbox("🩹 Stitch gaps", value=True, key="stitch_gaps",
+                                    help="Fetch missing candles from the exchange into the chart (in-memory).")
 
     # Resolve table rows per timeframe (same exchange preferred)
     row_15m = find_table_row(df_15m, sym_ticker, sym_ex)
@@ -711,6 +745,20 @@ with tab_charts:
             st.info(f"No {tf_label} table for {sym_ticker}.")
             return
         hist_df = get_candles(tf_label, row, limit, demo_mode)
+
+        # In-memory gap stitching: fetch missing bars from the exchange
+        if stitch_gaps and not demo_mode and hist_df is not None and len(hist_df) > 1:
+            step = 900 if tf_label == "15m" else 86400
+            timeframe = "15m" if tf_label == "15m" else "1d"
+            exchange_map = settings.exchange_map_1d
+            ccxt_id = exchange_map.get(sym_ex, sym_ex)
+            hist_df, stitched = stitch_candle_gaps(
+                hist_df,
+                lambda r0, r1: _fetch_missing_candles_cached(ccxt_id, sym_ticker, timeframe, r0, r1),
+                step,
+            )
+            if stitched:
+                st.caption(f"🩹 {stitched} missing {tf_label} candles stitched from exchange (in-memory)")
 
         # Keep the daily chart in sync: aggregate fresher 15m candles of today
         if tf_label == "1D" and row_15m is not None:

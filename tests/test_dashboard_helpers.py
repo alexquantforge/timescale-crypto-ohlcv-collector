@@ -297,3 +297,49 @@ def test_build_live_poller_js_variants():
 
     assert build_live_poller_js("htx", "ADA/USDT", 900, 1000) == ""   # unsupported
     assert build_live_poller_js("bybit", "ADA/USDT", 900, 0) == ""    # disabled
+
+
+# ---------------------------------------------------------------------------
+# In-memory gap stitching
+# ---------------------------------------------------------------------------
+
+def test_find_missing_bucket_ranges():
+    from dashboard.helpers import find_missing_bucket_ranges
+    assert find_missing_bucket_ranges([1, 2, 3], 900) == []
+    assert find_missing_bucket_ranges([1, 2, 5, 6], 900) == [(3, 5)]
+    assert find_missing_bucket_ranges([0, 10], 900) == [(1, 10)]
+    assert find_missing_bucket_ranges([5], 900) == []
+    assert find_missing_bucket_ranges([], 900) == []
+
+
+def test_stitch_candle_gaps_fills_hole_with_fake_fetcher():
+    from dashboard.helpers import stitch_candle_gaps
+    import pandas as pd
+
+    step = 86400
+    base = 1_786_000_000 - (1_786_000_000 % step)
+    df = _mk_df([base, base + step, base + 4 * step, base + 5 * step])  # hole of 2 days
+
+    def fetcher(r0, r1):
+        # returns ms candles for the requested bucket range
+        return [[(base + b * step) * 1000, 1.0, 1.5, 0.9, 1.2, 5.0] for b in range(r0 - base // step, r1 - base // step)]
+
+    out, added = stitch_candle_gaps(df, fetcher, step)
+    assert added == 2
+    ts = out["ts"].tolist()
+    assert ts == sorted(ts)
+    assert base + 2 * step in ts and base + 3 * step in ts
+    assert len(out) == 6
+
+
+def test_stitch_candle_gaps_no_gap_noop_and_skips_huge_gaps():
+    from dashboard.helpers import stitch_candle_gaps
+
+    step = 900
+    full = _mk_df(list(range(1_786_000_000, 1_786_000_000 + 5 * step, step)))
+    out, added = stitch_candle_gaps(full, lambda r0, r1: (_ for _ in ()).throw(AssertionError("must not fetch")), step)
+    assert added == 0 and len(out) == len(full)
+
+    huge = _mk_df([1_786_000_000, 1_786_000_000 + 5000 * step])
+    out2, added2 = stitch_candle_gaps(huge, lambda r0, r1: [], step, max_gap_buckets=2000)
+    assert added2 == 0 and len(out2) == 2

@@ -492,3 +492,74 @@ def build_live_poller_js(exchange: str, symbol: str, step_sec: int, interval_ms:
         .replace("__STEP__", str(int(step_sec)))
         .replace("__MS__", str(int(interval_ms)))
     )
+
+
+# ---------------------------------------------------------------------------
+# In-memory gap stitching (dashboard-side, DB untouched)
+# ---------------------------------------------------------------------------
+
+def find_missing_bucket_ranges(buckets, step: int):
+    """
+    Given sorted unique bucket numbers (ts // step), returns the half-open
+    missing ranges (start_bucket, end_bucket) strictly between the first and
+    the last stored bucket.
+    """
+    if buckets is None or len(buckets) < 2:
+        return []
+    ranges = []
+    prev = buckets[0]
+    for b in buckets[1:]:
+        if b - prev > 1:
+            ranges.append((prev + 1, b))
+        prev = b
+    return ranges
+
+
+def stitch_candle_gaps(df: pd.DataFrame, fetcher, step: int, max_gap_buckets: int = 2000):
+    """
+    Fills gaps in a candle frame by fetching the missing bars through `fetcher`
+    (a callable (start_bucket, end_bucket) -> [[ts_ms, o, h, l, c, v], ...]).
+    Pure data operation (fully testable with a fake fetcher); returns
+    (new_df, added_count). The database itself is NOT modified.
+    """
+    if df is None or df.empty:
+        return df, 0
+
+    ts_sorted = sorted(int(t) for t in df["ts"])
+    buckets = sorted(set(t // step for t in ts_sorted))
+    ranges = [r for r in find_missing_bucket_ranges(buckets, step) if r[1] - r[0] <= max_gap_buckets]
+    if not ranges:
+        return df, 0
+
+    missing_set = set()
+    for r0, r1 in ranges:
+        missing_set.update(range(r0, r1))
+
+    added_rows = []
+    for r0, r1 in ranges:
+        try:
+            candles = fetcher(r0, r1) or []
+        except Exception:
+            candles = []
+        for c in candles:
+            b = int(c[0]) // (step * 1000)
+            if b in missing_set:
+                added_rows.append({
+                    "ts": int(c[0]) // 1000,
+                    "open": float(c[1]), "high": float(c[2]),
+                    "low": float(c[3]), "close": float(c[4]),
+                    "volume": float(c[5]) if c[5] is not None else 0.0,
+                })
+
+    if not added_rows:
+        return df, 0
+
+    add_df = pd.DataFrame(added_rows)
+    add_df["time"] = pd.to_datetime(add_df["ts"], unit="s")
+    merged = (
+        pd.concat([df, add_df], ignore_index=True)
+        .drop_duplicates(subset="ts", keep="first")
+        .sort_values("ts")
+        .reset_index(drop=True)
+    )
+    return merged, len(add_df)
