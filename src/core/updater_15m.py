@@ -15,6 +15,7 @@ from typing import Optional, Dict, Any, List, Set, Tuple
 import asyncpg
 import pandas as pd
 import numpy as np
+import ccxt  # FIX: ccxt.BadSymbol / ccxt.ExchangeError are referenced in exception handlers
 import ccxt.async_support as ccxt_async
 
 from src.exchanges.symbol_selector import get_exchange_url, get_swap_url
@@ -133,6 +134,16 @@ OB_FALLBACK_LIMITS: List[int] = [20, 10, 5]
 GC_ATR_PERIOD: int = 5
 GC_BAR_SMALL_THRESHOLD: float = 0.5
 GC_BAR_LARGE_THRESHOLD: float = 1.8
+
+# FIX: vitality score thresholds used by the orderbook scoring block below
+# (were referenced but never defined -> NameError, silently swallowed by try/except)
+OB_TRADES_MIN_SLOW: float = 3.0
+OB_TRADES_MIN_OK: float = 15.0
+OB_TRADES_MIN_GOOD: float = 45.0
+OB_TRADES_MIN_BLAZING: float = 120.0
+OB_DEPTH_MIN_THIN: float = 1000.0
+OB_DEPTH_MIN_OK: float = 10000.0
+OB_DEPTH_MIN_GOOD: float = 50000.0
 
 db_pools: Dict[str, asyncpg.Pool] = {}
 
