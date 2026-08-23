@@ -76,6 +76,32 @@ def get_download_min_timestamp() -> int:
 
 GAP_TOLERANCE_SEC = 900 * 2
 GAP_MAX_LOOKBACK_DAYS = DATA_RETENTION_DAYS
+
+# Gate.io rejects kline queries whose `from` is older than ~10000 recent
+# points ("Candlestick too long ago. Maximum 10000 points recently are
+# allowed"). Pairs hitting that were skipped every cycle forever. Clamp any
+# fetch start for these exchanges into their allowed window (with a margin).
+EXCHANGE_MAX_LOOKBACK_CANDLES_15M: Dict[str, int] = {
+    "gateio": 9900,  # of 10000 allowed
+    "gate": 9900,
+}
+
+
+def clamp_ohlcv_since_ms(exchange_name: str, since_ms: int) -> int:
+    """Clamps the OHLCV 'since' cursor into the exchange's allowed lookback
+    window (Gate.io: ~10000 recent candles). No-op for other exchanges."""
+    max_candles = EXCHANGE_MAX_LOOKBACK_CANDLES_15M.get(exchange_name)
+    if not max_candles:
+        return int(since_ms)
+    return max(int(since_ms), int(time.time() * 1000) - max_candles * 900 * 1000)
+
+
+def ohlcv_since_floor_ms(exchange_name: str):
+    """Absolute oldest 'since' the exchange accepts right now, or None when unlimited."""
+    max_candles = EXCHANGE_MAX_LOOKBACK_CANDLES_15M.get(exchange_name)
+    if not max_candles:
+        return None
+    return int(time.time() * 1000) - max_candles * 900 * 1000
 GAP_FETCH_DELAY = 0.1
 
 SKIP_PATTERNS = re.compile(
@@ -614,7 +640,7 @@ async def save_orderbook_snapshot(
 
 
 async def check_and_fill_table_gaps(
-    exchange, symbol: str, tbl: str, db: str
+    exchange, symbol: str, tbl: str, db: str, ccxt_name: str = ""
 ) -> Tuple[int, int, int]:
     download_min_ts = get_download_min_timestamp()
 
@@ -634,6 +660,19 @@ async def check_and_fill_table_gaps(
         diff = timestamps[i + 1] - timestamps[i]
         if diff > GAP_TOLERANCE_SEC:
             gaps.append((timestamps[i], timestamps[i + 1]))
+
+    # Gate.io & co. reject 'from' older than their recent-candle window —
+    # gaps lying (even partly) behind it can never be fetched there. Clamp or
+    # drop them so the engine does not retry (and re-log) the impossible
+    # fetch on every 5-minute cycle.
+    floor_ms = ohlcv_since_floor_ms(ccxt_name)
+    if floor_ms is not None:
+        clamped: List[Tuple[int, int]] = []
+        for gap_start, gap_end in gaps:
+            if gap_end * 1000 < floor_ms:
+                continue  # wholly behind the window — permanently out of reach
+            clamped.append((max(gap_start, floor_ms // 1000), gap_end))
+        gaps = clamped
 
     if not gaps:
         return (len(timestamps), 0, 0)
@@ -765,7 +804,7 @@ async def process_pair(exchange, symbol, ccxt_id):
                 last_ts = download_min_ts
 
             per_page = PER_PAGE_LIMIT.get(ccxt_id, DEFAULT_PER_PAGE)
-            cursor_ms = last_ts * 1000
+            cursor_ms = clamp_ohlcv_since_ms(ccxt_id, last_ts * 1000)
             pages = 0
             while pages < 20:
                 try:
@@ -795,7 +834,13 @@ async def process_pair(exchange, symbol, ccxt_id):
             # Auto-discover new symbol and download initial history
             log(f"  [15M] 🚀 New symbol detected: {symbol} ({ccxt_id}) -> Downloading initial history...")
             per_page = PER_PAGE_LIMIT.get(ccxt_id, DEFAULT_PER_PAGE)
-            start_since = download_min_ts * 1000
+            start_since = clamp_ohlcv_since_ms(ccxt_id, download_min_ts * 1000)
+            if start_since > download_min_ts * 1000:
+                log(
+                    f"  [15M] ℹ️ {symbol} @{ccxt_id}: exchange kline window — "
+                    f"initial history limited to the latest "
+                    f"{EXCHANGE_MAX_LOOKBACK_CANDLES_15M.get(ccxt_id)} candles"
+                )
 
             try:
                 cs = await asyncio.wait_for(
@@ -942,7 +987,7 @@ async def process_pair(exchange, symbol, ccxt_id):
                 )
 
         total_bars, gaps_found, gaps_filled = await check_and_fill_table_gaps(
-            exchange, symbol, tbl, current_db
+            exchange, symbol, tbl, current_db, ccxt_name=ccxt_id
         )
 
         try:
