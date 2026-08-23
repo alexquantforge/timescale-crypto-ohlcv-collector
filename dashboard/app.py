@@ -773,8 +773,20 @@ with tab_charts:
             return frame, 0
 
         hist_df, stitched = _stitch(hist_df, "15m" if tf_label == "15m" else "1d")
-        if stitched:
-            st.caption(f"🩹 {stitched} missing {tf_label} candles stitched from exchange (in-memory)")
+        # Always render the stitch caption line at a fixed height (empty when
+        # nothing was stitched) so the side-by-side 15m / 1D charts stay
+        # perfectly level — previously the 15m chart was pushed ~20px down
+        # whenever it had a stitched-gap caption and the 1D chart did not.
+        stitch_txt = (
+            f"🩹 {stitched} missing {tf_label} candles stitched from exchange (in-memory)"
+            if stitched
+            else "&nbsp;"
+        )
+        st.markdown(
+            f"<div style='font-size:12px;color:#808495;height:20px;line-height:20px;"
+            f"margin:0 0 2px 4px;white-space:nowrap;overflow:hidden;'>{stitch_txt}</div>",
+            unsafe_allow_html=True,
+        )
 
         # Keep the daily chart in sync: aggregate fresher 15m candles of today
         # (the 15m frame is stitched too, so today's daily bar is always fresh)
