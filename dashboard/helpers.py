@@ -5,6 +5,7 @@ Kept free of any `streamlit` import so they can be unit-tested with plain pytest
 pair navigation (prev/next), table lookup across the timeframe summary frames,
 and a synthetic demo-data generator used when no TimescaleDB is reachable.
 """
+import json
 from typing import List, Optional
 
 import numpy as np
@@ -542,45 +543,88 @@ def merge_intraday_into_daily(df_1d: pd.DataFrame, df_15m: pd.DataFrame) -> pd.D
 
 _LIVE_POLLER_TEMPLATE = """
 (function(){
-  let fails = 0;
-  const timer = setInterval(async () => {
+  'use strict';
+  const STEP = __STEP__;
+  const TICK_PATH = __TICK_PATH__;    // '/tick?db=..&ex=..&sym=..' served by the dashboard, or ''
+  const TICK_PORT = __TICK_PORT__;    // dashboard live-tick endpoint port, or 0
+  const DIRECT_URL = __DIRECT_URL__;  // exchange public REST ticker URL, or ''
+  function directParse(j){ let price = NaN, bid = NaN, ask = NaN; __PARSE__ return price; }
+  function dbTickUrl(){
+    if (!TICK_PATH || !TICK_PORT) { return null; }
     try {
-      const r = await fetch('__URL__');
-      const j = await r.json();
-      let price = NaN, bid = NaN, ask = NaN;
-      __PARSE__
-      if (!isFinite(price) || price <= 0) { throw new Error('bad price'); }
-      if (liveLine) { try { liveLine.applyOptions({ price: price }); } catch (e) {} }
-      const now = Math.floor(Date.now() / 1000);
-      const step = __STEP__;
-      const barTs = now - (now % step);
-      if (!lastBar || barTs > lastBar.time) {
-        lastBar = { time: barTs, open: price, high: price, low: price, close: price };
-      } else {
-        lastBar.close = price;
-        if (price > lastBar.high) { lastBar.high = price; }
-        if (price < lastBar.low) { lastBar.low = price; }
-      }
-      mainSeries.update(lastBar);
-      fails = 0;
-    } catch (e) {
-      fails += 1;
-      if (fails >= 5) {
-        clearInterval(timer);
-      }
-    }
+      const ref = document.referrer || ((location.ancestorOrigins && location.ancestorOrigins[0]) || '');
+      if (!ref) { return null; }
+      const u = new URL(ref);
+      return u.protocol + '//' + u.hostname + ':' + TICK_PORT + TICK_PATH;
+    } catch (e) { return null; }
+  }
+  const TURL = dbTickUrl();
+  let inflight = false;
+  async function grabPrice(url, parse){
+    const r = await fetch(url, { cache: 'no-store' });
+    const j = await r.json();
+    return parse(j);
+  }
+  // The poller NEVER gives up: a dead endpoint / CORS rejection just skips the
+  // tick and the next interval tries again, so the chart recovers by itself.
+  setInterval(function(){
+    (async function(){
+      if (inflight) { return; }
+      inflight = true;
+      try {
+        let price = NaN;
+        if (TURL) {
+          try { price = await grabPrice(TURL, function(j){ return +j.last; }); } catch (e) {}
+        }
+        if ((!isFinite(price) || price <= 0) && DIRECT_URL) {
+          try { price = await grabPrice(DIRECT_URL, directParse); } catch (e) {}
+        }
+        if (!isFinite(price) || price <= 0) { return; }
+        if (liveLine) { try { liveLine.applyOptions({ price: price }); } catch (e) {} }
+        const now = Math.floor(Date.now() / 1000);
+        const barTs = now - (now % STEP);
+        if (!lastBar || barTs > lastBar.time) {
+          lastBar = { time: barTs, open: price, high: price, low: price, close: price };
+        } else {
+          lastBar.close = price;
+          if (price > lastBar.high) { lastBar.high = price; }
+          if (price < lastBar.low) { lastBar.low = price; }
+        }
+        mainSeries.update(lastBar);
+      } finally { inflight = false; }
+    })();
   }, __MS__);
 })();
 """
 
 
-def build_live_poller_js(exchange: str, symbol: str, step_sec: int, interval_ms: int = 1000) -> str:
+def build_live_poller_js(
+    exchange: str,
+    symbol: str,
+    step_sec: int,
+    interval_ms: int = 1000,
+    tick_path: Optional[str] = None,
+    tick_port: Optional[int] = None,
+) -> str:
     """
-    Returns browser-side JS that polls the exchange public REST ticker once per
-    interval and live-updates the last chart bar + the dotted live price line.
-    Empty string for unsupported exchanges (chart simply stays DB-static).
+    Returns browser-side JS that live-updates the last chart bar + the dotted
+    live price line once per interval.
+
+    Two data sources, tried in order on every tick:
+    1) `tick_path`/`tick_port` — the dashboard's own live-tick JSON endpoint
+       (host resolved in the browser from document.referrer, since these charts
+       live in srcdoc iframes). The endpoint serves the DB row written every
+       second by the dashboard's background writer, so charts stay live even
+       when the browser itself cannot reach the exchange (CORS, geo-block).
+    2) the exchange public REST ticker directly (fallback when the endpoint is
+       unavailable), supported for all 9 collector exchanges.
+
+    The poller never stops on errors (a failing source only skips that tick).
+    Returns "" when live refresh is disabled or no data source is available.
     """
     if interval_ms <= 0:
+        return ""
+    if not tick_path and exchange is None:
         return ""
     from src.exchanges.symbol_selector import split_symbol
 
@@ -589,6 +633,8 @@ def build_live_poller_js(exchange: str, symbol: str, step_sec: int, interval_ms:
     perp = ":" in (symbol or "")
     ex = (exchange or "").lower()
 
+    url = None
+    parse = None
     if ex == "bybit":
         cat = "linear" if perp else "spot"
         url = f"https://api.bybit.com/v5/market/tickers?category={cat}&symbol={b}{q}"
@@ -615,13 +661,32 @@ def build_live_poller_js(exchange: str, symbol: str, step_sec: int, interval_ms:
         else:
             url = f"https://open-api.bingx.com/openApi/spot/v1/ticker/24hr?symbol={b}-{q}"
             parse = "const it=(j.data||{});price=+it.closePrice;"
-    else:
+    elif ex == "bitget":
+        if perp:
+            url = f"https://api.bitget.com/api/v2/mix/market/ticker?symbol={b}{q}&productType={q}-FUTURES"
+        else:
+            url = f"https://api.bitget.com/api/v2/spot/market/tickers?symbol={b}{q}"
+        parse = "const it=(Array.isArray(j.data)?j.data[0]:j.data)||{};price=+it.lastPr;bid=+it.bidPr;ask=+it.askPr;"
+    elif ex == "htx":
+        if perp:
+            url = f"https://api.hbdm.com/linear-swap-ex/market/detail/merged/{b}-{q}"
+        else:
+            url = f"https://api.huobi.pro/market/detail/merged?symbol={(b + q).lower()}"
+        parse = "const it=j.tick||{};price=+it.close;bid=+((it.bid||[])[0]);ask=+((it.ask||[])[0]);"
+    elif ex == "coinex":
+        kind = "futures" if perp else "spot"
+        url = f"https://api.coinex.com/v2/{kind}/ticker?market={b}{q}"
+        parse = "const it=(Array.isArray(j.data)?j.data[0]:j.data)||{};price=+it.last;bid=+it.bid;ask=+it.ask;"
+
+    if not tick_path and not url:
         return ""
 
     return (
         _LIVE_POLLER_TEMPLATE
-        .replace("__URL__", url)
-        .replace("__PARSE__", parse)
+        .replace("__TICK_PATH__", json.dumps(tick_path) if tick_path else "''")
+        .replace("__TICK_PORT__", str(int(tick_port or 0)))
+        .replace("__DIRECT_URL__", json.dumps(url) if url else "''")
+        .replace("__PARSE__", parse or "price=NaN;")
         .replace("__STEP__", str(int(step_sec)))
         .replace("__MS__", str(int(interval_ms)))
     )

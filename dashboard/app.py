@@ -20,6 +20,8 @@ import json
 import time
 import asyncio
 import threading
+from typing import Optional
+
 import asyncpg
 import numpy as np
 import pandas as pd
@@ -291,8 +293,13 @@ def _fetch_ticker_cached(ccxt_id: str, symbol: str):
         return None
 
 
-def _render_live_panel(ticker: str, exchange: str, demo: bool):
-    """One-line LIVE chips: price, bid/ask, spread, 24h change."""
+def _render_live_panel(ticker: str, exchange: str, demo: bool, db_name: str = None):
+    """One-line LIVE chips: price, bid/ask, spread, 24h change.
+
+    Reads the live row the background daemon keeps writing to TimescaleDB
+    every second; falls back to a direct exchange ticker fetch only when the
+    DB row is missing/stale.
+    """
     if demo:
         import random as _random
         key = f"demo_px_{ticker}_{exchange}"
@@ -304,9 +311,19 @@ def _render_live_panel(ticker: str, exchange: str, demo: bool):
         data = {"last": px, "bid": px * 0.99995, "ask": px * 1.00005,
                 "pct": st.session_state.get(f"demo_pct_{ticker}_{exchange}", 2.4)}
     else:
-        exchange_map = settings.exchange_map_1d
-        ccxt_id = exchange_map.get(exchange, exchange)
-        data = _fetch_ticker_cached(ccxt_id, ticker)
+        data = None
+        live_row = _db_live_read(db_name, exchange, ticker) if db_name else None
+        if live_row and live_row.get("last"):
+            data = {
+                "last": live_row["last"],
+                "bid": live_row.get("bid"),
+                "ask": live_row.get("ask"),
+                "pct": live_row.get("pct"),
+            }
+        if not data:
+            exchange_map = settings.exchange_map_1d
+            ccxt_id = exchange_map.get(exchange, exchange)
+            data = _fetch_ticker_cached(ccxt_id, ticker)
 
     if not data or not data.get("last"):
         st.caption("🔴 LIVE: exchange unreachable")
@@ -335,7 +352,369 @@ def _render_live_panel(ticker: str, exchange: str, demo: bool):
 
 
 # ---------------------------------------------------------------------------
-# Live health-strip chips (exchange REST, ~1s refresh)
+# Live snapshot pipeline — TimescaleDB is the single source of truth for live
+# data. A process-wide background daemon writes the live price / orderbook top /
+# spread / trade-tape stats of the CURRENT pair and its ±5 neighbours into the
+# `dashboard_live_ticks` table every second. Every live widget in the UI — the
+# 🔴 LIVE price line, the health strip, and even the in-chart poller (via a
+# tiny local JSON endpoint) — READS those rows, so the page never blocks on
+# exchange latency and charts stay live even when the browser itself cannot
+# reach the exchange (CORS / geo-block). Direct exchange fetches remain only
+# as a fallback for when the writer has not produced a fresh row yet.
+# ---------------------------------------------------------------------------
+_LIVE_TABLE = "dashboard_live_ticks"
+_LIVE_TICK_PORTS = (8511, 8512, 8513, 8514, 8515)
+_LIVE_TARGET_TTL = 90.0   # writer idles when the pair page stops refreshing its target
+_LIVE_ROW_MAX_AGE = 30.0  # UI treats older rows as stale → direct fallback
+
+_LIVE_TARGET_LOCK = threading.Lock()
+_LIVE_TARGET: dict = {"ts": 0.0, "pairs": []}
+
+_KNOWN_DBS = {
+    getattr(settings, "db_high_1d", ""),
+    getattr(settings, "db_low_1d", ""),
+    getattr(settings, "db_high_15m", ""),
+    getattr(settings, "db_low_15m", ""),
+} - {""}
+
+
+def _set_live_target(pairs: list) -> None:
+    """Replaces the writer's working set (current pair ± 5 neighbours)."""
+    with _LIVE_TARGET_LOCK:
+        _LIVE_TARGET["ts"] = time.time()
+        _LIVE_TARGET["pairs"] = list(pairs or [])
+
+
+def _get_live_target():
+    with _LIVE_TARGET_LOCK:
+        return _LIVE_TARGET["ts"], list(_LIVE_TARGET["pairs"])
+
+
+@st.cache_resource(show_spinner=False)
+def _live_infra() -> dict:
+    """
+    Process-wide live pipeline (started once, survives Streamlit reruns):
+      1. one asyncio loop + asyncpg pools shared by the DB writer and readers;
+      2. the background snapshot WRITER thread (ccxt → TimescaleDB, every 1 s
+         for the current pair ± 5 neighbours);
+      3. a tiny local JSON endpoint /tick for the in-chart live pollers, which
+         SELECTs the freshest row straight from the table.
+    """
+    import queue as _queue
+
+    ready = _queue.Queue()
+    port_ready = threading.Event()
+
+    def pg_thread():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        infra = {"loop": loop, "pools": {}, "pool_lock": asyncio.Lock()}
+
+        async def get_pool(db_name: str):
+            async with infra["pool_lock"]:
+                pool = infra["pools"].get(db_name)
+                if pool is None:
+                    pool = await asyncpg.create_pool(
+                        host=db_host, port=db_port, user=db_user, password=db_pass,
+                        database=db_name, min_size=1, max_size=3, command_timeout=15,
+                    )
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            f'CREATE TABLE IF NOT EXISTS {_LIVE_TABLE} ('
+                            ' exchange text NOT NULL, symbol text NOT NULL,'
+                            ' payload jsonb NOT NULL,'
+                            ' updated_at timestamptz NOT NULL DEFAULT now(),'
+                            ' PRIMARY KEY (exchange, symbol))'
+                        )
+                    infra["pools"][db_name] = pool
+            return pool
+
+        async def upsert(db_name, exchange, symbol, payload):
+            pool = await get_pool(db_name)
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    f'INSERT INTO {_LIVE_TABLE} (exchange, symbol, payload, updated_at)'
+                    ' VALUES ($1, $2, $3::jsonb, now())'
+                    ' ON CONFLICT (exchange, symbol) DO UPDATE'
+                    ' SET payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at',
+                    exchange, symbol, json.dumps(payload),
+                )
+
+        async def select(db_name, exchange, symbol):
+            try:
+                pool = await get_pool(db_name)
+                async with pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        f'SELECT payload, EXTRACT(EPOCH FROM (now() - updated_at)) AS age'
+                        f' FROM {_LIVE_TABLE} WHERE exchange=$1 AND symbol=$2',
+                        exchange, symbol,
+                    )
+            except Exception:
+                return None
+            if not row:
+                return None
+            try:
+                age = float(row["age"] if row["age"] is not None else 1e9)
+            except (TypeError, ValueError):
+                age = 1e9
+            if age > _LIVE_ROW_MAX_AGE:
+                return None  # writer stopped → caller falls back to direct fetch
+            payload = row["payload"]
+            if isinstance(payload, str):  # asyncpg returns jsonb as text by default
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = None
+            data = dict(payload or {})
+            data["age"] = age
+            return data
+
+        def submit_upsert(db, ex, sym, payload, timeout=5.0):
+            try:
+                return asyncio.run_coroutine_threadsafe(
+                    upsert(db, ex, sym, payload), loop
+                ).result(timeout=timeout)
+            except Exception:
+                return None
+
+        def submit_select(db, ex, sym, timeout=2.5):
+            try:
+                return asyncio.run_coroutine_threadsafe(
+                    select(db, ex, sym), loop
+                ).result(timeout=timeout)
+            except Exception:
+                return None
+
+        infra["submit_upsert"] = submit_upsert
+        infra["submit_select"] = submit_select
+        ready.put(infra)
+        loop.run_forever()
+
+    threading.Thread(target=pg_thread, daemon=True, name="live-pg").start()
+    infra = ready.get(timeout=10)
+
+    # --- tiny JSON endpoint for the in-chart pollers (/tick?db&ex&sym) -------
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs
+    import re as _re
+
+    _EX_RE = _re.compile(r"[A-Za-z0-9_\-]{1,32}")
+    _SYM_RE = _re.compile(r"[A-Za-z0-9/:\._\-]{1,64}")
+
+    class _TickHandler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            return
+
+        def _send(self, obj, status=200):
+            body = json.dumps(obj).encode()
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.end_headers()
+
+        def do_GET(self):
+            try:
+                u = _urlparse(self.path)
+                if u.path != "/tick":
+                    self._send({}, status=404)
+                    return
+                q = _parse_qs(u.query)
+                db = (q.get("db") or [""])[0]
+                ex = (q.get("ex") or [""])[0]
+                sym = (q.get("sym") or [""])[0]
+                if (
+                    db not in _KNOWN_DBS
+                    or not _EX_RE.fullmatch(ex or "")
+                    or not _SYM_RE.fullmatch(sym or "")
+                ):
+                    self._send({})
+                    return
+                data = infra["submit_select"](db, ex, sym, timeout=2.5)
+                self._send(data or {})
+            except Exception:
+                self._send({})
+
+    def tick_thread():
+        for port in _LIVE_TICK_PORTS:
+            try:
+                srv = ThreadingHTTPServer(("0.0.0.0", port), _TickHandler)
+            except OSError:
+                continue
+            srv.daemon_threads = True
+            infra["tick_port"] = port
+            port_ready.set()
+            srv.serve_forever()
+            return
+        port_ready.set()  # no free port — charts fall back to direct exchange REST
+
+    threading.Thread(target=tick_thread, daemon=True, name="live-tick").start()
+    port_ready.wait(timeout=1.5)  # first render already gets the tick port
+
+    # --- background writer: ccxt → dashboard_live_ticks, every second --------
+    writer_ex: dict = {}
+    writer_ex_lock = threading.Lock()
+
+    def writer_exchange(ccxt_id: str):
+        import ccxt as _ccxt
+
+        with writer_ex_lock:
+            ex = writer_ex.get(ccxt_id)
+            if ex is None:
+                ex = getattr(_ccxt, ccxt_id)(
+                    {"enableRateLimit": True, "timeout": 6000}
+                )
+                writer_ex[ccxt_id] = ex
+        if not ex.markets:
+            with writer_ex_lock:
+                if not ex.markets:
+                    try:
+                        ex.load_markets()
+                    except Exception:
+                        pass
+        return ex
+
+    def writer_fetch_pair(entry: dict):
+        """Fetches ticker + orderbook top + trade tape; returns payload dict."""
+        ex = writer_exchange(entry["ccxt"])
+        sym = entry["sym"]
+
+        last = bid = ask = pct = None
+        try:
+            t = ex.fetch_ticker(sym)
+            last, bid, ask, pct = (
+                t.get("last"), t.get("bid"), t.get("ask"), t.get("percentage")
+            )
+        except Exception:
+            pass
+
+        depth = None
+        try:
+            ob = ex.fetch_order_book(sym, limit=50)
+            bids, asks = ob.get("bids") or [], ob.get("asks") or []
+            if bids and asks:
+                ob_bid, ob_ask = float(bids[0][0]), float(asks[0][0])
+                bid = bid if bid else ob_bid
+                ask = ask if ask else ob_ask
+                if last is None and ob_bid > 0 and ob_ask > 0:
+                    last = (ob_bid + ob_ask) / 2.0
+                mid = (ob_bid + ob_ask) / 2.0
+                lo, hi = mid * 0.99, mid * 1.01
+                depth = (
+                    sum(float(p) * float(a) for p, a in bids if float(p) >= lo)
+                    + sum(float(p) * float(a) for p, a in asks if float(p) <= hi)
+                )
+        except Exception:
+            pass
+
+        tpm = None
+        barcode = False
+        try:
+            trades = ex.fetch_trades(sym, limit=200) or []
+            now_ms = time.time() * 1000.0
+            recent = [
+                tr for tr in trades
+                if tr.get("timestamp") and float(tr["timestamp"]) >= now_ms - 300_000
+            ]
+            tpm = len(recent) / 5.0
+            prices = [float(tr["price"]) for tr in trades if tr.get("price")]
+            if len(trades) >= 30 and len(set(prices)) <= 4:
+                barcode = True
+        except Exception:
+            pass
+
+        if last is None and depth is None and tpm is None:
+            return None
+
+        def _fin(x):
+            """Non-finite floats would produce invalid JSONB — map to None."""
+            try:
+                f = float(x)
+            except (TypeError, ValueError):
+                return None
+            return f if f == f and abs(f) != float("inf") else None
+
+        return {
+            "last": _fin(last), "bid": _fin(bid), "ask": _fin(ask), "pct": _fin(pct),
+            "depth_usd": _fin(depth), "trades_per_min": _fin(tpm),
+            "is_barcode": bool(barcode), "ts": time.time(),
+        }
+
+    def writer_loop():
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool_exec = ThreadPoolExecutor(max_workers=6)
+        while True:
+            tgt_ts, pairs = _get_live_target()
+            if not pairs or (time.time() - tgt_ts) > _LIVE_TARGET_TTL:
+                time.sleep(1.0)
+                continue
+            started = time.time()
+            futs = [(e, pool_exec.submit(writer_fetch_pair, e)) for e in pairs]
+            for e, f in futs:
+                try:
+                    payload = f.result(timeout=10)
+                except Exception:
+                    payload = None
+                if payload:
+                    infra["submit_upsert"](e["db"], e["ex"], e["sym"], payload)
+            time.sleep(max(0.2, 1.0 - (time.time() - started)))
+
+    threading.Thread(target=writer_loop, daemon=True, name="live-writer").start()
+    return infra
+
+
+def _live_infra_or_none():
+    try:
+        return _live_infra()
+    except Exception:
+        return None
+
+
+def _live_db_for(row_1d, row_15m) -> Optional[str]:
+    """Database the live snapshot for this pair is written to / read from."""
+    row = row_1d or row_15m
+    if row and row.get("db_name"):
+        return row["db_name"]
+    return getattr(settings, "db_high_1d", None)
+
+
+@st.cache_data(ttl=1, show_spinner=False)
+def _db_live_read(db_name: str, exchange: str, symbol: str):
+    """Latest live snapshot row for the pair (None when missing/stale)."""
+    infra = _live_infra_or_none()
+    if not infra or not db_name:
+        return None
+    try:
+        return infra["submit_select"](db_name, exchange, symbol, timeout=2.5)
+    except Exception:
+        return None
+
+
+def _live_tick_path(db_name: Optional[str], exchange: str, symbol: str) -> Optional[str]:
+    """URL path for the dashboard's live-tick endpoint serving this pair."""
+    from urllib.parse import urlencode
+
+    infra = _live_infra_or_none()
+    if not infra or not infra.get("tick_port") or not db_name:
+        return None
+    return "/tick?" + urlencode({"db": db_name, "ex": exchange, "sym": symbol})
+
+
+# ---------------------------------------------------------------------------
+# Live health-strip chips (live DB snapshot first, exchange REST fallback,
+# ~1s refresh)
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=1, show_spinner=False)
@@ -372,49 +751,71 @@ def _fetch_trade_tape(ccxt_id: str, symbol: str, limit: int = 200):
         return None
 
 
-def _compute_live_health_row(sym_ticker, sym_ex, hist_1d, atr_val, db_row):
+def _compute_live_health_row(sym_ticker, sym_ex, hist_1d, atr_val, db_row, db_name: str = None):
     """
-    Builds the health-strip row from LIVE exchange data (orderbook + trade
-    tape, each cached ~1s). Any field the live fetch could not produce falls
-    back to the latest collector snapshot value from `db_row`.
+    Builds the health-strip row from the LIVE snapshot the background daemon
+    writes to TimescaleDB every second (orderbook top + trade tape for the
+    pair). When no fresh DB row exists yet, falls back to direct exchange
+    fetches, and finally to the latest collector snapshot values in `db_row`.
     """
     row = dict(db_row or {})
     exchange_map = settings.exchange_map_1d
     ccxt_id = exchange_map.get(sym_ex, sym_ex)
 
-    # --- Depth ±1% & Spread % ATR from the live orderbook ---
-    ob = _fetch_orderbook_top(ccxt_id, sym_ticker)
-    if ob and ob["bids"] and ob["asks"]:
-        try:
-            bid = float(ob["bids"][0][0])
-            ask = float(ob["asks"][0][0])
-            if bid > 0 and ask > 0:
-                mid = (bid + ask) / 2.0
-                lo, hi = mid * 0.99, mid * 1.01
-                depth = sum(float(p) * float(a) for p, a in ob["bids"] if float(p) >= lo) + sum(
-                    float(p) * float(a) for p, a in ob["asks"] if float(p) <= hi
-                )
-                row["ob_total_depth_usd"] = depth
+    live_row = _db_live_read(db_name, sym_ex, sym_ticker) if db_name else None
+
+    # --- Depth ±1% & Spread % ATR (DB live row, else direct orderbook) ---
+    if live_row and live_row.get("depth_usd") is not None:
+        row["ob_total_depth_usd"] = live_row["depth_usd"]
+        bid, ask = live_row.get("bid"), live_row.get("ask")
+        if bid and ask:
+            try:
+                bid, ask = float(bid), float(ask)
                 row["ob_spread_abs"] = ask - bid
                 row["ob_best_bid"] = bid
                 row["ob_best_ask"] = ask
                 if atr_val and atr_val > 0:
                     row["ob_spread_atr_pct"] = (ask - bid) / atr_val * 100.0
-        except (TypeError, ValueError, IndexError):
-            pass
+            except (TypeError, ValueError):
+                pass
+    else:
+        ob = _fetch_orderbook_top(ccxt_id, sym_ticker)
+        if ob and ob["bids"] and ob["asks"]:
+            try:
+                bid = float(ob["bids"][0][0])
+                ask = float(ob["asks"][0][0])
+                if bid > 0 and ask > 0:
+                    mid = (bid + ask) / 2.0
+                    lo, hi = mid * 0.99, mid * 1.01
+                    depth = sum(float(p) * float(a) for p, a in ob["bids"] if float(p) >= lo) + sum(
+                        float(p) * float(a) for p, a in ob["asks"] if float(p) <= hi
+                    )
+                    row["ob_total_depth_usd"] = depth
+                    row["ob_spread_abs"] = ask - bid
+                    row["ob_best_bid"] = bid
+                    row["ob_best_ask"] = ask
+                    if atr_val and atr_val > 0:
+                        row["ob_spread_atr_pct"] = (ask - bid) / atr_val * 100.0
+            except (TypeError, ValueError, IndexError):
+                pass
 
-    # --- Trades/min from the live trade tape (300s window, as in collector) ---
-    trades = _fetch_trade_tape(ccxt_id, sym_ticker)
-    if trades:
-        now_ms = time.time() * 1000.0
-        recent = [
-            t for t in trades
-            if t.get("timestamp") and float(t["timestamp"]) >= now_ms - 300_000
-        ]
-        row["ob_trades_per_min"] = len(recent) / 5.0
-        prices = [float(t["price"]) for t in trades if t.get("price")]
-        if len(trades) >= 30 and len(set(prices)) <= 4:
+    # --- Trades/min over a 300s window (DB live row, else direct tape) ---
+    if live_row and live_row.get("trades_per_min") is not None:
+        row["ob_trades_per_min"] = live_row["trades_per_min"]
+        if live_row.get("is_barcode"):
             row["ob_is_barcode"] = True  # barcode market → DEAD tape chip
+    else:
+        trades = _fetch_trade_tape(ccxt_id, sym_ticker)
+        if trades:
+            now_ms = time.time() * 1000.0
+            recent = [
+                t for t in trades
+                if t.get("timestamp") and float(t["timestamp"]) >= now_ms - 300_000
+            ]
+            row["ob_trades_per_min"] = len(recent) / 5.0
+            prices = [float(t["price"]) for t in trades if t.get("price")]
+            if len(trades) >= 30 and len(set(prices)) <= 4:
+                row["ob_is_barcode"] = True  # barcode market → DEAD tape chip
 
     # --- Min 7d $Vol: min(vol×low) over the last 7 CLOSED daily bars ---
     if hist_1d is not None and not hist_1d.empty:
@@ -787,6 +1188,9 @@ with tab_charts:
     row_1d = find_table_row(df_1d, sym_ticker, sym_ex)
     live_interval = 0.0 if live_refresh == "Off" else float(live_refresh[:-1])
     ccxt_id = settings.exchange_map_1d.get(sym_ex, sym_ex)
+    # TimescaleDB table row all live widgets read from (written every second
+    # by the background live daemon for the current pair ± 5 neighbours).
+    live_db = None if demo_mode else _live_db_for(row_1d, row_15m)
 
     # Daily candles for the live health strip chips (ATR & Min 7d $Vol).
     # Reused by the ATR metrics below the charts — cache makes it free.
@@ -812,7 +1216,8 @@ with tab_charts:
         @st.fragment(run_every=live_interval)
         def _strip_fragment():
             live_row = _compute_live_health_row(
-                sym_ticker, sym_ex, hist_1d_live, atr_live, row_1d or row_15m
+                sym_ticker, sym_ex, hist_1d_live, atr_live, row_1d or row_15m,
+                db_name=live_db,
             )
             st.markdown(build_health_strip_html(live_row), unsafe_allow_html=True)
 
@@ -832,11 +1237,11 @@ with tab_charts:
     if live_interval > 0 and hasattr(st, "fragment"):
         @st.fragment(run_every=live_interval)
         def _live_fragment():
-            _render_live_panel(sym_ticker, sym_ex, demo_mode)
+            _render_live_panel(sym_ticker, sym_ex, demo_mode, db_name=live_db)
 
         _live_fragment()
     else:
-        _render_live_panel(sym_ticker, sym_ex, demo_mode)
+        _render_live_panel(sym_ticker, sym_ex, demo_mode, db_name=live_db)
 
     def render_chart(row, tf_label, limit, interval, chart_height=470):
         """Renders one timeframe chart into the current container."""
@@ -883,7 +1288,17 @@ with tab_charts:
         if chart_engine == "TradingView Lightweight Canvas":
             step = 900 if tf_label == "15m" else 86400
             interval_ms = int(live_interval * 1000) if live_interval > 0 else 0
-            poller_js = build_live_poller_js(sym_ex, sym_ticker, step, interval_ms)
+            # Chart poller reads the DB live row through the dashboard's own
+            # /tick endpoint (host resolved in-browser); direct exchange REST
+            # is kept only as fallback. Works for all 9 exchanges and never
+            # gives up on errors.
+            _infra = _live_infra_or_none() if (live_db and interval_ms > 0) else None
+            tick_path = _live_tick_path(live_db, sym_ex, sym_ticker) if _infra else None
+            poller_js = build_live_poller_js(
+                sym_ex, sym_ticker, step, interval_ms,
+                tick_path=tick_path,
+                tick_port=(_infra or {}).get("tick_port"),
+            )
             render_tradingview_lightweight_chart(
                 hist_df, sym_ticker, sym_ex, tf_label,
                 chart_height=chart_height,
@@ -1013,14 +1428,29 @@ with tab_charts:
     # Kicks daemon threads that pre-fill every cache the neighbour views need:
     # candle frames, exchange gap/tail stitch fetches, live chips feeds, and
     # (±2) the full orderbook snapshot. Zero blocking on pair switch.
-    if not demo_mode and len(TICKER_OPTIONS) > 1:
+    # The same ±5 set becomes the live writer's target: every second the live
+    # daemon persists price / orderbook / spread / tape stats of exactly these
+    # pairs into TimescaleDB, and all live widgets above just read those rows.
+    if not demo_mode and sym_ticker and sym_ex and TICKER_OPTIONS:
         try:
+            _live_infra()  # starts the writer daemon + /tick endpoint (runs once)
+            live_pairs = []
+            seen = set()
             cur_idx = TICKER_OPTIONS.index(sym_ticker)
-            for delta in [d for d in range(-5, 6) if d != 0]:
+            for delta in range(-5, 6):
                 nb_ticker = TICKER_OPTIONS[(cur_idx + delta) % len(TICKER_OPTIONS)]
+                if nb_ticker in seen:
+                    continue
+                seen.add(nb_ticker)
                 nb_15 = find_table_row(df_15m, nb_ticker, sym_ex)
                 nb_1d = find_table_row(df_1d, nb_ticker, sym_ex)
-                if not (nb_15 or nb_1d):
+                if delta != 0 and not (nb_15 or nb_1d):
+                    continue
+                live_pairs.append({
+                    "db": _live_db_for(nb_1d, nb_15) or live_db,
+                    "ex": sym_ex, "ccxt": ccxt_id, "sym": nb_ticker,
+                })
+                if delta == 0:
                     continue
                 _bg(
                     ("pair", nb_ticker, sym_ex),
@@ -1030,8 +1460,11 @@ with tab_charts:
                             limit_15m, limit_1d, atr_days, fl,
                         ),
                 )
+            _set_live_target([p for p in live_pairs if p["db"]])
         except Exception:
             pass
+    else:
+        _set_live_target([])  # demo mode / no pair selected → live writer idles
 
     # --- Auto-reload DB data (full app rerun every 60 s) ---------------------
     if auto_reload and hasattr(st, "fragment"):

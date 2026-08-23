@@ -295,8 +295,70 @@ def test_build_live_poller_js_variants():
     gate = build_live_poller_js("gateio", "BTC/USDT:USDT", 900, 1000)
     assert "futures/usdt/tickers" in gate and "contract=BTC_USDT" in gate
 
-    assert build_live_poller_js("htx", "ADA/USDT", 900, 1000) == ""   # unsupported
-    assert build_live_poller_js("bybit", "ADA/USDT", 900, 0) == ""    # disabled
+    assert build_live_poller_js("unknown_ex", "ADA/USDT", 900, 1000) == ""  # unsupported
+    assert build_live_poller_js("bybit", "ADA/USDT", 900, 0) == ""          # disabled
+
+
+def test_build_live_poller_js_all_nine_exchanges_supported():
+    """Every collector exchange must have a live chart poller — a missing one
+    leaves the chart frozen while only the server-side chips keep updating."""
+    from dashboard.helpers import build_live_poller_js
+
+    cases = [
+        ("bybit", "BTC/USDT:USDT", "api.bybit.com"),
+        ("okx", "BTC/USDT:USDT", "okx.com"),
+        ("gateio", "BTC/USDT:USDT", "gateio.ws"),
+        ("kucoin", "BTC/USDT:USDT", "kucoin.com"),
+        ("mexc", "BTC/USDT:USDT", "mexc.com"),
+        ("bingx", "BTC/USDT:USDT", "bingx.com"),
+        ("bitget", "BTC/USDT:USDT", "api.bitget.com/api/v2/mix"),
+        ("htx", "BTC/USDT:USDT", "hbdm.com/linear-swap-ex"),
+        ("coinex", "BTC/USDT:USDT", "coinex.com/v2/futures"),
+    ]
+    for exchange, symbol, marker in cases:
+        js = build_live_poller_js(exchange, symbol, 900, 1000)
+        assert js, f"no live poller for {exchange}"
+        assert marker in js, f"unexpected endpoint for {exchange}"
+        assert "__STEP__" not in js and "__PARSE__" not in js
+
+    # spot variants resolve too
+    assert "productType" not in build_live_poller_js("bitget", "BTC/USDT", 900, 1000)
+    assert "symbol=btcusdt" in build_live_poller_js("htx", "BTC/USDT", 900, 1000)
+    assert "spot/ticker" in build_live_poller_js("coinex", "BTC/USDT", 900, 1000)
+
+
+def test_build_live_poller_js_never_gives_up():
+    """The poller must retry forever: a previous version called clearInterval
+    after 5 failed fetches, permanently freezing the chart on any hiccup."""
+    from dashboard.helpers import _LIVE_POLLER_TEMPLATE, build_live_poller_js
+
+    assert "clearInterval" not in _LIVE_POLLER_TEMPLATE
+    js = build_live_poller_js("bybit", "BTC/USDT:USDT", 900, 1000)
+    assert "clearInterval" not in js
+    assert "inflight" in js  # overlapping-request guard
+
+
+def test_build_live_poller_js_db_tick_mode():
+    """DB mode: the poller reads the dashboard's own /tick endpoint (serving the
+    TimescaleDB live row) first, with direct exchange REST only as fallback."""
+    from dashboard.helpers import build_live_poller_js
+
+    tick_path = "/tick?db=ohlcv_1d_high&ex=bybit&sym=BTC%2FUSDT%3AUSDT"
+    js = build_live_poller_js(
+        "bybit", "BTC/USDT:USDT", 900, 1000, tick_path=tick_path, tick_port=8511
+    )
+    assert tick_path in js and "8511" in js
+    assert "document.referrer" in js  # host resolved client-side (srcdoc iframe)
+    assert "+j.last" in js            # DB payload parse
+    assert "api.bybit.com" in js      # direct REST stays as fallback
+
+    # DB payload alone is enough even for an exchange without a REST mapping
+    js2 = build_live_poller_js(
+        "unknown_ex", "BTC/USDT:USDT", 900, 1000,
+        tick_path=tick_path, tick_port=8511,
+    )
+    assert tick_path in js2
+    assert "__TICK_PATH__" not in js2 and "__TICK_PORT__" not in js2
 
 
 # ---------------------------------------------------------------------------
