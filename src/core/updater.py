@@ -36,6 +36,39 @@ class MarketDataEngine:
         self.repository: Optional[HistoricalMarketRepository] = None
         self.progress: Optional[GlobalProgress] = None
         self.timeframe = timeframe or settings.timeframe
+        # Throttles: keep cycles fast on a large fleet
+        self._empty_since: Dict[str, float] = {}   # tbl -> ts of last empty-symbol backfill attempt
+        self._gap_since: Dict[str, float] = {}     # tbl -> ts of last gap check
+        self._gap_budget_until = 0.0               # gap filling deadline for the current cycle
+        self._gap_budget_logged = False
+
+    def _should_attempt_backfill(self, tbl_name: str) -> bool:
+        """Empty symbols (0 candles: tokenized stocks, delisted) are retried
+        at most once per settings.empty_symbol_retry_sec instead of every cycle."""
+        now = time.time()
+        last = self._empty_since.get(tbl_name, 0.0)
+        if now - last < settings.empty_symbol_retry_sec:
+            return False
+        self._empty_since[tbl_name] = now
+        return True
+
+    def _should_gap_check(self, tbl_name: str) -> bool:
+        """Each table is gap-checked at most once per settings.gap_recheck_sec,
+        and only while the per-cycle gap-filling time budget lasts."""
+        if time.time() > self._gap_budget_until:
+            if not self._gap_budget_logged:
+                logger.info(
+                    f"[{self.timeframe.upper()}] Gap-filler budget for this cycle exhausted "
+                    f"({settings.gap_filler_budget_sec}s) — remaining tables will be checked next cycle."
+                )
+                self._gap_budget_logged = True
+            return False
+        now = time.time()
+        last = self._gap_since.get(tbl_name, 0.0)
+        if now - last < settings.gap_recheck_sec:
+            return False
+        self._gap_since[tbl_name] = now
+        return True
 
     async def initialize(self) -> None:
         """Ensures databases exist and initializes connection pools."""
@@ -103,6 +136,10 @@ class MarketDataEngine:
             # --- Fetch OHLCV Candles ---
             if last_ts == 0:
                 if not settings.backfill_new_tables:
+                    return 0
+                # Empty/failed symbols (tokenized stocks, delisted) create empty
+                # tables — without a cooldown they would be re-backfilled every cycle.
+                if not self._should_attempt_backfill(tbl_name):
                     return 0
 
                 logger.info(f"  [{self.timeframe.upper()}] ⏳ Backfilling new symbol history: {symbol} ({ccxt_id})...")
@@ -193,7 +230,7 @@ class MarketDataEngine:
                 )
 
             # --- Check Gap Filling ---
-            if settings.check_and_fill_gaps and current_db:
+            if settings.check_and_fill_gaps and current_db and self._should_gap_check(tbl_name):
                 try:
                     await fill_history_gaps(
                         exchange,
@@ -343,6 +380,8 @@ class MarketDataEngine:
     async def run_cycle(self) -> None:
         """Executes one full iteration cycle over all configured exchanges."""
         self.progress = GlobalProgress()
+        self._gap_budget_until = time.time() + settings.gap_filler_budget_sec
+        self._gap_budget_logged = False
         active_exchanges = self.get_configured_exchanges()
 
         if settings.precount_pairs:

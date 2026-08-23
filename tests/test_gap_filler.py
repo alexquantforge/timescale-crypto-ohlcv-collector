@@ -121,3 +121,49 @@ def test_fetch_ohlcv_catch_up_future_since_clamped():
                              since_sec=int(time.time()) + 10 * 365 * 86400)
     )
     assert FutEx.got_since <= int(time.time() * 1000)  # clamped to now
+
+
+def test_fetch_ohlcv_catch_up_reraises_badsymbol():
+    import asyncio
+    import ccxt
+    from src.exchanges.gap_filler import fetch_ohlcv_catch_up
+
+    class DeadEx:
+        async def fetch_ohlcv(self, symbol, timeframe="1d", since=None, limit=50):
+            raise ccxt.BadSymbol("bogus symbol")
+
+    try:
+        asyncio.run(
+            fetch_ohlcv_catch_up(DeadEx(), "XXX/USDT:USDT", "1d", since_sec=1_786_000_000)
+        )
+    except ccxt.BadSymbol:
+        passed = True
+    else:
+        passed = False
+    assert passed, "BadSymbol must propagate so the engine drops delisted tables"
+
+
+def test_engine_throttles_backfill_and_gap_checks():
+    from src.core.updater import MarketDataEngine
+    from config.settings import settings
+
+    eng = MarketDataEngine(timeframe="1d")
+
+    # Empty-symbol backfill: first attempt allowed, second blocked until cooldown
+    assert eng._should_attempt_backfill("a_on_bybit") is True
+    assert eng._should_attempt_backfill("a_on_bybit") is False
+    # another table independent
+    assert eng._should_attempt_backfill("b_on_bybit") is True
+
+    # Cooldown expiry simulated
+    eng._empty_since["a_on_bybit"] -= settings.empty_symbol_retry_sec + 1
+    assert eng._should_attempt_backfill("a_on_bybit") is True
+
+    # Gap budget: with budget available -> checks allowed but once per table
+    eng._gap_budget_until = __import__("time").time() + 3600
+    assert eng._should_gap_check("a_on_bybit") is True
+    assert eng._should_gap_check("a_on_bybit") is False
+
+    # Budget exhausted -> blocked for everyone
+    eng._gap_budget_until = 0.0
+    assert eng._should_gap_check("c_on_bybit") is False

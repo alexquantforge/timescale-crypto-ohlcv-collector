@@ -119,6 +119,9 @@ class Settings(BaseSettings):
     }
 
     gap_max_pages_per_range: int = Field(default=50, alias="GAP_MAX_PAGES_PER_RANGE")  # max OHLCV pages per gap fill
+    gap_filler_budget_sec: int = Field(default=600, alias="GAP_FILLER_BUDGET_SEC")  # max seconds of gap filling per engine cycle
+    gap_recheck_sec: int = Field(default=21600, alias="GAP_RECHECK_SEC")  # min seconds between gap checks of the same table (6h)
+    empty_symbol_retry_sec: int = Field(default=86400, alias="EMPTY_SYMBOL_RETRY_SEC")  # retry backfill of empty symbols at most once/day
 
     check_and_fill_gaps: bool = Field(default=True, alias="CHECK_AND_FILL_GAPS")
     gap_tolerance_sec_15m: int = Field(default=1800, alias="GAP_TOLERANCE_SEC_15M")  # 30 min tolerance

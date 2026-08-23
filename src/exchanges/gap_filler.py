@@ -5,6 +5,7 @@ Gap filling module for detecting and backfilling missing candle buckets
 import asyncio
 import logging
 import time
+import ccxt
 from typing import List, Set, Tuple
 import numpy as np
 import pandas as pd
@@ -137,6 +138,13 @@ async def fetch_ohlcv_catch_up(
                 exchange.fetch_ohlcv(symbol, timeframe, since=cursor_ms, limit=page_limit),
                 timeout=timeout,
             )
+        except ccxt.BadSymbol:
+            raise  # let the engine drop the delisted table
+        except ccxt.ExchangeError as e:
+            msg = str(e).lower()
+            if any(t in msg for t in ("symbol is not found", "invalid symbol", "symbol_not_found", "100204", "48001")):
+                raise  # delisted -> engine cleanup
+            break
         except Exception:
             break
         if not batch:
