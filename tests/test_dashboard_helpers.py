@@ -196,6 +196,52 @@ def test_sanitize_candle_frame_single_ms_row_in_seconds_table():
     assert 1_780_000_000 in out["ts"].tolist()
 
 
+def test_filter_sane_summary_rows_drops_ghost_pairs():
+    """Ghost pairs: a table whose last row has a corrupted timestamp (future
+    2031-style, pre-2013, ms-epoch or NaN) appeared in the pair list while its
+    chart could never render a candle. The filter drops them at summary level."""
+    from dashboard.helpers import filter_sane_summary_rows
+    import time as _t
+
+    now = int(_t.time())
+    df = pd.DataFrame([
+        {"ticker": "GOOD/USDT:USDT", "max_ts": now - 900},          # fresh
+        {"ticker": "EDGY/USDT:USDT", "max_ts": now + 86400},        # +1d allowed (like sanitize)
+        {"ticker": "GHOST/USDT:USDT", "max_ts": now + 10 * 86400},  # +10d future -> garbage
+        {"ticker": "OLD/USDT:USDT", "max_ts": 1_234_567_890},       # 2009 -> garbage
+        {"ticker": "MS/USDT:USDT", "max_ts": now * 1000},           # lone ms row in s frame -> garbage
+        {"ticker": "NAN/USDT:USDT", "max_ts": None},
+    ])
+    out = filter_sane_summary_rows(df)
+    assert out["ticker"].tolist() == ["GOOD/USDT:USDT", "EDGY/USDT:USDT"]
+
+
+def test_filter_sane_summary_rows_ms_frame_converted_and_kept():
+    from dashboard.helpers import filter_sane_summary_rows
+    import time as _t
+
+    now_ms = int(_t.time() * 1000)
+    df = pd.DataFrame([
+        {"ticker": "A/USDT:USDT", "max_ts": now_ms},
+        {"ticker": "B/USDT:USDT", "max_ts": now_ms - 900_000},
+    ])
+    out = filter_sane_summary_rows(df)
+    assert len(out) == 2  # whole ms frame converted, valid rows kept
+
+    empty = filter_sane_summary_rows(pd.DataFrame())
+    assert empty is not None and empty.empty
+    assert filter_sane_summary_rows(None) is None
+
+
+def test_demo_summary_passes_sanity_filter():
+    """Demo mode must survive the ghost-pair filter (regression: demo used a
+    fixed 1.8e9 max_ts, which drifts into the future as real time passes)."""
+    from dashboard.helpers import generate_demo_summary, filter_sane_summary_rows
+
+    for tf in ["15m", "1d"]:
+        assert not filter_sane_summary_rows(generate_demo_summary(tf)).empty
+
+
 def test_is_perp_and_find_perp_ticker():
     from dashboard.helpers import is_perp_symbol, find_perp_ticker
 

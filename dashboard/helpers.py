@@ -97,7 +97,7 @@ def generate_demo_summary(timeframe: str) -> pd.DataFrame:
                 "ticker": t,
                 "exchange": ex,
                 "asset_type": "perp",
-                "max_ts": int(1.8e9),
+                "max_ts": int(_time.time()),  # anchor demo summaries to now so the sanity filter keeps them
                 "close": close,
                 "ob_vitality_grade": str(rng.choice(["A", "B", "C", "D"])),
                 "ob_vitality_score": float(rng.uniform(1, 10)),
@@ -300,6 +300,29 @@ def sanitize_candle_frame(df: pd.DataFrame, min_ts: int = 1356998400) -> pd.Data
     now = _time.time()
     df = df[(df["ts"] >= min_ts) & (df["ts"] <= now + 2 * 86400)]
     return df.sort_values("ts").reset_index(drop=True)
+
+
+def filter_sane_summary_rows(df: pd.DataFrame, min_ts: int = 1356998400) -> pd.DataFrame:
+    """
+    Drops summary rows whose last-candle timestamp is garbage, applying the
+    SAME bounds as sanitize_candle_frame() (whole-frame ms→s detection, then
+    min_ts <= max_ts <= now + 2 days).
+
+    Without this, a pair whose table contains ONLY corrupted rows (e.g.
+    future 2031 timestamps or ms-epochs) still entered the dashboard pair
+    list — the summary scan saw the raw row — but its charts then rendered
+    zero sanitized candles ("No candles available"). Now such ghost pairs
+    never enter TICKER_OPTIONS at all.
+    """
+    if df is None or df.empty or "max_ts" not in df.columns:
+        return df
+    ts = pd.to_numeric(df["max_ts"], errors="coerce")
+    med = ts.median(skipna=True)
+    if pd.notna(med) and float(med) > 1e11:  # milliseconds table(s)
+        ts = ts // 1000
+    now = _time.time()
+    ok = (ts >= min_ts) & (ts <= now + 2 * 86400)
+    return df[ok.fillna(False)]
 
 
 # ---------------------------------------------------------------------------

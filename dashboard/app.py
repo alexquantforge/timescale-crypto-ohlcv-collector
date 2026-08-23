@@ -46,6 +46,7 @@ from dashboard.helpers import (
     build_pair_links_html,
     find_perp_ticker,
     sanitize_candle_frame,
+    filter_sane_summary_rows,
     merge_intraday_into_daily,
     build_live_poller_js,
     build_lightweight_chart_html,
@@ -1114,6 +1115,12 @@ if enabled_exs and not df_15m.empty:
     df_15m = df_15m[df_15m["exchange"].isin(enabled_exs)]
 if enabled_exs and not df_1d.empty:
     df_1d = df_1d[df_1d["exchange"].isin(enabled_exs)]
+
+# Drop ghost pairs: tables whose last-candle timestamp is garbage (corrupted
+# future dates / ms epochs). The summary scan sees the raw row, but the chart
+# sanitize drops every candle — such pairs must never enter the pair list.
+df_15m = filter_sane_summary_rows(df_15m)
+df_1d = filter_sane_summary_rows(df_1d)
 
 df_table = df_15m if table_tf == "15m" else df_1d
 
