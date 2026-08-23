@@ -324,7 +324,7 @@ def test_stitch_candle_gaps_fills_hole_with_fake_fetcher():
         # returns ms candles for the requested bucket range
         return [[(base + b * step) * 1000, 1.0, 1.5, 0.9, 1.2, 5.0] for b in range(r0 - base // step, r1 - base // step)]
 
-    out, added = stitch_candle_gaps(df, fetcher, step)
+    out, added = stitch_candle_gaps(df, fetcher, step, include_tail=False)
     assert added == 2
     ts = out["ts"].tolist()
     assert ts == sorted(ts)
@@ -343,3 +343,37 @@ def test_stitch_candle_gaps_no_gap_noop_and_skips_huge_gaps():
     huge = _mk_df([1_786_000_000, 1_786_000_000 + 5000 * step])
     out2, added2 = stitch_candle_gaps(huge, lambda r0, r1: [], step, max_gap_buckets=2000)
     assert added2 == 0 and len(out2) == 2
+
+
+def test_stitch_candle_gaps_fetches_closed_tail_only():
+    from dashboard.helpers import stitch_candle_gaps
+
+    step = 900
+    now = 1_786_100_000
+    # stored frame ends 3 closed buckets + 1 forming bucket behind `now`
+    last_stored = now - 4 * step
+    df = _mk_df([last_stored - step, last_stored])
+
+    calls = []
+
+    def fetcher(r0, r1):
+        calls.append((r0, r1))
+        return [[b * step * 1000, 1.0, 1.5, 0.9, 1.2, 5.0] for b in range(r0, r1)]
+
+    out, added = stitch_candle_gaps(df, fetcher, step, include_tail=True, now_sec=now)
+    assert added == 3  # three closed buckets, forming one excluded
+    tail_call = calls[-1]
+    assert tail_call[0] == last_stored // step + 1
+    assert tail_call[1] == now // step  # half-open: forming bucket NOT fetched
+    assert (out["ts"] == now // step * step).sum() == 0  # no forming bar added
+    assert out["ts"].is_monotonic_increasing
+
+
+def test_stitch_candle_gaps_tail_disabled():
+    from dashboard.helpers import stitch_candle_gaps
+
+    step = 900
+    now = 1_786_100_000
+    df = _mk_df([now - 3 * step, now - 2 * step])
+    out, added = stitch_candle_gaps(df, lambda r0, r1: [], step, include_tail=False, now_sec=now)
+    assert added == 0 and len(out) == len(df)

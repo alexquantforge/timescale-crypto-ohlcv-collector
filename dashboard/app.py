@@ -746,23 +746,30 @@ with tab_charts:
             return
         hist_df = get_candles(tf_label, row, limit, demo_mode)
 
-        # In-memory gap stitching: fetch missing bars from the exchange
-        if stitch_gaps and not demo_mode and hist_df is not None and len(hist_df) > 1:
-            step = 900 if tf_label == "15m" else 86400
-            timeframe = "15m" if tf_label == "15m" else "1d"
-            exchange_map = settings.exchange_map_1d
-            ccxt_id = exchange_map.get(sym_ex, sym_ex)
-            hist_df, stitched = stitch_candle_gaps(
-                hist_df,
-                lambda r0, r1: _fetch_missing_candles_cached(ccxt_id, sym_ticker, timeframe, r0, r1),
-                step,
-            )
-            if stitched:
-                st.caption(f"🩹 {stitched} missing {tf_label} candles stitched from exchange (in-memory)")
+        exchange_map = settings.exchange_map_1d
+        ccxt_id = exchange_map.get(sym_ex, sym_ex)
+
+        def _stitch(frame, timeframe):
+            """Gap + closed-tail stitching from the exchange (in-memory)."""
+            if stitch_gaps and not demo_mode and frame is not None and len(frame) > 1:
+                step = 900 if timeframe == "15m" else 86400
+                frame, added = stitch_candle_gaps(
+                    frame,
+                    lambda r0, r1: _fetch_missing_candles_cached(ccxt_id, sym_ticker, timeframe, r0, r1),
+                    step,
+                )
+                return frame, added
+            return frame, 0
+
+        hist_df, stitched = _stitch(hist_df, "15m" if tf_label == "15m" else "1d")
+        if stitched:
+            st.caption(f"🩹 {stitched} missing {tf_label} candles stitched from exchange (in-memory)")
 
         # Keep the daily chart in sync: aggregate fresher 15m candles of today
+        # (the 15m frame is stitched too, so today's daily bar is always fresh)
         if tf_label == "1D" and row_15m is not None:
             df15 = get_candles("15m", row_15m, max(limit_15m, 200), demo_mode)
+            df15, _ = _stitch(df15, "15m")
             hist_df = merge_intraday_into_daily(hist_df, df15)
 
         if chart_engine == "TradingView Lightweight Canvas":

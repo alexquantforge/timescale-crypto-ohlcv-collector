@@ -515,12 +515,22 @@ def find_missing_bucket_ranges(buckets, step: int):
     return ranges
 
 
-def stitch_candle_gaps(df: pd.DataFrame, fetcher, step: int, max_gap_buckets: int = 2000):
+def stitch_candle_gaps(
+    df: pd.DataFrame,
+    fetcher,
+    step: int,
+    max_gap_buckets: int = 2000,
+    include_tail: bool = True,
+    now_sec: Optional[int] = None,
+):
     """
     Fills gaps in a candle frame by fetching the missing bars through `fetcher`
     (a callable (start_bucket, end_bucket) -> [[ts_ms, o, h, l, c, v], ...]).
-    Pure data operation (fully testable with a fake fetcher); returns
-    (new_df, added_count). The database itself is NOT modified.
+    With include_tail=True it also fetches the CLOSED bars between the last
+    stored candle and now (the still-forming bar is left to the live poller —
+    closed bars are immutable and safe to cache). Pure data operation (fully
+    testable with a fake fetcher); returns (new_df, added_count). The database
+    itself is NOT modified.
     """
     if df is None or df.empty:
         return df, 0
@@ -528,6 +538,13 @@ def stitch_candle_gaps(df: pd.DataFrame, fetcher, step: int, max_gap_buckets: in
     ts_sorted = sorted(int(t) for t in df["ts"])
     buckets = sorted(set(t // step for t in ts_sorted))
     ranges = [r for r in find_missing_bucket_ranges(buckets, step) if r[1] - r[0] <= max_gap_buckets]
+
+    if include_tail and buckets:
+        now = int(now_sec if now_sec is not None else _time.time())
+        now_bucket = now // step
+        if buckets[-1] < now_bucket and now_bucket - buckets[-1] <= max_gap_buckets:
+            ranges.append((buckets[-1] + 1, now_bucket))  # half-open: forming bar excluded
+
     if not ranges:
         return df, 0
 
