@@ -422,10 +422,13 @@ def test_chart_html_declaration_precedes_all_uses():
     assert decl < html.index("let lastBar = candlesData.length")
 
 
-def test_chart_html_injects_live_poller_and_badge():
+def test_chart_html_injects_live_poller_without_visual_noise():
     html = _build_chart_html()
     assert "POLLER_STUB();" in html
-    assert 'id="live-badge"' in html
+    # no in-chart 'LIVE' decorations: neither the price-line axis title nor
+    # the corner badge (redundant next to the always-on server LIVE chip)
+    assert 'live-badge' not in html
+    assert "title: 'LIVE'" not in html
 
 
 def test_chart_html_volume_optional():

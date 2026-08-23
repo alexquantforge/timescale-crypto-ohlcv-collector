@@ -374,7 +374,7 @@ def build_lightweight_chart_html(
 
     The candle/volume payloads are embedded ONCE as JS variables
     (`candlesData` / `volumeData`) and every consumer — setData, the lastBar
-    initializer, the live badge/line and the browser-side live poller —
+    initializer, the live price line and the browser-side live poller —
     references those variables.
 
     Regression note: a previous version built the lastBar line from a JS
@@ -423,13 +423,10 @@ def build_lightweight_chart_html(
         <style>
             body {{ margin: 0; padding: 0; background-color: #131722; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; }}
             #tv-chart {{ width: 100%; height: {chart_height}px; position: relative; }}
-            #live-badge {{ position: absolute; top: 8px; right: 70px; z-index: 10; display: none;
-                background: rgba(66, 165, 245, 0.15); color: #42a5f5; border: 1px solid rgba(66, 165, 245, 0.4);
-                border-radius: 8px; padding: 2px 8px; font-size: 12px; }}
         </style>
     </head>
     <body>
-        <div id="tv-chart"><div id="live-badge"></div></div>
+        <div id="tv-chart"></div>
         <script>
             const fmtPrice = (p) => {{
                 const a = Math.abs(p);
@@ -554,16 +551,6 @@ _LIVE_POLLER_TEMPLATE = """
       __PARSE__
       if (!isFinite(price) || price <= 0) { throw new Error('bad price'); }
       if (liveLine) { try { liveLine.applyOptions({ price: price }); } catch (e) {} }
-      const badge = document.getElementById('live-badge');
-      if (badge) {
-        let sp = '';
-        if (isFinite(bid) && isFinite(ask) && bid > 0 && ask > 0) {
-          const pct = (ask - bid) / ((ask + bid) / 2) * 100;
-          sp = ' \\u00b7 spread ' + pct.toFixed(3) + '%';
-        }
-        badge.style.display = 'block';
-        badge.textContent = '\\u25cf LIVE ' + price + sp;
-      }
       const now = Math.floor(Date.now() / 1000);
       const step = __STEP__;
       const barTs = now - (now % step);
@@ -580,8 +567,6 @@ _LIVE_POLLER_TEMPLATE = """
       fails += 1;
       if (fails >= 5) {
         clearInterval(timer);
-        const b = document.getElementById('live-badge');
-        if (b) { b.style.display = 'none'; }
       }
     }
   }, __MS__);
@@ -592,7 +577,7 @@ _LIVE_POLLER_TEMPLATE = """
 def build_live_poller_js(exchange: str, symbol: str, step_sec: int, interval_ms: int = 1000) -> str:
     """
     Returns browser-side JS that polls the exchange public REST ticker once per
-    interval and live-updates the last chart bar + a LIVE price badge/line.
+    interval and live-updates the last chart bar + the dotted live price line.
     Empty string for unsupported exchanges (chart simply stays DB-static).
     """
     if interval_ms <= 0:
