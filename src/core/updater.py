@@ -76,6 +76,52 @@ class MarketDataEngine:
         self._empty_since[tbl_name] = now
         return True
 
+    async def _watchdog(self, stall_timeout: float = 180.0) -> None:
+        """
+        If global progress stalls (no symbol completes) for stall_timeout,
+        dumps every pending asyncio task with its current await location to
+        the log — turns a silent freeze into an exact diagnostic of where
+        the engine is stuck.
+        """
+        last_done = -1
+        stalled_since: Optional[float] = None
+        try:
+            while True:
+                await asyncio.sleep(30.0)
+                done = self.progress.done if self.progress else 0
+                if done != last_done:
+                    last_done = done
+                    stalled_since = None
+                    continue
+                now = time.time()
+                if stalled_since is None:
+                    stalled_since = now
+                elif now - stalled_since >= stall_timeout:
+                    total = self.progress.total if self.progress else 0
+                    logger.error(
+                        f"[{self.timeframe.upper()}] 🐕 WATCHDOG: no progress for {stall_timeout:.0f}s "
+                        f"({done}/{total}). Pending tasks:"
+                    )
+                    shown = 0
+                    for task in asyncio.all_tasks():
+                        if task.done() or task is asyncio.current_task():
+                            continue
+                        if shown >= 40:
+                            logger.error("  ... (more tasks truncated)")
+                            break
+                        corr = task.get_coro()
+                        name = getattr(corr, "__qualname__", str(corr))
+                        where = ""
+                        stack = task.get_stack()
+                        if stack:
+                            f = stack[-1]
+                            where = f" <- stuck at {f.f_code.co_filename}:{f.f_lineno} in {f.f_code.co_name}()"
+                        logger.error(f"  task: {name}{where}")
+                        shown += 1
+                    stalled_since = now  # re-arm: dump again if still frozen later
+        except asyncio.CancelledError:
+            pass
+
     def _should_gap_check(self, tbl_name: str) -> bool:
         """Each table is gap-checked at most once per settings.gap_recheck_sec,
         and only while the per-cycle gap-filling time budget lasts."""
@@ -420,10 +466,14 @@ class MarketDataEngine:
             self.progress.start_timing()
 
         start_time = time.time()
-        results = await asyncio.gather(
-            *[self.process_exchange(e) for e in active_exchanges],
-            return_exceptions=True,
-        )
+        watchdog = asyncio.create_task(self._watchdog())
+        try:
+            results = await asyncio.gather(
+                *[self.process_exchange(e) for e in active_exchanges],
+                return_exceptions=True,
+            )
+        finally:
+            watchdog.cancel()
 
         for ex_name, res in zip(active_exchanges, results):
             if isinstance(res, Exception):
