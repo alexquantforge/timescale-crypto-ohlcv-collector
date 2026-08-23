@@ -31,6 +31,30 @@ MSK_TZ = pytz_timezone("Europe/Moscow")
 ALMATY_TZ = pytz_timezone("Asia/Almaty")
 
 
+async def load_markets_with_retry(
+    exchange, name: str, attempts: int = 3, timeout: float = 12.0
+) -> bool:
+    """
+    Loads exchange markets with retries — gateio/htx/kucoin occasionally
+    time out on flaky networks (empty exception messages are asyncio
+    timeouts), which used to skip the whole exchange for the cycle.
+    """
+    last_err: Optional[BaseException] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            await asyncio.wait_for(exchange.load_markets(), timeout=timeout)
+            return True
+        except Exception as e:
+            last_err = e
+            if attempt < attempts:
+                logger.warning(
+                    f"load_markets for {name} failed (attempt {attempt}/{attempts}): {e!r} — retrying..."
+                )
+                await asyncio.sleep(2.0)
+    logger.warning(f"Failed to load markets for {name} after {attempts} attempts: {last_err!r}")
+    return False
+
+
 class MarketDataEngine:
     def __init__(self, timeframe: Optional[str] = None):
         self.repository: Optional[HistoricalMarketRepository] = None
@@ -328,11 +352,12 @@ class MarketDataEngine:
         ccxt_id = exchange_map.get(ccxt_name, ccxt_name)
         exchange = create_exchange(ccxt_id)
         try:
-            await asyncio.wait_for(exchange.load_markets(), timeout=12.0)
+            if not await load_markets_with_retry(exchange, ccxt_name):
+                return 0
             syms = select_symbols_perp_first(exchange.symbols, exchange.markets, exchange_name=ccxt_name)
             return len(syms)
         except Exception as e:
-            logger.warning(f"Failed precount for {ccxt_name}: {e}")
+            logger.warning(f"Failed precount for {ccxt_name}: {e!r}")
             return 0
         finally:
             await close_exchange_safely(exchange, ccxt_name)
@@ -345,10 +370,7 @@ class MarketDataEngine:
 
         exchange = create_exchange(ccxt_id)
         try:
-            try:
-                await asyncio.wait_for(exchange.load_markets(), timeout=12.0)
-            except Exception as e:
-                logger.warning(f"Failed to load markets for {ccxt_name}: {e}")
+            if not await load_markets_with_retry(exchange, ccxt_name):
                 return
 
             syms = select_symbols_perp_first(exchange.symbols, exchange.markets, exchange_name=ccxt_name)

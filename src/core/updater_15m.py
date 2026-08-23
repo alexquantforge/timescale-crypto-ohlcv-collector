@@ -1144,17 +1144,34 @@ def _make_exchange(ccxt_id: str):
     return getattr(ccxt_async, ccxt_id)(config)
 
 
+async def load_markets_retries(exchange, ccxt_name, attempts: int = 3, timeout: float = 12.0) -> bool:
+    """Load markets with retries — gateio/htx occasionally time out on flaky networks."""
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            await asyncio.wait_for(exchange.load_markets(), timeout=timeout)
+            return True
+        except Exception as e:
+            last_err = e
+            if attempt < attempts:
+                log(f"  [MARKETS] {ccxt_name} attempt {attempt}/{attempts} failed: {e!r} — retrying...")
+                await asyncio.sleep(2.0)
+    log(f"  ⚠️ Failed loading markets for {ccxt_name} after {attempts} attempts: {last_err!r}")
+    return False
+
+
 async def count_pairs_for_exchange(ccxt_name: str) -> int:
     ccxt_id = EXCHANGE_MAP.get(ccxt_name, ccxt_name)
     exchange = _make_exchange(ccxt_id)
     try:
-        await asyncio.wait_for(exchange.load_markets(), timeout=12.0)
+        if not await load_markets_retries(exchange, ccxt_name):
+            return 0
         syms = select_symbols_for_exchange(
             exchange.symbols, exchange.markets, ccxt_name
         )
         return len(syms)
     except Exception as e:
-        log(f"  [PRECOUNT] {ccxt_name}: failed counting pairs: {e}")
+        log(f"  [PRECOUNT] {ccxt_name}: failed counting pairs: {e!r}")
         return 0
     finally:
         await close_exchange_safely(exchange, ccxt_name)
@@ -1167,10 +1184,7 @@ async def process_exchange(ccxt_name):
     exchange = _make_exchange(ccxt_id)
 
     try:
-        try:
-            await asyncio.wait_for(exchange.load_markets(), timeout=12.0)
-        except Exception as e:
-            log(f"  ⚠️ Failed loading markets for {ccxt_name}: {e}")
+        if not await load_markets_retries(exchange, ccxt_name):
             if GLOBAL_PROGRESS is not None:
                 GLOBAL_PROGRESS.subtract_from_total(2000)
             return
