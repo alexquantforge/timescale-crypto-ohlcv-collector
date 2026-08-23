@@ -19,6 +19,7 @@ import sys
 import json
 import time
 import asyncio
+import threading
 import asyncpg
 import numpy as np
 import pandas as pd
@@ -46,6 +47,7 @@ from dashboard.helpers import (
     merge_intraday_into_daily,
     build_live_poller_js,
     build_lightweight_chart_html,
+    find_missing_bucket_ranges,
     stitch_candle_gaps,
 )
 
@@ -425,8 +427,93 @@ def _compute_live_health_row(sym_ticker, sym_ex, hist_1d, atr_val, db_row):
 
 
 # ---------------------------------------------------------------------------
-# Charts
+# Background cache warming — near-instant Prev/Next pair switching.
+# Everything a pair view touches (DB candle frames, exchange gap/tail stitch
+# fetches, live ticker/orderbook/trade-tape chips, full orderbook snapshot)
+# is pre-fetched for the ±5 neighbouring pairs in daemon threads while the
+# user looks at the current pair. The UI thread NEVER waits on these.
 # ---------------------------------------------------------------------------
+_BG_LOCK = threading.Lock()
+_BG_RUNNING: set = set()
+_LIVE_SNAP: dict = {}  # (ticker, exchange, atr) -> (snapshot_or_None, fetched_at)
+
+
+def _bg(key, fn) -> None:
+    """Runs fn() in a daemon thread, deduplicated per key while running."""
+    with _BG_LOCK:
+        if key in _BG_RUNNING:
+            return
+        _BG_RUNNING.add(key)
+
+    def _run():
+        try:
+            fn()
+        except Exception:
+            pass
+        finally:
+            with _BG_LOCK:
+                _BG_RUNNING.discard(key)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _warm_live_snapshot(ticker: str, exchange_name: str, ccxt_id: str, atr_val: float) -> None:
+    """Background fill of the live orderbook snapshot used by metrics cards."""
+    key = (ticker, exchange_name, round(float(atr_val or 0.0), 10))
+    try:
+        snap = fetch_live_cached(ticker, exchange_name, ccxt_id, float(atr_val or 0.0))
+    except Exception:
+        snap = None
+    _LIVE_SNAP[key] = (snap, time.time())
+
+
+def _warm_pair_caches(
+    ticker, exchange_name, ccxt_id, row_15m, row_1d, lim15, lim1d, atr_period, full_live: bool
+) -> None:
+    """
+    Warms ALL data a pair view needs so Prev/Next renders instantly:
+    candle frames (15m+1D), the exchange-side gap/tail stitch fetches,
+    the live chip feeds (ticker/orderbook/trade tape), and — for the
+    immediate ±2 neighbours — the full live orderbook snapshot.
+    """
+    for tf, row, lim in (("15m", row_15m, lim15), ("1d", row_1d, lim1d)):
+        if not row:
+            continue
+        frame = load_candles_cached(
+            db_host, db_port, db_user, db_pass, row["db_name"], row["table_name"], lim
+        )
+        if frame is None or frame.empty:
+            continue
+        step = 900 if tf == "15m" else 86400
+        buckets = sorted(set(int(t) // step for t in frame["ts"]))
+        ranges = find_missing_bucket_ranges(buckets, step)
+        now_bucket = int(time.time()) // step
+        if buckets and buckets[-1] < now_bucket and now_bucket - buckets[-1] <= 2000:
+            ranges.append((buckets[-1] + 1, now_bucket))  # closed tail
+        for r0, r1 in ranges[:10]:
+            _fetch_missing_candles_cached(ccxt_id, ticker, tf, r0, r1)
+    _fetch_ticker_cached(ccxt_id, ticker)
+    _fetch_orderbook_top(ccxt_id, ticker)
+    _fetch_trade_tape(ccxt_id, ticker)
+    if full_live and row_1d is not None:
+        atr_nb = 0.0
+        try:
+            fr = load_candles_cached(
+                db_host, db_port, db_user, db_pass,
+                row_1d["db_name"], row_1d["table_name"], max(int(lim1d), 60),
+            )
+            if fr is not None and not fr.empty and len(fr) >= 3:
+                atr_nb = compute_atr_no_paranormal_bars(
+                    highs=fr["high"].to_numpy(dtype=float),
+                    lows=fr["low"].to_numpy(dtype=float),
+                    closes=fr["close"].to_numpy(dtype=float),
+                    period=atr_period,
+                    small_threshold=settings.atr_small_threshold,
+                    large_threshold=settings.atr_large_threshold,
+                )
+        except Exception:
+            pass
+        _warm_live_snapshot(ticker, exchange_name, ccxt_id, atr_nb)
 
 def build_series_payloads(hist_df: pd.DataFrame, with_volume: bool = True):
     """
@@ -699,6 +786,7 @@ with tab_charts:
     row_15m = find_table_row(df_15m, sym_ticker, sym_ex)
     row_1d = find_table_row(df_1d, sym_ticker, sym_ex)
     live_interval = 0.0 if live_refresh == "Off" else float(live_refresh[:-1])
+    ccxt_id = settings.exchange_map_1d.get(sym_ex, sym_ex)
 
     # Daily candles for the live health strip chips (ATR & Min 7d $Vol).
     # Reused by the ATR metrics below the charts — cache makes it free.
@@ -756,9 +844,6 @@ with tab_charts:
             st.info(f"No {tf_label} table for {sym_ticker}.")
             return
         hist_df = get_candles(tf_label, row, limit, demo_mode)
-
-        exchange_map = settings.exchange_map_1d
-        ccxt_id = exchange_map.get(sym_ex, sym_ex)
 
         def _stitch(frame, timeframe):
             """Gap + closed-tail stitching from the exchange (in-memory)."""
@@ -869,65 +954,82 @@ with tab_charts:
     atr_val = atr_live
 
     db_row = row_1d or row_15m or {}
+    snap_key = (sym_ticker, sym_ex, round(float(atr_val or 0.0), 10))
 
-    snap = None
-    if not demo_mode and sym_ticker and sym_ex:
+    def _render_metrics(src):
+        """Metric cards from `src` (live snapshot when ready, else DB snapshot)."""
+        g = lambda k, d=0.0: float(src.get(k, d) or d)
+
+        mid_price = (g("ob_best_bid") + g("ob_best_ask")) / 2.0
+        if not mid_price:
+            mid_price = g("close")
+        spread_abs = g("ob_spread_abs")
+        spread_pct = g("ob_spread_pct")
+        spread_atr_pct = (spread_abs / atr_val * 100.0) if atr_val > 0 else 0.0
+
+        mcol1, mcol2, mcol3, mcol4, mcol5 = st.columns(5)
+        mcol1.metric(
+            "Live Mid Price", f"${mid_price:,.4f}",
+            delta=f"Bid: ${g('ob_best_bid', mid_price):,.4f} | Ask: ${g('ob_best_ask', mid_price):,.4f}",
+        )
+        mcol2.metric("Live Spread", f"${spread_abs:.4f}", delta=f"{spread_pct:.3f}%")
+        mcol3.metric(f"ATR w/o Paranormal Bars ({atr_days}d)", f"${atr_val:.4f}")
+        mcol4.metric("Spread % of ATR", f"{spread_atr_pct:.2f}%", delta=f"Relative to {atr_days}d ATR")
+        mcol5.metric("Vitality Score", f"{g('ob_vitality_score'):.1f} / 10", delta=f"Grade {src.get('ob_vitality_grade', 'N/A')}")
+
+        st.markdown("##### 📖 Live Orderbook & Trade Tape Metrics")
+        dcol1, dcol2, dcol3, dcol4 = st.columns(4)
+        dcol1.metric(
+            "Total Depth (±1% $)", f"${g('ob_total_depth_usd'):,.2f}",
+            delta=f"Bid: ${g('ob_bid_depth_usd'):,.0f} | Ask: ${g('ob_ask_depth_usd'):,.0f}",
+        )
+        dcol2.metric("Orderbook Imbalance", f"{g('ob_imbalance'):.2f}", delta="Bid / Ask Depth Ratio")
+        dcol3.metric("5m Cumulative Vol Delta (CVD)", f"${g('ob_cvd_5m'):,.2f}", delta=f"Buy Pressure: {g('ob_buy_pressure_pct'):.1f}%")
+        dcol4.metric("Trade Activity", f"{g('ob_trades_per_min'):.1f} trades/min")
+
+    # The full snapshot fetch (exchange ctor + markets + orderbook + trades)
+    # takes seconds — never run it synchronously in the UI path. Show the best
+    # available data instantly and refresh in the background.
+    if demo_mode or not (sym_ticker and sym_ex):
+        _render_metrics(db_row)
+    elif hasattr(st, "fragment"):
+        @st.fragment(run_every=3.0)
+        def _metrics_fragment():
+            entry = _LIVE_SNAP.get(snap_key)
+            if entry is None or time.time() - entry[1] > 25:
+                _bg(
+                    ("live", snap_key),
+                    lambda: _warm_live_snapshot(sym_ticker, sym_ex, ccxt_id, atr_val),
+                )
+            _render_metrics((entry[0] if entry else None) or db_row)
+
+        _metrics_fragment()
+    else:
         with st.spinner(f"Fetching live orderbook for {sym_ticker} on {sym_ex}…"):
-            exchange_map = settings.exchange_map_1d
-            ccxt_id = exchange_map.get(sym_ex, sym_ex)
-            snap = fetch_live_cached(sym_ticker, sym_ex, ccxt_id, atr_val)
+            _warm_live_snapshot(sym_ticker, sym_ex, ccxt_id, atr_val)
+        _render_metrics((_LIVE_SNAP.get(snap_key) or (None, None))[0] or db_row)
 
-    def _metric_source():
-        if snap:
-            return snap
-        return db_row
-
-    src = _metric_source()
-    g = lambda k, d=0.0: float(src.get(k, d) or d)
-
-    mid_price = (g("ob_best_bid") + g("ob_best_ask")) / 2.0
-    if not mid_price:
-        mid_price = g("close")
-    spread_abs = g("ob_spread_abs")
-    spread_pct = g("ob_spread_pct")
-    spread_atr_pct = (spread_abs / atr_val * 100.0) if atr_val > 0 else 0.0
-
-    mcol1, mcol2, mcol3, mcol4, mcol5 = st.columns(5)
-    mcol1.metric(
-        "Live Mid Price", f"${mid_price:,.4f}",
-        delta=f"Bid: ${g('ob_best_bid', mid_price):,.4f} | Ask: ${g('ob_best_ask', mid_price):,.4f}",
-    )
-    mcol2.metric("Live Spread", f"${spread_abs:.4f}", delta=f"{spread_pct:.3f}%")
-    mcol3.metric(f"ATR w/o Paranormal Bars ({atr_days}d)", f"${atr_val:.4f}")
-    mcol4.metric("Spread % of ATR", f"{spread_atr_pct:.2f}%", delta=f"Relative to {atr_days}d ATR")
-    mcol5.metric("Vitality Score", f"{g('ob_vitality_score'):.1f} / 10", delta=f"Grade {src.get('ob_vitality_grade', 'N/A')}")
-
-    st.markdown("##### 📖 Live Orderbook & Trade Tape Metrics")
-    dcol1, dcol2, dcol3, dcol4 = st.columns(4)
-    dcol1.metric(
-        "Total Depth (±1% $)", f"${g('ob_total_depth_usd'):,.2f}",
-        delta=f"Bid: ${g('ob_bid_depth_usd'):,.0f} | Ask: ${g('ob_ask_depth_usd'):,.0f}",
-    )
-    dcol2.metric("Orderbook Imbalance", f"{g('ob_imbalance'):.2f}", delta="Bid / Ask Depth Ratio")
-    dcol3.metric("5m Cumulative Vol Delta (CVD)", f"${g('ob_cvd_5m'):,.2f}", delta=f"Buy Pressure: {g('ob_buy_pressure_pct'):.1f}%")
-    dcol4.metric("Trade Activity", f"{g('ob_trades_per_min'):.1f} trades/min")
-
-    # --- Prefetch neighbour pairs (cache warming for instant flipping) -------
-    # Warms the candle cache for the ±5 pairs around the current one so that
-    # Prev/Next switching renders instantly. Cache hits are free; misses run
-    # a single parallel-safe DB query per table, TTL-bound by the cache itself.
+    # --- Background warming of ±5 neighbour pairs (instant Prev/Next) --------
+    # Kicks daemon threads that pre-fill every cache the neighbour views need:
+    # candle frames, exchange gap/tail stitch fetches, live chips feeds, and
+    # (±2) the full orderbook snapshot. Zero blocking on pair switch.
     if not demo_mode and len(TICKER_OPTIONS) > 1:
         try:
             cur_idx = TICKER_OPTIONS.index(sym_ticker)
             for delta in [d for d in range(-5, 6) if d != 0]:
                 nb_ticker = TICKER_OPTIONS[(cur_idx + delta) % len(TICKER_OPTIONS)]
-                for df_tf, lim in ((df_15m, limit_15m), (df_1d, limit_1d)):
-                    nb_row = find_table_row(df_tf, nb_ticker, sym_ex)
-                    if nb_row:
-                        load_candles_cached(
-                            db_host, db_port, db_user, db_pass,
-                            nb_row["db_name"], nb_row["table_name"], lim,
-                        )
+                nb_15 = find_table_row(df_15m, nb_ticker, sym_ex)
+                nb_1d = find_table_row(df_1d, nb_ticker, sym_ex)
+                if not (nb_15 or nb_1d):
+                    continue
+                _bg(
+                    ("pair", nb_ticker, sym_ex),
+                    lambda t=nb_ticker, r15=nb_15, r1=nb_1d, fl=abs(delta) <= 2:
+                        _warm_pair_caches(
+                            t, sym_ex, ccxt_id, r15, r1,
+                            limit_15m, limit_1d, atr_days, fl,
+                        ),
+                )
         except Exception:
             pass
 
