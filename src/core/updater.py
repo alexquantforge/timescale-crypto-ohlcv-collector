@@ -19,7 +19,7 @@ from src.db.connection import get_db_pools, close_all_db_pools
 from src.db.migrations import ensure_databases_exist
 from src.db.repository import HistoricalMarketRepository
 from src.exchanges.client import create_exchange, close_exchange_safely
-from src.exchanges.gap_filler import fill_history_gaps
+from src.exchanges.gap_filler import fill_history_gaps, fetch_ohlcv_catch_up
 from src.exchanges.symbol_selector import (
     get_exchange_url,
     get_swap_url,
@@ -144,9 +144,13 @@ class MarketDataEngine:
                         break
                     cursor_ms = int(new_rows[-1][0]) + (900000 if self.timeframe == "15m" else 86400000)
             else:
-                cs = await asyncio.wait_for(
-                    exchange.fetch_ohlcv(symbol, self.timeframe, since=since_ts * 1000, limit=50),
-                    timeout=6.0,
+                # Paged catch-up from the last stored candle up to now:
+                # fully synchronises lagging tables in one cycle (a single
+                # limit=50 request covers only 50 candles and left tables
+                # crawling forward or gapped after long downtime).
+                cs = await fetch_ohlcv_catch_up(
+                    exchange, symbol, self.timeframe, since_sec=since_ts,
+                    page_limit=50, max_pages=40,
                 )
 
             if not cs and last_ts == 0:

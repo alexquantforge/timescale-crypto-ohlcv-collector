@@ -82,3 +82,42 @@ def test_fill_history_gaps_no_gaps_noop():
         fill_history_gaps(ex, "BTC/USDT:USDT", "bybit", repo, timeframe="1d")
     )
     assert inserted == 0 and repo.inserted_df is None
+
+
+def test_fetch_ohlcv_catch_up_pages_until_now():
+    import asyncio
+    from src.exchanges.gap_filler import fetch_ohlcv_catch_up
+
+    step_ms = 86400_000
+    start_bucket = 18000  # ~2020-05
+    n_days = 173           # needs 4 pages of 50
+    candles = [[(start_bucket + i) * step_ms, 1.0, 2.0, 0.5, 1.5, 10.0] for i in range(n_days)]
+
+    class PagingEx:
+        calls = 0
+        async def fetch_ohlcv(self, symbol, timeframe="1d", since=None, limit=50):
+            PagingEx.calls += 1
+            return [c for c in candles if c[0] >= since][:limit]
+
+    out = asyncio.run(
+        fetch_ohlcv_catch_up(PagingEx(), "BTC/USDT:USDT", "1d",
+                             since_sec=(start_bucket) * 86400, page_limit=50, max_pages=40)
+    )
+    assert len(out) == n_days
+    assert [c[0] for c in out] == sorted(c[0] for c in out)
+    assert PagingEx.calls == 4  # 50 + 50 + 50 + 23
+
+
+def test_fetch_ohlcv_catch_up_future_since_clamped():
+    import asyncio, time
+    from src.exchanges.gap_filler import fetch_ohlcv_catch_up
+
+    class FutEx:
+        async def fetch_ohlcv(self, symbol, timeframe="1d", since=None, limit=50):
+            FutEx.got_since = since
+            return []
+    asyncio.run(
+        fetch_ohlcv_catch_up(FutEx(), "BTC/USDT:USDT", "1d",
+                             since_sec=int(time.time()) + 10 * 365 * 86400)
+    )
+    assert FutEx.got_since <= int(time.time() * 1000)  # clamped to now

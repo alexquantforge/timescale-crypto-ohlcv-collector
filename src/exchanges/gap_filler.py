@@ -107,3 +107,51 @@ async def fill_history_gaps(
     inserted = await repository.upsert_ohlcv_batch(df, timeframe=timeframe)
     logger.info(f"Filled {inserted}/{len(missing)} missing {timeframe} gap buckets for {symbol} ({ccxt_id})")
     return inserted
+
+
+async def fetch_ohlcv_catch_up(
+    exchange,
+    symbol: str,
+    timeframe: str,
+    since_sec: int,
+    page_limit: int = 50,
+    max_pages: int = 40,
+    timeout: float = 6.0,
+) -> List[list]:
+    """
+    Paged catch-up fetch: pulls ALL candles from `since_sec` up to now, page by
+    page, so a lagging table synchronises fully in a single collector cycle
+    (a single limit=50 request covers only 50 daily candles and used to leave
+    the table crawling forward — or gapped — for months of downtime).
+    """
+    step_ms = (900 if timeframe == "15m" else 86400) * 1000
+    now_ms = int(time.time() * 1000)
+    cursor_ms = max(0, min(int(since_sec), now_ms // 1000)) * 1000
+
+    collected: List[list] = []
+    seen: Set[int] = set()
+
+    for _ in range(max_pages):
+        try:
+            batch = await asyncio.wait_for(
+                exchange.fetch_ohlcv(symbol, timeframe, since=cursor_ms, limit=page_limit),
+                timeout=timeout,
+            )
+        except Exception:
+            break
+        if not batch:
+            break
+
+        for c in batch:
+            ts = int(c[0])
+            if ts not in seen:
+                seen.add(ts)
+                collected.append(c)
+
+        last_ms = int(batch[-1][0])
+        if last_ms >= now_ms or len(batch) < page_limit:
+            break
+        cursor_ms = last_ms + step_ms
+
+    collected.sort(key=lambda c: c[0])
+    return collected
