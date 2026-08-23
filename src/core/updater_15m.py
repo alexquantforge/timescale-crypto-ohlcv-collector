@@ -1155,7 +1155,7 @@ def _make_exchange(ccxt_id: str):
     return getattr(ccxt_async, ccxt_id)(config)
 
 
-async def load_markets_retries(exchange, ccxt_name, attempts: int = 3, timeout: float = 12.0) -> bool:
+async def load_markets_retries(exchange, ccxt_name, attempts: int = 3, timeout: float = 30.0) -> bool:
     """Load markets with retries — gateio/htx occasionally time out on flaky networks."""
     last_err = None
     for attempt in range(1, attempts + 1):

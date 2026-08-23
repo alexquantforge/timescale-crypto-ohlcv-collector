@@ -32,7 +32,7 @@ ALMATY_TZ = pytz_timezone("Asia/Almaty")
 
 
 async def load_markets_with_retry(
-    exchange, name: str, attempts: int = 3, timeout: float = 12.0
+    exchange, name: str, attempts: int = 3, timeout: float = 30.0
 ) -> bool:
     """
     Loads exchange markets with retries — gateio/htx/kucoin occasionally
