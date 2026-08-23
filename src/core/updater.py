@@ -198,9 +198,10 @@ class MarketDataEngine:
                         self.repository,
                         bf_limit=bf_limit,
                         max_pages=settings.gap_max_pages_per_range,
+                        timeframe=self.timeframe,
                     )
                 except Exception as e:
-                    logger.debug(f"Gap filling notice for {symbol}: {e}")
+                    logger.warning(f"Gap filling failed for {symbol} ({ccxt_id}): {e!r}")
 
             # --- Check Volume Floor & Move Table (HIGH <-> LOW) ---
             if current_db:

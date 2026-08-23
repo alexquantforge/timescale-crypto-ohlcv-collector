@@ -1,5 +1,6 @@
 """
-Gap filling module for detecting and backfilling missing daily candle ranges.
+Gap filling module for detecting and backfilling missing candle buckets
+(1 day for the 1d timeframe, 15 minutes for the 15m timeframe).
 """
 import asyncio
 import logging
@@ -23,12 +24,17 @@ async def fill_history_gaps(
     repository,
     bf_limit: int = 300,
     max_pages: int = 50,
+    timeframe: str = "1d",
 ) -> int:
     """
-    Checks stored daily candle timestamps in DB for missing days and fetches
-    gap ranges from the exchange with strict network timeouts.
+    Checks stored candle buckets in DB for missing intervals and fetches the
+    gap ranges from the exchange with strict network timeouts. One bucket =
+    one candle of the given timeframe (1 day for '1d', 15 minutes for '15m').
     """
-    existing_days = await repository.get_stored_days(symbol, ccxt_id)
+    step_sec = 900 if timeframe == "15m" else 86400
+    step_ms = step_sec * 1000
+
+    existing_days = await repository.get_stored_days(symbol, ccxt_id, timeframe=timeframe)
     if len(existing_days) < 2:
         return 0
 
@@ -56,7 +62,7 @@ async def fill_history_gaps(
         for _ in range(max_pages):
             try:
                 batch = await asyncio.wait_for(
-                    exchange.fetch_ohlcv(symbol, "1d", since=cursor_day * 86400000, limit=bf_limit),
+                    exchange.fetch_ohlcv(symbol, timeframe, since=cursor_day * step_ms, limit=bf_limit),
                     timeout=8.0,
                 )
             except Exception as e:
@@ -67,12 +73,12 @@ async def fill_history_gaps(
                 break
 
             for c in batch:
-                day = int(c[0]) // 86400000
+                day = int(c[0]) // step_ms
                 if day in gap_days and day not in seen_days:
                     seen_days.add(day)
                     all_gap_cs.append(c)
 
-            last_day = int(batch[-1][0]) // 86400000
+            last_day = int(batch[-1][0]) // step_ms
             if last_day >= r1 or len(batch) < bf_limit:
                 break
             cursor_day = last_day + 1
@@ -98,6 +104,6 @@ async def fill_history_gaps(
     df["open_time_msk"] = dt_utc.dt.tz_convert(MSK_TZ).dt.strftime("%Y-%m-%d %H:%M:%S")
     df["open_time_almaty"] = dt_utc.dt.tz_convert(ALMATY_TZ).dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    inserted = await repository.upsert_ohlcv_batch(df)
-    logger.info(f"Filled {inserted}/{len(missing)} missing gap days for {symbol} ({ccxt_id})")
+    inserted = await repository.upsert_ohlcv_batch(df, timeframe=timeframe)
+    logger.info(f"Filled {inserted}/{len(missing)} missing {timeframe} gap buckets for {symbol} ({ccxt_id})")
     return inserted

@@ -16,6 +16,8 @@ import asyncpg
 import pandas as pd
 import numpy as np
 import ccxt.async_support as ccxt_async
+
+from src.exchanges.symbol_selector import get_exchange_url, get_swap_url
 from pytz import timezone as pytz_timezone
 
 from config.settings import settings
@@ -682,6 +684,11 @@ async def check_and_fill_table_gaps(
         df["volume_x_low"] = df["volume"] * df["low"]
         df["volume_x_close"] = df["volume"] * df["close"]
         df["asset_type"] = "swap" if ":" in symbol else "spot"
+        gap_ccxt_id = tbl.rsplit("_on_", 1)[-1]
+        gap_spot_url = get_exchange_url(gap_ccxt_id, symbol)
+        gap_swap_url = get_swap_url(gap_ccxt_id, symbol)
+        df["url_of_trading_pair"] = gap_swap_url if ":" in symbol else gap_spot_url
+        df["url_of_swap_contract_if_it_exists"] = None if ":" in symbol else gap_swap_url
         dt_utc = pd.to_datetime(df["Timestamp"], unit="s", utc=True)
         df["open_time_msk"] = dt_utc.dt.tz_convert(MSK_TZ).dt.strftime(
             "%Y-%m-%d %H:%M:%S"

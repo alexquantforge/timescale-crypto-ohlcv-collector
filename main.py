@@ -168,5 +168,112 @@ def summary(
     asyncio.run(_summary())
 
 
+@app.command(name="check-gaps")
+def check_gaps(
+    timeframe: str = typer.Option("1d", help="Timeframe to inspect: '1d' or '15m'"),
+    table: str = typer.Option("", help="Specific table (e.g. btc_usdt_usdt_on_bybit). Empty = scan all tables"),
+    top: int = typer.Option(15, help="Show top N tables by missing candles"),
+):
+    """
+    Detect missing candles (gaps) in stored tables — read-only diagnostic.
+    """
+    import datetime as _dt
+
+    async def _scan():
+        if timeframe == "15m":
+            dbs = [("HIGH", settings.db_high_15m), ("LOW", settings.db_low_15m)]
+        else:
+            dbs = [("HIGH", settings.db_high_1d), ("LOW", settings.db_low_1d)]
+        step = 900 if timeframe == "15m" else 86400
+        results = []
+
+        for tier, db_name in dbs:
+            try:
+                conn = await asyncpg.connect(
+                    host=settings.db_host, port=settings.db_port,
+                    user=settings.db_user, password=settings.db_password,
+                    database=db_name,
+                )
+            except Exception as e:
+                console.print(f"[yellow]Could not connect to {db_name}: {e}[/yellow]")
+                continue
+
+            if table:
+                exists = await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name=$1)", table
+                )
+                tables = [(table, tier)] if exists else []
+                if not tables:
+                    console.print(f"[yellow]Table '{table}' not found in {db_name}[/yellow]")
+            else:
+                rows = await conn.fetch(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema='public' AND table_name LIKE '%_on_%'"
+                )
+                tables = [(r["table_name"], tier) for r in rows]
+
+            for tbl, tier_label in tables:
+                try:
+                    brows = await conn.fetch(
+                        f'SELECT DISTINCT "Timestamp" / {step} AS b FROM "{tbl}" ORDER BY b ASC'
+                    )
+                except Exception:
+                    continue
+                buckets = [int(r["b"]) for r in brows]
+                if len(buckets) < 2:
+                    continue
+
+                missing_total = (buckets[-1] - buckets[0] + 1) - len(buckets)
+                biggest, biggest_at = 0, buckets[0]
+                prev = buckets[0]
+                for b in buckets[1:]:
+                    if b - prev - 1 > biggest:
+                        biggest = b - prev - 1
+                        biggest_at = prev
+                    prev = b
+
+                if missing_total > 0:
+                    results.append({
+                        "table": tbl,
+                        "tier": tier_label,
+                        "first": _dt.datetime.fromtimestamp(buckets[0] * step, tz=_dt.timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                        "last": _dt.datetime.fromtimestamp(buckets[-1] * step, tz=_dt.timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                        "stored": len(buckets),
+                        "missing": missing_total,
+                        "biggest": biggest,
+                        "biggest_at": _dt.datetime.fromtimestamp(biggest_at * step, tz=_dt.timezone.utc).strftime("%Y-%m-%d"),
+                    })
+            await conn.close()
+        return results
+
+    results = asyncio.run(_scan())
+
+    if not results:
+        console.print(f"[bold green]✓ No gaps found ({timeframe}) — every table is continuous.[/bold green]")
+        return
+
+    results.sort(key=lambda r: r["missing"], reverse=True)
+    out = Table(title=f"🔍 Candle Gaps ({timeframe.upper()}) — {len(results)} tables with missing data")
+    out.add_column("Table", style="cyan")
+    out.add_column("Tier", style="yellow")
+    out.add_column("From", style="white")
+    out.add_column("To", style="white")
+    out.add_column("Stored", justify="right", style="green")
+    out.add_column("Missing", justify="right", style="bold red")
+    out.add_column("Biggest gap", justify="right", style="magenta")
+    out.add_column("After", style="dim")
+    for r in results[: top]:
+        unit = "days" if timeframe == "1d" else "bars"
+        out.add_row(
+            r["table"], r["tier"], r["first"], r["last"],
+            f"{r['stored']:,}", f"{r['missing']:,}", f"{r['biggest']:,} {unit}", r["biggest_at"],
+        )
+    console.print(out)
+    console.print(
+        "[dim]Gaps are auto-repaired on the next collector cycle (CHECK_AND_FILL_GAPS=1). "
+        "Run `python main.py run` to trigger repair.[/dim]"
+    )
+
+
 if __name__ == "__main__":
     app()

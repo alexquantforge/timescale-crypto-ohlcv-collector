@@ -259,6 +259,80 @@ class HistoricalMarketRepository:
                     """
                 )
 
+    async def get_stored_days(self, symbol: str, ccxt_id: str, timeframe: str = "1d") -> List[int]:
+        """
+        Returns sorted distinct candle bucket numbers ("Timestamp" // step)
+        stored for the symbol's table across HIGH/LOW databases.
+        Used by the gap detector (1 bucket = 1 day for 1d, 15 minutes for 15m).
+        """
+        step = 900 if timeframe == "15m" else 86400
+        tbl_name = f"{symbol.replace('/', '_').replace('-', '_')}_on_{ccxt_id}".lower()
+        db, _, _ = await self.find_table(tbl_name)
+        if not db:
+            return []
+        pool = self.pools.get(db)
+        if not pool:
+            return []
+        try:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    f'SELECT DISTINCT "Timestamp" / {int(step)} AS bucket '
+                    f'FROM "{tbl_name}" ORDER BY bucket ASC'
+                )
+            return [int(r["bucket"]) for r in rows]
+        except Exception as e:
+            logger.warning(f"get_stored_days failed for {tbl_name}: {e}")
+            return []
+
+    async def upsert_ohlcv_batch(self, df: pd.DataFrame, timeframe: str = "1d") -> int:
+        """
+        Inserts gap-fill candles produced by gap_filler (frame with ts in
+        milliseconds plus url_trading/url_swap columns), deleting any
+        overlapping stored rows first. Returns the number of inserted rows.
+        """
+        if df is None or df.empty:
+            return 0
+
+        df = df.copy()
+        df["Timestamp"] = df["ts"].astype("int64") // 1000
+        df["volume_x_low"] = df["volume"] * df["low"]
+        df["volume_x_close"] = df["volume"] * df["close"]
+        df["url_of_trading_pair"] = df["url_trading"] if "url_trading" in df.columns else None
+        df["url_of_swap_contract_if_it_exists"] = df["url_swap"] if "url_swap" in df.columns else None
+        if "open_time_msk" not in df.columns:
+            df["open_time_msk"] = None
+            df["open_time_almaty"] = None
+        if "asset_type" not in df.columns:
+            df["asset_type"] = "swap" if ":" in str(df["ticker"].iloc[0]) else "spot"
+
+        symbol = str(df["ticker"].iloc[0])
+        ccxt_id = str(df["exchange"].iloc[0])
+        tbl_name = f"{symbol.replace('/', '_').replace('-', '_')}_on_{ccxt_id}".lower()
+        db, _, _ = await self.find_table(tbl_name)
+        if not db:
+            logger.warning(f"upsert_ohlcv_batch: table {tbl_name} not found, skipping")
+            return 0
+        pool = self.pools.get(db)
+        if not pool:
+            return 0
+
+        cols = list(ALL_COLUMNS_SQL.keys())
+        tuples = [
+            tuple(None if pd.isna(x) else x for x in row)
+            for row in df[cols].to_numpy()
+        ]
+        min_ts = int(df["Timestamp"].min())
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    f'DELETE FROM "{tbl_name}" WHERE "Timestamp" >= $1', min_ts
+                )
+                await conn.copy_records_to_table(tbl_name, records=tuples, columns=cols)
+            return len(tuples)
+        except Exception as e:
+            logger.warning(f"upsert_ohlcv_batch failed for {tbl_name}: {e}")
+            return 0
+
     async def save_orderbook_snapshot(
         self,
         db_name: str,
