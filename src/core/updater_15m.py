@@ -667,7 +667,11 @@ async def check_and_fill_table_gaps(
                         ),
                         timeout=6.0,
                     )
-                except Exception:
+                except Exception as e:
+                    log(
+                        f"  [15M] ⚠️ {symbol} @{tbl.rsplit('_on_', 1)[-1]}: gap-fill fetch_ohlcv failed "
+                        f"({type(e).__name__}: {e}) — gap left open"
+                    )
                     break
                 if not cs:
                     break
@@ -771,7 +775,11 @@ async def process_pair(exchange, symbol, ccxt_id):
                         ),
                         timeout=6.0,
                     )
-                except Exception:
+                except Exception as e:
+                    log(
+                        f"  [15M] ⚠️ {symbol} @{ccxt_id}: catch-up fetch_ohlcv failed "
+                        f"({type(e).__name__}: {e}) — table stays behind"
+                    )
                     break
                 if not cs:
                     break
@@ -797,6 +805,10 @@ async def process_pair(exchange, symbol, ccxt_id):
                     timeout=6.0,
                 )
             except Exception as e:
+                log(
+                    f"  [15M] ⚠️ {symbol} @{ccxt_id}: initial fetch_ohlcv failed "
+                    f"({type(e).__name__}: {e})"
+                )
                 cs = []
 
             if cs:
@@ -817,7 +829,11 @@ async def process_pair(exchange, symbol, ccxt_id):
                             ),
                             timeout=6.0,
                         )
-                    except Exception:
+                    except Exception as e:
+                        log(
+                            f"  [15M] ⚠️ {symbol} @{ccxt_id}: backfill fetch_ohlcv failed "
+                            f"({type(e).__name__}: {e})"
+                        )
                         break
 
                     if not prev_cs:

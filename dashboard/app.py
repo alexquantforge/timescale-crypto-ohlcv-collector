@@ -1304,12 +1304,28 @@ with tab_charts:
             return frame, 0
 
         hist_df, stitched = _stitch(hist_df, "15m" if tf_label == "15m" else "1d")
+        # When the stitch covers a stale DB tail, say how far the COLLECTOR
+        # is behind, so a big '47 missing candles' hint is not mistaken for a
+        # stitch bug: it means the engine has not persisted this table lately.
+        stale_hint = ""
+        if stitched and row is not None:
+            try:
+                _mt = int(row.get("max_ts"))
+            except (TypeError, ValueError):
+                _mt = None
+            if _mt:
+                if _mt > 1e11:  # ms epoch defence (frame-level filter already ran)
+                    _mt //= 1000
+                _age_h = (time.time() - _mt) / 3600.0
+                _thr = 1.0 if tf_label == "15m" else 49.0  # 1D: last closed day is ~24-48h back, normal
+                if _age_h > _thr:
+                    stale_hint = f" · ⏳ collector {_age_h:.1f}h behind"
         # Always render the stitch caption line at a fixed height (empty when
         # nothing was stitched) so the side-by-side 15m / 1D charts stay
         # perfectly level — previously the 15m chart was pushed ~20px down
         # whenever it had a stitched-gap caption and the 1D chart did not.
         stitch_txt = (
-            f"🩹 {stitched} missing {tf_label} candles stitched from exchange (in-memory)"
+            f"🩹 {stitched} missing {tf_label} candles stitched from exchange (in-memory){stale_hint}"
             if stitched
             else "&nbsp;"
         )
