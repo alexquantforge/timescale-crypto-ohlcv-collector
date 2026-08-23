@@ -51,6 +51,8 @@ timescale-crypto-ohlcv-collector/
 │   └── core/                   # Orchestration engine
 │       ├── progress.py         # Unified progress & ETA calculation
 │       └── updater.py          # Main market data engine loop
+│   └── utils/                  # Dependency-free shared utilities
+│       └── timeouts.py         # hard_wait_for: strictly bounded network timeouts
 ├── dashboard/                  # Web Dashboard
 │   └── app.py                  # Streamlit dashboard app
 ├── tests/                      # Unit test suite (Pytest)
