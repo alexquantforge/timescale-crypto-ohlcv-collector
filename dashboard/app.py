@@ -1052,6 +1052,22 @@ else:
     db_user = st.sidebar.text_input("DB User", value=os.getenv("DB_USER", "postgres"))
     db_pass = st.sidebar.text_input("DB Password", value=os.getenv("DB_PASSWORD", "postgres"), type="password")
 
+# --- Exchange filter (which exchanges the dashboard is wired to) -------------
+# Options respect the collector's ALLOWED_EXCHANGES whitelist (empty = all).
+# Filtering happens on the cached summary frames, so toggling is instant.
+_all_configured_exs = sorted(settings.exchange_map_1d.keys())
+_allowed_exs = settings.allowed_exchanges
+_exchange_options = (
+    [e for e in _all_configured_exs if e in _allowed_exs] if _allowed_exs else _all_configured_exs
+)
+_default_exs = [e for e in ("bybit", "okx", "mexc") if e in _exchange_options]
+enabled_exs = st.sidebar.multiselect(
+    "🌐 Exchanges",
+    options=_exchange_options,
+    default=_default_exs,
+    help="Which exchanges the dashboard shows (charts, health strip, liquidity table). Default: Bybit / OKX / MEXC.",
+)
+
 st.sidebar.markdown("---")
 st.sidebar.caption("⚡ Charts load only the last N candles (cached 60 s) — instant pair switching.")
 limit_15m = st.sidebar.slider("Candles · 15m chart", min_value=100, max_value=3000, value=700, step=100)
@@ -1092,7 +1108,18 @@ else:
     df_15m = load_summary_cached(db_host, db_port, db_user, db_pass, "15m")
     df_1d = load_summary_cached(db_host, db_port, db_user, db_pass, "1d")
 
+# Keep only pairs of the exchanges enabled in the sidebar — charts tab,
+# Prev/Next list, live writer target set and the liquidity table all inherit it.
+if enabled_exs and not df_15m.empty:
+    df_15m = df_15m[df_15m["exchange"].isin(enabled_exs)]
+if enabled_exs and not df_1d.empty:
+    df_1d = df_1d[df_1d["exchange"].isin(enabled_exs)]
+
 df_table = df_15m if table_tf == "15m" else df_1d
+
+if not enabled_exs:
+    st.warning("⬅️ Select at least one exchange in the sidebar (🌐 Exchanges).")
+    st.stop()
 
 if df_15m.empty and df_1d.empty:
     st.warning(
@@ -1118,6 +1145,13 @@ TICKER_OPTIONS = _unique_sorted(
     ([] if df_15m.empty else df_15m["ticker"].dropna().tolist())
     + ([] if df_1d.empty else df_1d["ticker"].dropna().tolist())
 )
+
+if not TICKER_OPTIONS:
+    st.warning(
+        "No pairs yet for the exchanges enabled in the sidebar — "
+        "enable more exchanges or let the collector build their tables."
+    )
+    st.stop()
 
 
 def _nav(delta: int):
