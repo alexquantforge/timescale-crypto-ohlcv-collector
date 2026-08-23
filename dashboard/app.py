@@ -17,6 +17,7 @@ Layout: the Charts tab is first — 15m chart on top, 1D chart below, with
 import os
 import sys
 import json
+import time
 import asyncio
 import asyncpg
 import numpy as np
@@ -332,6 +333,98 @@ def _render_live_panel(ticker: str, exchange: str, demo: bool):
 
 
 # ---------------------------------------------------------------------------
+# Live health-strip chips (exchange REST, ~1s refresh)
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=1, show_spinner=False)
+def _fetch_orderbook_top(ccxt_id: str, symbol: str, limit: int = 50):
+    """Top-of-book (cached ~1s) for the live Depth/Spread chips."""
+    ex = _get_sync_exchange(ccxt_id)
+    try:
+        if not ex.markets:
+            ex.load_markets()
+        ob = ex.fetch_order_book(symbol, limit=limit)
+        return {"bids": ob.get("bids") or [], "asks": ob.get("asks") or []}
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=1, show_spinner=False)
+def _fetch_trade_tape(ccxt_id: str, symbol: str, limit: int = 200):
+    """Recent trades (cached ~1s) for the live Trades/min chip."""
+    ex = _get_sync_exchange(ccxt_id)
+    try:
+        if not ex.markets:
+            ex.load_markets()
+        trades = ex.fetch_trades(symbol, limit=limit) or []
+        return [
+            {
+                "timestamp": t.get("timestamp"),
+                "price": t.get("price"),
+                "amount": t.get("amount"),
+                "side": t.get("side"),
+            }
+            for t in trades
+        ]
+    except Exception:
+        return None
+
+
+def _compute_live_health_row(sym_ticker, sym_ex, hist_1d, atr_val, db_row):
+    """
+    Builds the health-strip row from LIVE exchange data (orderbook + trade
+    tape, each cached ~1s). Any field the live fetch could not produce falls
+    back to the latest collector snapshot value from `db_row`.
+    """
+    row = dict(db_row or {})
+    exchange_map = settings.exchange_map_1d
+    ccxt_id = exchange_map.get(sym_ex, sym_ex)
+
+    # --- Depth ±1% & Spread % ATR from the live orderbook ---
+    ob = _fetch_orderbook_top(ccxt_id, sym_ticker)
+    if ob and ob["bids"] and ob["asks"]:
+        try:
+            bid = float(ob["bids"][0][0])
+            ask = float(ob["asks"][0][0])
+            if bid > 0 and ask > 0:
+                mid = (bid + ask) / 2.0
+                lo, hi = mid * 0.99, mid * 1.01
+                depth = sum(float(p) * float(a) for p, a in ob["bids"] if float(p) >= lo) + sum(
+                    float(p) * float(a) for p, a in ob["asks"] if float(p) <= hi
+                )
+                row["ob_total_depth_usd"] = depth
+                row["ob_spread_abs"] = ask - bid
+                row["ob_best_bid"] = bid
+                row["ob_best_ask"] = ask
+                if atr_val and atr_val > 0:
+                    row["ob_spread_atr_pct"] = (ask - bid) / atr_val * 100.0
+        except (TypeError, ValueError, IndexError):
+            pass
+
+    # --- Trades/min from the live trade tape (300s window, as in collector) ---
+    trades = _fetch_trade_tape(ccxt_id, sym_ticker)
+    if trades:
+        now_ms = time.time() * 1000.0
+        recent = [
+            t for t in trades
+            if t.get("timestamp") and float(t["timestamp"]) >= now_ms - 300_000
+        ]
+        row["ob_trades_per_min"] = len(recent) / 5.0
+        prices = [float(t["price"]) for t in trades if t.get("price")]
+        if len(trades) >= 30 and len(set(prices)) <= 4:
+            row["ob_is_barcode"] = True  # barcode market → DEAD tape chip
+
+    # --- Min 7d $Vol: min(vol×low) over the last 7 CLOSED daily bars ---
+    if hist_1d is not None and not hist_1d.empty:
+        closed = hist_1d[hist_1d["ts"] <= int(time.time()) - 86400]
+        tail = closed.tail(7)
+        if len(tail) >= 1:
+            row["ob_min_7d_volume_usd"] = float((tail["volume"] * tail["low"]).min())
+
+    return row
+
+
+# ---------------------------------------------------------------------------
 # Charts
 # ---------------------------------------------------------------------------
 
@@ -605,11 +698,41 @@ with tab_charts:
     # Resolve table rows per timeframe (same exchange preferred)
     row_15m = find_table_row(df_15m, sym_ticker, sym_ex)
     row_1d = find_table_row(df_1d, sym_ticker, sym_ex)
+    live_interval = 0.0 if live_refresh == "Off" else float(live_refresh[:-1])
 
-    # --- Compact health strip (latest collector snapshot) --------------------
-    health_row = row_1d or row_15m
-    if health_row:
-        st.markdown(build_health_strip_html(health_row), unsafe_allow_html=True)
+    # Daily candles for the live health strip chips (ATR & Min 7d $Vol).
+    # Reused by the ATR metrics below the charts — cache makes it free.
+    hist_1d_live = None
+    if row_1d is not None:
+        hist_1d_live = get_candles("1d", row_1d, max(limit_1d, 60), demo_mode)
+    atr_live = 0.0
+    if hist_1d_live is not None and not hist_1d_live.empty and len(hist_1d_live) >= 3:
+        atr_live = compute_atr_no_paranormal_bars(
+            highs=hist_1d_live["high"].to_numpy(dtype=float),
+            lows=hist_1d_live["low"].to_numpy(dtype=float),
+            closes=hist_1d_live["close"].to_numpy(dtype=float),
+            period=atr_days,
+            small_threshold=settings.atr_small_threshold,
+            large_threshold=settings.atr_large_threshold,
+        )
+
+    # --- Compact health strip — LIVE from the exchange every ~1s -------------
+    # (Tape / Depth ±1% / Spread % ATR via orderbook & trade tape, Min 7d $Vol
+    #  from fresh daily candles; falls back to the collector snapshot values
+    #  only for fields the live fetch couldn't produce)
+    if live_interval > 0 and hasattr(st, "fragment") and not demo_mode:
+        @st.fragment(run_every=live_interval)
+        def _strip_fragment():
+            live_row = _compute_live_health_row(
+                sym_ticker, sym_ex, hist_1d_live, atr_live, row_1d or row_15m
+            )
+            st.markdown(build_health_strip_html(live_row), unsafe_allow_html=True)
+
+        _strip_fragment()
+    else:
+        health_row = row_1d or row_15m
+        if health_row:
+            st.markdown(build_health_strip_html(health_row), unsafe_allow_html=True)
 
     # --- Spot/Swap links + shortability badge --------------------------------
     from src.exchanges.symbol_selector import split_symbol
@@ -618,7 +741,6 @@ with tab_charts:
     st.markdown(build_pair_links_html(sym_ticker, sym_ex, _perp), unsafe_allow_html=True)
 
     # --- LIVE panel (auto-refreshing chips, ~1s) ------------------------------
-    live_interval = 0.0 if live_refresh == "Off" else float(live_refresh[:-1])
     if live_interval > 0 and hasattr(st, "fragment"):
         @st.fragment(run_every=live_interval)
         def _live_fragment():
@@ -729,20 +851,10 @@ with tab_charts:
     st.markdown("---")
     st.markdown("#### 🔴 Live Market & Orderbook Metrics")
 
-    hist_1d = None
-    if row_1d is not None:
-        hist_1d = get_candles("1d", row_1d, max(limit_1d, 60), demo_mode)
-
-    atr_val = 0.0
-    if hist_1d is not None and not hist_1d.empty and len(hist_1d) >= 3:
-        atr_val = compute_atr_no_paranormal_bars(
-            highs=hist_1d["high"].to_numpy(dtype=float),
-            lows=hist_1d["low"].to_numpy(dtype=float),
-            closes=hist_1d["close"].to_numpy(dtype=float),
-            period=atr_days,
-            small_threshold=settings.atr_small_threshold,
-            large_threshold=settings.atr_large_threshold,
-        )
+    # Daily candles + ATR already loaded above for the live health strip —
+    # reuse them here (the 60s candle cache makes the call free anyway).
+    hist_1d = hist_1d_live
+    atr_val = atr_live
 
     db_row = row_1d or row_15m or {}
 
