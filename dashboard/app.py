@@ -39,6 +39,9 @@ from dashboard.helpers import (
     generate_demo_summary,
     generate_demo_candles,
     build_health_strip_html,
+    build_pair_links_html,
+    find_perp_ticker,
+    sanitize_candle_frame,
 )
 
 st.set_page_config(
@@ -159,7 +162,10 @@ async def _load_candles(db_name: str, table_name: str, limit: int, db_host, db_p
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame([dict(r) for r in rows])
-    df = df.drop_duplicates(subset="ts", keep="first").iloc[::-1].reset_index(drop=True)
+    df = df.drop_duplicates(subset="ts", keep="first")
+    df = sanitize_candle_frame(df)  # drop future/garbage timestamps (e.g. 2031), ms->s fix
+    if df.empty:
+        return df
     df["time"] = pd.to_datetime(df["ts"], unit="s")
     return df
 
@@ -288,6 +294,24 @@ def render_tradingview_lightweight_chart(
 
     dumps = lambda x: json.dumps(x, separators=(",", ":"))
 
+    price_formatter_js = """
+            const fmtPrice = (p) => {
+                const a = Math.abs(p);
+                const trim = (x) => {
+                    const ax = Math.abs(x);
+                    let s;
+                    if (ax >= 100) s = x.toFixed(0);
+                    else if (ax >= 1) s = x.toFixed(2);
+                    else s = x.toPrecision(4);
+                    return parseFloat(s).toString();
+                };
+                if (a >= 1e9) return trim(p / 1e9) + 'B';
+                if (a >= 1e6) return trim(p / 1e6) + 'M';
+                if (a >= 1e5) return trim(p / 1e3) + 'K';
+                return trim(p);
+            };
+    """
+
     volume_js = ""
     if show_volume:
         volume_js = f"""
@@ -313,6 +337,7 @@ def render_tradingview_lightweight_chart(
     <body>
         <div id="tv-chart"></div>
         <script>
+            {price_formatter_js}
             const chartElement = document.getElementById('tv-chart');
             const chart = LightweightCharts.createChart(chartElement, {{
                 width: chartElement.clientWidth,
@@ -335,6 +360,9 @@ def render_tradingview_lightweight_chart(
                     borderColor: 'rgba(197, 203, 206, 0.8)',
                     timeVisible: true,
                     rightOffset: 5,
+                }},
+                localization: {{
+                    priceFormatter: fmtPrice,
                 }},
             }});
 
@@ -565,6 +593,12 @@ with tab_charts:
     health_row = row_1d or row_15m
     if health_row:
         st.markdown(build_health_strip_html(health_row), unsafe_allow_html=True)
+
+    # --- Spot/Swap links + shortability badge --------------------------------
+    from src.exchanges.symbol_selector import split_symbol
+    _base, _quote = split_symbol(sym_ticker or "")
+    _perp = None if ":" in sym_ticker else find_perp_ticker([df_15m, df_1d], _base, sym_ex)
+    st.markdown(build_pair_links_html(sym_ticker, sym_ex, _perp), unsafe_allow_html=True)
 
     def render_chart(row, tf_label, limit, interval, chart_height=470):
         """Renders one timeframe chart into the current container."""

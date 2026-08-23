@@ -154,3 +154,73 @@ def test_build_health_strip_empty_row_is_safe():
     html = build_health_strip_html({})
     assert html.count("n/a") >= 3
     assert "hsl(0" in html
+
+
+# ---------------------------------------------------------------------------
+# Candle sanitization & pair links
+# ---------------------------------------------------------------------------
+
+def test_sanitize_candle_frame_drops_future_and_garbage():
+    from dashboard.helpers import sanitize_candle_frame
+    import pandas as pd
+
+    df = pd.DataFrame({
+        "ts": [1_700_000_000, 1_940_000_000, 1_000],  # valid 2023, garbage-2031, garbage-1970
+        "close": [1.0, 2.0, 3.0],
+    })
+    out = sanitize_candle_frame(df)
+    assert out["ts"].tolist() == [1_700_000_000]
+
+
+def test_sanitize_candle_frame_milliseconds_table():
+    from dashboard.helpers import sanitize_candle_frame
+    import pandas as pd
+    import time
+
+    now_ms = int(time.time() * 1000)
+    df = pd.DataFrame({"ts": [now_ms - 86400_000, now_ms - 2 * 86400_000], "close": [1.0, 2.0]})
+    out = sanitize_candle_frame(df)
+    assert len(out) == 2
+    assert out["ts"].max() < 1e11  # converted to seconds
+    assert out["ts"].is_monotonic_increasing
+
+
+def test_sanitize_candle_frame_single_ms_row_in_seconds_table():
+    from dashboard.helpers import sanitize_candle_frame
+    import pandas as pd
+
+    # seconds table + one corrupted millisecond row -> only the ms row is dropped
+    df = pd.DataFrame({"ts": [1_780_000_000, 1_780_086_000, 1_786_000_000_000], "close": [1.0, 2.0, 3.0]})
+    out = sanitize_candle_frame(df)
+    assert 1_786_000_000_000 not in out["ts"].tolist()
+    assert 1_780_000_000 in out["ts"].tolist()
+
+
+def test_is_perp_and_find_perp_ticker():
+    from dashboard.helpers import is_perp_symbol, find_perp_ticker
+
+    assert is_perp_symbol("ADA/USDT:USDT")
+    assert not is_perp_symbol("ADA/USDT")
+
+    df = pd.DataFrame([
+        {"ticker": "ADA/USDT", "exchange": "bybit"},
+        {"ticker": "ADA/USDT:USDT", "exchange": "okx"},
+    ])
+    assert find_perp_ticker([df], "ADA", "okx") == "ADA/USDT:USDT"
+    assert find_perp_ticker([df], "ADA", "bybit") is None
+    assert find_perp_ticker([df], "BTC", "okx") is None
+
+
+def test_build_pair_links_html_variants():
+    from dashboard.helpers import build_pair_links_html
+
+    perp = build_pair_links_html("ADA/USDT:USDT", "bybit")
+    assert "trade/spot/ADA/USDT" in perp
+    assert "trade/usdt/ADAUSDT" in perp
+    assert "✅ Short: perp" in perp
+
+    spot_with_perp = build_pair_links_html("ADA/USDT", "bybit", "ADA/USDT:USDT")
+    assert "✅ Short: perp ADA/USDT:USDT" in spot_with_perp
+
+    spot_no_perp = build_pair_links_html("XYZ/USDT", "bybit", None)
+    assert "no perp" in spot_no_perp

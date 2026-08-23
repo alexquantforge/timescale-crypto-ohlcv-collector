@@ -272,3 +272,85 @@ def build_health_strip_html(row: dict) -> str:
         "padding:2px 0 6px 0;font-size:12.5px;font-family:-apple-system,Segoe UI,Roboto,sans-serif;'>"
         + "".join(chips) + "</div>"
     )
+
+
+# ---------------------------------------------------------------------------
+# Candle timestamp sanitization (fixes "year 2031" garbage on charts)
+# ---------------------------------------------------------------------------
+
+import time as _time
+
+
+def sanitize_candle_frame(df: pd.DataFrame, min_ts: int = 1356998400) -> pd.DataFrame:
+    """
+    Cleans raw candle timestamps:
+    * auto-detects milliseconds (> 1e11) and converts to seconds,
+    * drops rows with garbage dates (before 2013 or more than 2 days in the future),
+    * sorts ascending and resets the index.
+
+    Some tables contain corrupted future timestamps (e.g. a daily ADA chart
+    stretching to 2031); those rows are removed so the chart axis stays sane.
+    """
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    if float(df["ts"].median()) > 1e11:  # whole table stored in milliseconds
+        df["ts"] = df["ts"] // 1000
+    now = _time.time()
+    df = df[(df["ts"] >= min_ts) & (df["ts"] <= now + 2 * 86400)]
+    return df.sort_values("ts").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Pair links & shortability badge
+# ---------------------------------------------------------------------------
+
+def is_perp_symbol(symbol: str) -> bool:
+    """True for linear perpetual symbols like ADA/USDT:USDT."""
+    return ":" in (symbol or "")
+
+
+def find_perp_ticker(dfs, base: str, exchange: str) -> Optional[str]:
+    """
+    Searches summary frames for a perpetual ticker of the same base asset on
+    the given exchange (e.g. base ADA -> 'ADA/USDT:USDT'). Returns None if absent.
+    """
+    prefix = f"{base.upper()}/"
+    for d in dfs:
+        if d is None or d.empty or "ticker" not in d.columns:
+            continue
+        m = d[
+            (d["exchange"] == exchange)
+            & d["ticker"].astype(str).str.upper().str.startswith(prefix)
+            & d["ticker"].astype(str).str.endswith(":USDT")
+        ]
+        if not m.empty:
+            return str(m.iloc[0]["ticker"])
+    return None
+
+
+def build_pair_links_html(symbol: str, exchange: str, perp_ticker: Optional[str] = None) -> str:
+    """
+    Compact HTML line with Spot/Swap exchange links and a shortability badge:
+    a pair is shortable when it IS a perp, or a perp variant exists on the exchange.
+    """
+    from src.exchanges.symbol_selector import get_exchange_url, get_swap_url
+
+    spot_url = get_exchange_url(exchange, symbol)
+    swap_symbol = symbol if is_perp_symbol(symbol) else (perp_ticker or symbol)
+    swap_url = get_swap_url(exchange, swap_symbol)
+
+    if is_perp_symbol(symbol):
+        badge, color = "✅ Short: perp", "#66bb6a"
+    elif perp_ticker:
+        badge, color = f"✅ Short: perp {perp_ticker}", "#66bb6a"
+    else:
+        badge, color = "⚠️ Short: no perp — spot margin only", "#ffa726"
+
+    spot_link = f"<a href='{spot_url}' target='_blank' rel='noopener' style='color:#4fc3f7;text-decoration:none;'>Spot&nbsp;↗</a>" if spot_url else "Spot n/a"
+    swap_link = f"<a href='{swap_url}' target='_blank' rel='noopener' style='color:#4fc3f7;text-decoration:none;'>Swap&nbsp;↗</a>" if swap_url else "Swap n/a"
+    return (
+        f"<div style='font-size:13px;padding:0 0 6px 6px;'>"
+        f"🔗 {spot_link} &nbsp;·&nbsp; {swap_link} &nbsp;·&nbsp; "
+        f"<b style='color:{color};'>{badge}</b></div>"
+    )
