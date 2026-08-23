@@ -42,6 +42,8 @@ from dashboard.helpers import (
     build_pair_links_html,
     find_perp_ticker,
     sanitize_candle_frame,
+    merge_intraday_into_daily,
+    build_live_poller_js,
 )
 
 st.set_page_config(
@@ -226,6 +228,77 @@ def get_candles(timeframe: str, row: dict, limit: int, demo: bool) -> pd.DataFra
 
 
 # ---------------------------------------------------------------------------
+# Live ticker (server-side chips, cached ~1s)
+# ---------------------------------------------------------------------------
+
+@st.cache_resource(show_spinner=False)
+def _get_sync_exchange(ccxt_id: str):
+    """Persistent synchronous ccxt instance (kept across reruns & sessions)."""
+    import ccxt as _ccxt
+    return getattr(_ccxt, ccxt_id)({"enableRateLimit": True, "timeout": 8000})
+
+
+@st.cache_data(ttl=1, show_spinner=False)
+def _fetch_ticker_cached(ccxt_id: str, symbol: str):
+    ex = _get_sync_exchange(ccxt_id)
+    try:
+        if not ex.markets:
+            ex.load_markets()
+        t = ex.fetch_ticker(symbol)
+        return {
+            "last": t.get("last"),
+            "bid": t.get("bid"),
+            "ask": t.get("ask"),
+            "pct": t.get("percentage"),
+        }
+    except Exception:
+        return None
+
+
+def _render_live_panel(ticker: str, exchange: str, demo: bool):
+    """One-line LIVE chips: price, bid/ask, spread, 24h change."""
+    if demo:
+        import random as _random
+        key = f"demo_px_{ticker}_{exchange}"
+        px = st.session_state.get(key)
+        if px is None:
+            px = 100.0
+        px = max(px * (1.0 + _random.uniform(-0.0012, 0.0012)), 1e-9)
+        st.session_state[key] = px
+        data = {"last": px, "bid": px * 0.99995, "ask": px * 1.00005,
+                "pct": st.session_state.get(f"demo_pct_{ticker}_{exchange}", 2.4)}
+    else:
+        exchange_map = settings.exchange_map_1d
+        ccxt_id = exchange_map.get(exchange, exchange)
+        data = _fetch_ticker_cached(ccxt_id, ticker)
+
+    if not data or not data.get("last"):
+        st.caption("🔴 LIVE: exchange unreachable")
+        return
+
+    last = float(data["last"])
+    bid, ask = data.get("bid"), data.get("ask")
+    spread_html = ""
+    if bid and ask:
+        abs_sp = ask - bid
+        pct_sp = abs_sp / ((ask + bid) / 2.0) * 100.0 if ask + bid else 0.0
+        spread_html = f" &nbsp;·&nbsp; spread {abs_sp:.6g} ({pct_sp:.3f}%)"
+    ba_html = f" &nbsp;·&nbsp; bid {bid:.6g} / ask {ask:.6g}" if bid and ask else ""
+    pct = data.get("pct")
+    chg_html = ""
+    if pct is not None:
+        color = "#66bb6a" if pct >= 0 else "#ef5350"
+        sign = "+" if pct >= 0 else ""
+        chg_html = f" &nbsp;·&nbsp; 24h <b style='color:{color}'>{sign}{pct:.2f}%</b>"
+
+    st.markdown(
+        f"<div style='font-size:13px;padding:0 0 6px 6px;'>"
+        f"<b style='color:#42a5f5;'>🔴 LIVE ${last:.6g}</b>{ba_html}{spread_html}{chg_html}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Charts
 # ---------------------------------------------------------------------------
 
@@ -265,6 +338,7 @@ def render_tradingview_lightweight_chart(
     chart_height: int = 470,
     chart_style: str = "OHLCV Bars",
     show_volume: bool = False,
+    live_poller_js: str = "",
 ):
     """Renders a TradingView Lightweight Charts canvas with OHLCV Bars/Candles,
     volume histogram, crosshair tooltips, and fast rolling ATR channels."""
@@ -331,11 +405,14 @@ def render_tradingview_lightweight_chart(
         <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
         <style>
             body {{ margin: 0; padding: 0; background-color: #131722; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; }}
-            #tv-chart {{ width: 100%; height: {chart_height}px; }}
+            #tv-chart {{ width: 100%; height: {chart_height}px; position: relative; }}
+            #live-badge {{ position: absolute; top: 8px; right: 70px; z-index: 10; display: none;
+                background: rgba(66, 165, 245, 0.15); color: #42a5f5; border: 1px solid rgba(66, 165, 245, 0.4);
+                border-radius: 8px; padding: 2px 8px; font-size: 12px; }}
         </style>
     </head>
     <body>
-        <div id="tv-chart"></div>
+        <div id="tv-chart"><div id="live-badge"></div></div>
         <script>
             {price_formatter_js}
             const chartElement = document.getElementById('tv-chart');
@@ -372,6 +449,18 @@ def render_tradingview_lightweight_chart(
             {volume_js}
 
             chart.timeScale().fitContent();
+
+            let lastBar = candles.length ? Object.assign({{}}, candles[candles.length - 1]) : null;
+            let liveLine = null;
+            try {{
+                liveLine = mainSeries.createPriceLine({{
+                    color: '#42a5f5', lineWidth: 1,
+                    lineStyle: LightweightCharts.LineStyle.Dotted,
+                    axisLabelVisible: true, title: 'LIVE',
+                    price: lastBar ? lastBar.close : 0,
+                }});
+            }} catch (e) {{}}
+{live_poller_js}
 
             window.addEventListener('resize', () => {{
                 chart.applyOptions({{ width: chartElement.clientWidth }});
@@ -584,6 +673,11 @@ with tab_charts:
         )
         chart_style = opt3.selectbox("📊 Chart Style", options=["OHLCV Bars", "Candlesticks"], index=0)
         show_volume = opt4.checkbox("📊 Show volume bars", value=False, key="show_volume")
+        opt5, opt6 = st.columns(2)
+        live_refresh = opt5.selectbox(
+            "🔴 Live refresh", options=["1s", "2s", "5s", "Off"], index=0, key="live_refresh",
+        )
+        auto_reload = opt6.checkbox("Auto-reload DB (60s)", value=True, key="auto_reload")
 
     # Resolve table rows per timeframe (same exchange preferred)
     row_15m = find_table_row(df_15m, sym_ticker, sym_ex)
@@ -600,18 +694,39 @@ with tab_charts:
     _perp = None if ":" in sym_ticker else find_perp_ticker([df_15m, df_1d], _base, sym_ex)
     st.markdown(build_pair_links_html(sym_ticker, sym_ex, _perp), unsafe_allow_html=True)
 
+    # --- LIVE panel (auto-refreshing chips, ~1s) ------------------------------
+    live_interval = 0.0 if live_refresh == "Off" else float(live_refresh[:-1])
+    if live_interval > 0 and hasattr(st, "fragment"):
+        @st.fragment(run_every=live_interval)
+        def _live_fragment():
+            _render_live_panel(sym_ticker, sym_ex, demo_mode)
+
+        _live_fragment()
+    else:
+        _render_live_panel(sym_ticker, sym_ex, demo_mode)
+
     def render_chart(row, tf_label, limit, interval, chart_height=470):
         """Renders one timeframe chart into the current container."""
         if row is None:
             st.info(f"No {tf_label} table for {sym_ticker}.")
             return
         hist_df = get_candles(tf_label, row, limit, demo_mode)
+
+        # Keep the daily chart in sync: aggregate fresher 15m candles of today
+        if tf_label == "1D" and row_15m is not None:
+            df15 = get_candles("15m", row_15m, max(limit_15m, 200), demo_mode)
+            hist_df = merge_intraday_into_daily(hist_df, df15)
+
         if chart_engine == "TradingView Lightweight Canvas":
+            step = 900 if tf_label == "15m" else 86400
+            interval_ms = int(live_interval * 1000) if live_interval > 0 else 0
+            poller_js = build_live_poller_js(sym_ex, sym_ticker, step, interval_ms)
             render_tradingview_lightweight_chart(
                 hist_df, sym_ticker, sym_ex, tf_label,
                 chart_height=chart_height,
                 chart_style=chart_style,
                 show_volume=show_volume,
+                live_poller_js=poller_js,
             )
         elif chart_engine == "TradingView Official Widget":
             style_code = "0" if chart_style == "OHLCV Bars" else "1"
@@ -728,6 +843,35 @@ with tab_charts:
     dcol2.metric("Orderbook Imbalance", f"{g('ob_imbalance'):.2f}", delta="Bid / Ask Depth Ratio")
     dcol3.metric("5m Cumulative Vol Delta (CVD)", f"${g('ob_cvd_5m'):,.2f}", delta=f"Buy Pressure: {g('ob_buy_pressure_pct'):.1f}%")
     dcol4.metric("Trade Activity", f"{g('ob_trades_per_min'):.1f} trades/min")
+
+    # --- Prefetch neighbour pairs (cache warming for instant flipping) -------
+    # Warms the candle cache for the ±5 pairs around the current one so that
+    # Prev/Next switching renders instantly. Cache hits are free; misses run
+    # a single parallel-safe DB query per table, TTL-bound by the cache itself.
+    if not demo_mode and len(TICKER_OPTIONS) > 1:
+        try:
+            cur_idx = TICKER_OPTIONS.index(sym_ticker)
+            for delta in [d for d in range(-5, 6) if d != 0]:
+                nb_ticker = TICKER_OPTIONS[(cur_idx + delta) % len(TICKER_OPTIONS)]
+                for df_tf, lim in ((df_15m, limit_15m), (df_1d, limit_1d)):
+                    nb_row = find_table_row(df_tf, nb_ticker, sym_ex)
+                    if nb_row:
+                        load_candles_cached(
+                            db_host, db_port, db_user, db_pass,
+                            nb_row["db_name"], nb_row["table_name"], lim,
+                        )
+        except Exception:
+            pass
+
+    # --- Auto-reload DB data (full app rerun every 60 s) ---------------------
+    if auto_reload and hasattr(st, "fragment"):
+        def _auto_reload():
+            # Rerun only on scheduled ticks, never on the initial creation run
+            if getattr(_auto_reload, "armed", False):
+                st.rerun(scope="app")
+            _auto_reload.armed = True
+
+        st.fragment(run_every=60.0)(_auto_reload)()
 
 with tab_liquidity:
     col1, col2, col3, col4, col5 = st.columns(5)

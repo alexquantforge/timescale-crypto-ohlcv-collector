@@ -354,3 +354,141 @@ def build_pair_links_html(symbol: str, exchange: str, perp_ticker: Optional[str]
         f"🔗 {spot_link} &nbsp;·&nbsp; {swap_link} &nbsp;·&nbsp; "
         f"<b style='color:{color};'>{badge}</b></div>"
     )
+
+
+# ---------------------------------------------------------------------------
+# Live data: intraday->daily aggregation & in-browser exchange poller
+# ---------------------------------------------------------------------------
+
+def merge_intraday_into_daily(df_1d: pd.DataFrame, df_15m: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keeps the daily chart in sync with fresher 15m data: aggregates all 15m
+    candles of the still-running UTC day into one daily bar and replaces the
+    stale/appends the missing daily bar. Fixes '15m ahead of the daily chart'
+    and 'daily chart missing the last day'.
+    """
+    if df_15m is None or df_15m.empty or df_1d is None or df_1d.empty:
+        return df_1d
+
+    last15 = int(df_15m["ts"].iloc[-1])
+    day_ts = last15 - (last15 % 86400)
+    day_bars = df_15m[df_15m["ts"] >= day_ts]
+    if day_bars.empty:
+        return df_1d
+
+    last_1d_ts = int(df_1d["ts"].iloc[-1])
+    if day_ts <= last_1d_ts - 86400:
+        return df_1d  # 15m data is older than the daily chart — nothing to add
+
+    new_bar = {
+        "ts": day_ts,
+        "time": pd.to_datetime(day_ts, unit="s"),
+        "open": float(day_bars["open"].iloc[0]),
+        "high": float(day_bars["high"].max()),
+        "low": float(day_bars["low"].min()),
+        "close": float(day_bars["close"].iloc[-1]),
+        "volume": float(day_bars["volume"].fillna(0.0).sum()),
+    }
+
+    out = df_1d[df_1d["ts"] < day_ts].copy()
+    out = pd.concat([out, pd.DataFrame([new_bar])], ignore_index=True)
+    return out
+
+
+_LIVE_POLLER_TEMPLATE = """
+(function(){
+  let fails = 0;
+  const timer = setInterval(async () => {
+    try {
+      const r = await fetch('__URL__');
+      const j = await r.json();
+      let price = NaN, bid = NaN, ask = NaN;
+      __PARSE__
+      if (!isFinite(price) || price <= 0) { throw new Error('bad price'); }
+      if (liveLine) { try { liveLine.applyOptions({ price: price }); } catch (e) {} }
+      const badge = document.getElementById('live-badge');
+      if (badge) {
+        let sp = '';
+        if (isFinite(bid) && isFinite(ask) && bid > 0 && ask > 0) {
+          const pct = (ask - bid) / ((ask + bid) / 2) * 100;
+          sp = ' \\u00b7 spread ' + pct.toFixed(3) + '%';
+        }
+        badge.style.display = 'block';
+        badge.textContent = '\\u25cf LIVE ' + price + sp;
+      }
+      const now = Math.floor(Date.now() / 1000);
+      const step = __STEP__;
+      const barTs = now - (now % step);
+      if (!lastBar || barTs > lastBar.time) {
+        lastBar = { time: barTs, open: price, high: price, low: price, close: price };
+      } else {
+        lastBar.close = price;
+        if (price > lastBar.high) { lastBar.high = price; }
+        if (price < lastBar.low) { lastBar.low = price; }
+      }
+      mainSeries.update(lastBar);
+      fails = 0;
+    } catch (e) {
+      fails += 1;
+      if (fails >= 5) {
+        clearInterval(timer);
+        const b = document.getElementById('live-badge');
+        if (b) { b.style.display = 'none'; }
+      }
+    }
+  }, __MS__);
+})();
+"""
+
+
+def build_live_poller_js(exchange: str, symbol: str, step_sec: int, interval_ms: int = 1000) -> str:
+    """
+    Returns browser-side JS that polls the exchange public REST ticker once per
+    interval and live-updates the last chart bar + a LIVE price badge/line.
+    Empty string for unsupported exchanges (chart simply stays DB-static).
+    """
+    if interval_ms <= 0:
+        return ""
+    from src.exchanges.symbol_selector import split_symbol
+
+    base, quote = split_symbol(symbol or "")
+    b, q = base.upper(), quote.upper()
+    perp = ":" in (symbol or "")
+    ex = (exchange or "").lower()
+
+    if ex == "bybit":
+        cat = "linear" if perp else "spot"
+        url = f"https://api.bybit.com/v5/market/tickers?category={cat}&symbol={b}{q}"
+        parse = "const it=((j.result||{}).list||[])[0]||{};price=+it.lastPrice;bid=+it.bid1Price;ask=+it.ask1Price;"
+    elif ex == "okx":
+        inst = f"{b}-{q}-SWAP" if perp else f"{b}-{q}"
+        url = f"https://www.okx.com/api/v5/market/ticker?instId={inst}"
+        parse = "const it=(j.data||[])[0]||{};price=+it.last;bid=+it.bidPx;ask=+it.askPx;"
+    elif ex in ("gateio", "gate"):
+        kind = "futures/usdt" if perp else "spot"
+        url = f"https://api.gateio.ws/api/v4/{kind}/tickers"
+        url += f"?contract={b}_{q}" if perp else f"?currency_pair={b}_{q}"
+        parse = "const it=(j[0]||{});price=+it.last;bid=+it.highest_bid;ask=+it.lowest_ask;"
+    elif ex == "kucoin":
+        url = f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={b}-{q}"
+        parse = "const it=(j.data||{});price=+it.price;bid=+it.bestBid;ask=+it.bestAsk;"
+    elif ex == "mexc":
+        url = f"https://api.mexc.com/api/v3/ticker/bookTicker?symbol={b}{q}"
+        parse = "const it=(j[0]||{});bid=+it.bidPrice;ask=+it.askPrice;price=(bid+ask)/2;"
+    elif ex == "bingx":
+        if perp:
+            url = f"https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol={b}-{q}"
+            parse = "const it=((j.data||[])[0])||{};price=+it.lastPrice;"
+        else:
+            url = f"https://open-api.bingx.com/openApi/spot/v1/ticker/24hr?symbol={b}-{q}"
+            parse = "const it=(j.data||{});price=+it.closePrice;"
+    else:
+        return ""
+
+    return (
+        _LIVE_POLLER_TEMPLATE
+        .replace("__URL__", url)
+        .replace("__PARSE__", parse)
+        .replace("__STEP__", str(int(step_sec)))
+        .replace("__MS__", str(int(interval_ms)))
+    )

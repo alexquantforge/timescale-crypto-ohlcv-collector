@@ -224,3 +224,76 @@ def test_build_pair_links_html_variants():
 
     spot_no_perp = build_pair_links_html("XYZ/USDT", "bybit", None)
     assert "no perp" in spot_no_perp
+
+
+# ---------------------------------------------------------------------------
+# Live data: intraday->daily merge & poller JS
+# ---------------------------------------------------------------------------
+
+def _mk_df(ts_list, o=1.0, h=2.0, l=0.5, c=1.5, v=1.0):
+    import pandas as pd
+    n = len(ts_list)
+    return pd.DataFrame({
+        "ts": ts_list,
+        "time": pd.to_datetime(ts_list, unit="s"),
+        "open": [o] * n, "high": [h] * n, "low": [l] * n, "close": [c] * n, "volume": [v] * n,
+    })
+
+
+def test_merge_intraday_into_daily_appends_today():
+    from dashboard.helpers import merge_intraday_into_daily
+    import pandas as pd
+
+    day = 1_786_000_000 - (1_786_000_000 % 86400)
+    d1 = _mk_df([day - 86400])
+    d15 = _mk_df([day, day + 900], o=1.5, h=2.5, l=1.4, c=1.8, v=3.0)
+    out = merge_intraday_into_daily(d1, d15)
+
+    assert len(out) == 2
+    last = out.iloc[-1]
+    assert int(last["ts"]) == day
+    assert last["open"] == 1.5 and last["high"] == 2.5 and last["low"] == 1.4
+    assert last["close"] == 1.8 and last["volume"] == 6.0
+
+
+def test_merge_intraday_into_daily_replaces_stale_bar():
+    from dashboard.helpers import merge_intraday_into_daily
+
+    day = 1_786_000_000 - (1_786_000_000 % 86400)
+    d1 = _mk_df([day])  # stale bar for today already present
+    d15 = _mk_df([day + 900, day + 1800], o=1.1, h=2.2, l=1.0, c=2.0, v=2.0)
+    out = merge_intraday_into_daily(d1, d15)
+
+    assert len(out) == 1
+    assert out.iloc[-1]["high"] == 2.2 and out.iloc[-1]["volume"] == 4.0
+
+
+def test_merge_intraday_into_daily_older_15m_ignored():
+    from dashboard.helpers import merge_intraday_into_daily
+
+    day = 1_786_000_000 - (1_786_000_000 % 86400)
+    d1 = _mk_df([day])
+    d15 = _mk_df([day - 86400])  # 15m data older than daily chart
+    out = merge_intraday_into_daily(d1, d15)
+    assert len(out) == 1
+    assert out.iloc[-1]["close"] == 1.5  # unchanged
+
+
+def test_build_live_poller_js_variants():
+    from dashboard.helpers import build_live_poller_js
+
+    bybit = build_live_poller_js("bybit", "ADA/USDT:USDT", 900, 1000)
+    assert "api.bybit.com" in bybit and "category=linear&symbol=ADAUSDT" in bybit
+    assert "mainSeries.update" in bybit and "__STEP__" not in bybit
+
+    okx_spot = build_live_poller_js("okx", "ADA/USDT", 86400, 2000)
+    assert "instId=ADA-USDT" in okx_spot and "86400" in okx_spot and "2000" in okx_spot
+
+    okx_perp = build_live_poller_js("okx", "ADA/USDT:USDT", 900, 1000)
+    assert "instId=ADA-USDT-SWAP" in okx_perp
+
+    gate = build_live_poller_js("gateio", "BTC/USDT:USDT", 900, 1000)
+    assert "futures/usdt/tickers" in gate and "contract=BTC_USDT" in gate
+
+    assert build_live_poller_js("htx", "ADA/USDT", 900, 1000) == ""   # unsupported
+    assert build_live_poller_js("bybit", "ADA/USDT", 900, 0) == ""    # disabled
