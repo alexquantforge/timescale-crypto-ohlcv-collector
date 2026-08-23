@@ -5,7 +5,7 @@ import asyncio
 import time
 from typing import Any, Dict, Optional
 from src.analytics.vitality import compute_vitality_score
-from src.core.timeouts import hard_wait_for
+from src.utils.timeouts import hard_wait_for
 
 
 async def fetch_orderbook_snapshot(

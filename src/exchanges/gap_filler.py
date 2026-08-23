@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 from pytz import timezone as pytz_timezone
 
-from src.core.timeouts import hard_wait_for
+from src.utils.timeouts import hard_wait_for
 from src.exchanges.symbol_selector import get_exchange_url, get_swap_url
 
 logger = logging.getLogger("gap_filler")

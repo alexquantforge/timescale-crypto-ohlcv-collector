@@ -15,7 +15,7 @@ from config.settings import settings
 from src.analytics.atr_filtered import compute_atr_no_paranormal_bars
 from src.analytics.orderbook import fetch_orderbook_snapshot
 from src.core.progress import GlobalProgress
-from src.core.timeouts import hard_wait_for
+from src.utils.timeouts import hard_wait_for
 from src.db.connection import get_db_pools, close_all_db_pools
 from src.db.migrations import ensure_databases_exist
 from src.db.repository import HistoricalMarketRepository
