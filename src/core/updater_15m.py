@@ -220,6 +220,13 @@ def should_skip_pair(symbol: str, exchange: str = "") -> bool:
     if base.endswith("STOCK"):
         return True
 
+    # Withdrawn/delisted listings still present in some exchanges' markets
+    # (BingX): '$'-prefixed and '*_OLD'-suffixed tickers never trade — their
+    # kline endpoint just 404s. Digit-leading tickers (1CAT, 10SET...) stay
+    # untouched: e.g. 1INCH is legit, and the graveyard covers the rest.
+    if base.startswith("$") or base.endswith("_OLD"):
+        return True
+
     if exchange == "bitget" and base.startswith("R"):
         crypto_exceptions = {"RARE", "RAY", "RAMP", "RAU", "RAVE", "RNDR", "RSR", "RUNE", "RVN", "ROSE", "REQ"}
         if base not in crypto_exceptions:

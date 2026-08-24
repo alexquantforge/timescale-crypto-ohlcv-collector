@@ -33,6 +33,11 @@ def should_skip_pair(symbol: str, exchange: str = "") -> bool:
     if base.endswith("STOCK"):
         return True
 
+    # Skip withdrawn/delisted listings still present in some exchanges'
+    # markets (BingX): '$'-prefixed and '*_OLD'-suffixed tickers never trade.
+    if base.startswith("$") or base.endswith("_OLD"):
+        return True
+
     # Bitget: Skip R* tokenized stock symbols (e.g. RAAPL, RGOOGL, RSAM, RSNOW, etc.)
     # These tokenized equity contracts fail parameter validation on Bitget API.
     if exchange.lower() in ("bitget", "bg") and base.startswith("R"):

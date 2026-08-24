@@ -47,3 +47,14 @@ def test_stock_tokens_skipped_in_both_selectors():
         assert not mod.should_skip_pair("BTC/USDT:USDT", "mexc")
         assert not mod.should_skip_pair("ROUTE/USDT", "bingx")
         assert not mod.should_skip_pair("ROY/USDT", "bingx")
+
+
+def test_junk_dollar_and_old_tickers_skipped():
+    for mod in (updater_15m, symbol_selector):
+        for pair in ("$1/USDT", "$BAR_OLD/USDT", "$TIME/USDT", "$NAP/USDT", "BAR_OLD/USDT"):
+            assert mod.should_skip_pair(pair, "bingx"), f"{mod.__name__}: {pair}"
+        # digit-leading tickers are NOT pattern-skipped (1INCH is legit) —
+        # the dead-symbol graveyard handles the truly broken ones
+        assert not mod.should_skip_pair("1INCH/USDT", "bingx")
+        assert not mod.should_skip_pair("1CAT/USDT", "bingx")
+        assert not mod.should_skip_pair("BTC/USDT:USDT", "bingx")
