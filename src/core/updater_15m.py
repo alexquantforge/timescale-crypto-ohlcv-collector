@@ -1254,12 +1254,69 @@ def _make_exchange(ccxt_id: str):
     return getattr(ccxt_async, ccxt_id)(config)
 
 
-async def load_markets_retries(exchange, ccxt_name, attempts: int = 3, timeout: float = 30.0) -> bool:
+# --- Persistent exchange instances (memory fix) ----------------------------
+# Previously each 5-minute cycle created a fresh ccxt instance per exchange
+# (and count_pairs_for_exchange created a SECOND one), re-downloaded the full
+# markets JSON (tens of MB on gate/mexc/bingx) and threw everything away.
+# The create/close churn plus Python allocator fragmentation ratcheted the
+# process RSS up until the machine hit swap. Now: one long-lived instance
+# per exchange; markets reloaded at most every MARKETS_TTL_SECONDS; instance
+# recreated at most every EXCHANGE_MAX_AGE_SECONDS.
+MARKETS_TTL_SECONDS = 1800.0           # reload market lists at most every 30 min
+EXCHANGE_MAX_AGE_SECONDS = 6 * 3600.0  # recreate each ccxt instance every 6 h
+_EXCHANGES: Dict[str, dict] = {}       # ccxt_name -> {ex, born_at, markets_at}
+
+
+async def get_persistent_exchange(ccxt_name: str):
+    """One long-lived ccxt instance per exchange. None on hard failure
+    (markets not loadable AND nothing cached)."""
+    now = time.time()
+    entry = _EXCHANGES.get(ccxt_name)
+    if entry and now - entry["born_at"] > EXCHANGE_MAX_AGE_SECONDS:
+        await close_exchange_safely(entry["ex"], ccxt_name)
+        _EXCHANGES.pop(ccxt_name, None)
+        entry = None
+    if entry is None:
+        entry = {"ex": _make_exchange(EXCHANGE_MAP.get(ccxt_name, ccxt_name)),
+                 "born_at": now, "markets_at": 0.0}
+        _EXCHANGES[ccxt_name] = entry
+    ex = entry["ex"]
+    if now - entry["markets_at"] > MARKETS_TTL_SECONDS or not getattr(ex, "markets", None):
+        ok = await load_markets_retries(ex, ccxt_name, reload=True)
+        if ok:
+            entry["markets_at"] = time.time()
+        elif not getattr(ex, "markets", None):
+            await close_exchange_safely(ex, ccxt_name)  # never loaded — drop, retry next cycle
+            _EXCHANGES.pop(ccxt_name, None)
+            return None
+    return ex
+
+
+def release_memory() -> None:
+    """Return freed heap arenas to the OS after a cycle. Python's allocator
+    ratchets RSS to the cycle peak and NEVER hands it back on its own — that
+    ratchet is what filled RAM + swap over hours. gc + malloc_trim(0) gives
+    it back on Linux; a harmless no-op elsewhere."""
+    try:
+        import gc
+
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+async def load_markets_retries(exchange, ccxt_name, attempts: int = 3, timeout: float = 30.0, reload: bool = False) -> bool:
     """Load markets with retries — gateio/htx occasionally time out on flaky networks."""
     last_err = None
     for attempt in range(1, attempts + 1):
         try:
-            await asyncio.wait_for(exchange.load_markets(), timeout=timeout)
+            await asyncio.wait_for(exchange.load_markets(reload), timeout=timeout)
             return True
         except Exception as e:
             last_err = e
@@ -1271,11 +1328,10 @@ async def load_markets_retries(exchange, ccxt_name, attempts: int = 3, timeout: 
 
 
 async def count_pairs_for_exchange(ccxt_name: str) -> int:
-    ccxt_id = EXCHANGE_MAP.get(ccxt_name, ccxt_name)
-    exchange = _make_exchange(ccxt_id)
+    exchange = await get_persistent_exchange(ccxt_name)  # shared instance, no per-cycle churn
+    if exchange is None:
+        return 0
     try:
-        if not await load_markets_retries(exchange, ccxt_name):
-            return 0
         syms = select_symbols_for_exchange(
             exchange.symbols, exchange.markets, ccxt_name
         )
@@ -1283,18 +1339,16 @@ async def count_pairs_for_exchange(ccxt_name: str) -> int:
     except Exception as e:
         log(f"  [PRECOUNT] {ccxt_name}: failed counting pairs: {e!r}")
         return 0
-    finally:
-        await close_exchange_safely(exchange, ccxt_name)
 
 
 async def process_exchange(ccxt_name):
     ccxt_id = EXCHANGE_MAP.get(ccxt_name, ccxt_name)
     log(f"--- Exchange: {ccxt_name} ---")
 
-    exchange = _make_exchange(ccxt_id)
+    exchange = await get_persistent_exchange(ccxt_name)  # persistent instance, no per-cycle churn
 
     try:
-        if not await load_markets_retries(exchange, ccxt_name):
+        if exchange is None:
             if GLOBAL_PROGRESS is not None:
                 GLOBAL_PROGRESS.subtract_from_total(2000)
             return
@@ -1347,7 +1401,8 @@ async def process_exchange(ccxt_name):
 
         await asyncio.gather(*[worker(s) for s in syms])
     finally:
-        await close_exchange_safely(exchange, ccxt_name)
+        # instance stays alive across cycles — the registry rotates it by age
+        pass
 
 
 async def main_15m_loop():
@@ -1392,6 +1447,8 @@ async def main_15m_loop():
         )
 
         await run_maintenance()
+
+        release_memory()  # hand freed arenas back to the OS before the sleep
 
         log(f"Sleeping {UPDATE_INTERVAL_SECONDS // 60} minutes until next 15M cycle.")
         await asyncio.sleep(UPDATE_INTERVAL_SECONDS)

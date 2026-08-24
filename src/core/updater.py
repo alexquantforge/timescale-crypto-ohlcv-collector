@@ -68,7 +68,7 @@ def format_await_chain(task: asyncio.Task, max_depth: int = 12) -> str:
 
 
 async def load_markets_with_retry(
-    exchange, name: str, attempts: int = 3, timeout: float = 30.0
+    exchange, name: str, attempts: int = 3, timeout: float = 30.0, reload: bool = False
 ) -> bool:
     """
     Loads exchange markets with retries — gateio/htx/kucoin occasionally
@@ -78,7 +78,7 @@ async def load_markets_with_retry(
     last_err: Optional[BaseException] = None
     for attempt in range(1, attempts + 1):
         try:
-            await hard_wait_for(exchange.load_markets(), timeout, label=f"{name}.load_markets")
+            await hard_wait_for(exchange.load_markets(reload), timeout, label=f"{name}.load_markets")
             return True
         except Exception as e:
             last_err = e
@@ -89,6 +89,60 @@ async def load_markets_with_retry(
                 await asyncio.sleep(2.0)
     logger.warning(f"Failed to load markets for {name} after {attempts} attempts: {last_err!r}")
     return False
+
+
+# --- Persistent exchange instances (memory fix) ----------------------------
+# Same story as the 15m engine: per cycle the engine created a fresh ccxt
+# instance per exchange (plus one more for the pre-count), re-downloaded full
+# market lists and threw everything out — the allocator churn ratcheted RSS
+# up until the host swapped. Keep one long-lived instance per exchange;
+# reload markets at most every MARKETS_TTL_SECONDS; recreate instances at
+# most every EXCHANGE_MAX_AGE_SECONDS.
+MARKETS_TTL_SECONDS = 1800.0
+EXCHANGE_MAX_AGE_SECONDS = 6 * 3600.0
+_EXCHANGES: Dict[str, dict] = {}  # ccxt_id -> {ex, born_at, markets_at}
+
+
+async def get_persistent_exchange(ccxt_id: str, ccxt_name: str):
+    """One long-lived ccxt instance per exchange. None on hard failure
+    (markets not loadable AND nothing cached)."""
+    now = time.time()
+    entry = _EXCHANGES.get(ccxt_id)
+    if entry and now - entry["born_at"] > EXCHANGE_MAX_AGE_SECONDS:
+        await close_exchange_safely(entry["ex"], ccxt_name)
+        _EXCHANGES.pop(ccxt_id, None)
+        entry = None
+    if entry is None:
+        entry = {"ex": create_exchange(ccxt_id), "born_at": now, "markets_at": 0.0}
+        _EXCHANGES[ccxt_id] = entry
+    ex = entry["ex"]
+    if now - entry["markets_at"] > MARKETS_TTL_SECONDS or not getattr(ex, "markets", None):
+        ok = await load_markets_with_retry(ex, ccxt_name, reload=True)
+        if ok:
+            entry["markets_at"] = time.time()
+        elif not getattr(ex, "markets", None):
+            await close_exchange_safely(ex, ccxt_name)  # never loaded — drop, retry next cycle
+            _EXCHANGES.pop(ccxt_id, None)
+            return None
+    return ex
+
+
+def release_memory() -> None:
+    """Return freed heap arenas to the OS after a cycle: gc + malloc_trim(0).
+    Python's allocator ratchets RSS to the cycle peak and never returns it on
+    its own — that ratchet is what filled RAM + swap over hours."""
+    try:
+        import gc
+
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 class MarketDataEngine:
@@ -428,17 +482,15 @@ class MarketDataEngine:
         """Counts symbols for exchange using Perp-First selection."""
         exchange_map = settings.exchange_map_15m if self.timeframe == "15m" else settings.exchange_map_1d
         ccxt_id = exchange_map.get(ccxt_name, ccxt_name)
-        exchange = create_exchange(ccxt_id)
+        exchange = await get_persistent_exchange(ccxt_id, ccxt_name)  # shared, no per-cycle churn
         try:
-            if not await load_markets_with_retry(exchange, ccxt_name):
+            if exchange is None:
                 return 0
             syms = select_symbols_perp_first(exchange.symbols, exchange.markets, exchange_name=ccxt_name)
             return len(syms)
         except Exception as e:
             logger.warning(f"Failed precount for {ccxt_name}: {e!r}")
             return 0
-        finally:
-            await close_exchange_safely(exchange, ccxt_name)
 
     async def process_exchange(self, ccxt_name: str) -> None:
         """Processes all selected symbols for an exchange in parallel."""
@@ -446,9 +498,9 @@ class MarketDataEngine:
         ccxt_id = exchange_map.get(ccxt_name, ccxt_name)
         logger.info(f"--- Processing Exchange: {ccxt_name} ({ccxt_id}) [{self.timeframe}] ---")
 
-        exchange = create_exchange(ccxt_id)
+        exchange = await get_persistent_exchange(ccxt_id, ccxt_name)  # persistent, no per-cycle churn
         try:
-            if not await load_markets_with_retry(exchange, ccxt_name):
+            if exchange is None:
                 return
 
             syms = select_symbols_perp_first(exchange.symbols, exchange.markets, exchange_name=ccxt_name)
@@ -475,7 +527,8 @@ class MarketDataEngine:
 
             await asyncio.gather(*[worker(s) for s in syms])
         finally:
-            await close_exchange_safely(exchange, ccxt_name)
+            # instance stays alive across cycles — the registry rotates it by age
+            pass
 
     async def run_cycle(self) -> None:
         """Executes one full iteration cycle over all configured exchanges."""
@@ -516,6 +569,7 @@ class MarketDataEngine:
             f"Cycle finished ({self.timeframe.upper()}). Processed {self.progress.done}/{self.progress.total} "
             f"symbols in {elapsed/60.0:.2f} mins."
         )
+        release_memory()  # hand freed arenas back to the OS
 
     async def start_loop(self) -> None:
         """Starts continuous execution loop."""
