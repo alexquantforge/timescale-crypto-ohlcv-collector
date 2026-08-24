@@ -102,6 +102,26 @@ def ohlcv_since_floor_ms(exchange_name: str):
     if not max_candles:
         return None
     return int(time.time() * 1000) - max_candles * 900 * 1000
+
+
+# Symbols the exchange itself reports as NOT FOUND (e.g. BingX code 100204 —
+# typically delisted spot tokens still present in load_markets). Retrying them
+# on every 5-minute cycle is pure noise and pure rate-limit burn: they are
+# skipped for the rest of the process run (a restart re-tries them once).
+_DEAD_SYMBOLS: set = set()  # {(ccxt_name, symbol)}
+
+
+def _is_symbol_not_found_error(e: Exception) -> bool:
+    """Delisted/unknown market — permanent until the next engine restart."""
+    if isinstance(e, ccxt.BadSymbol):
+        return True
+    msg = str(e).lower()
+    return "symbol is not found" in msg or '"code":100204' in msg.replace(" ", "")
+
+
+def _mark_dead_symbol_if_gone(e: Exception, ccxt_name: str, symbol: str) -> None:
+    if _is_symbol_not_found_error(e):
+        _DEAD_SYMBOLS.add((ccxt_name, symbol))
 GAP_FETCH_DELAY = 0.1
 
 SKIP_PATTERNS = re.compile(
@@ -192,6 +212,12 @@ def should_skip_pair(symbol: str, exchange: str = "") -> bool:
         return True
 
     if SKIP_PATTERNS.search(symbol):
+        return True
+
+    # MEXC-style synthetic *STOCK* tokens (CXMTSTOCK, AAOISTOCK, DXCMSTOCK...):
+    # their klines carry garbage timestamps (28 years of "history"), poison
+    # tables and charts. Never collect them.
+    if base.endswith("STOCK"):
         return True
 
     if exchange == "bitget" and base.startswith("R"):
@@ -707,6 +733,7 @@ async def check_and_fill_table_gaps(
                         timeout=6.0,
                     )
                 except Exception as e:
+                    _mark_dead_symbol_if_gone(e, ccxt_name, symbol)
                     log(
                         f"  [15M] ⚠️ {symbol} @{tbl.rsplit('_on_', 1)[-1]}: gap-fill fetch_ohlcv failed "
                         f"({type(e).__name__}: {e}) — gap left open"
@@ -815,6 +842,7 @@ async def process_pair(exchange, symbol, ccxt_id):
                         timeout=6.0,
                     )
                 except Exception as e:
+                    _mark_dead_symbol_if_gone(e, ccxt_id, symbol)
                     log(
                         f"  [15M] ⚠️ {symbol} @{ccxt_id}: catch-up fetch_ohlcv failed "
                         f"({type(e).__name__}: {e}) — table stays behind"
@@ -850,6 +878,7 @@ async def process_pair(exchange, symbol, ccxt_id):
                     timeout=6.0,
                 )
             except Exception as e:
+                _mark_dead_symbol_if_gone(e, ccxt_id, symbol)
                 log(
                     f"  [15M] ⚠️ {symbol} @{ccxt_id}: initial fetch_ohlcv failed "
                     f"({type(e).__name__}: {e})"
@@ -875,6 +904,7 @@ async def process_pair(exchange, symbol, ccxt_id):
                             timeout=6.0,
                         )
                     except Exception as e:
+                        _mark_dead_symbol_if_gone(e, ccxt_id, symbol)
                         log(
                             f"  [15M] ⚠️ {symbol} @{ccxt_id}: backfill fetch_ohlcv failed "
                             f"({type(e).__name__}: {e})"
@@ -905,7 +935,8 @@ async def process_pair(exchange, symbol, ccxt_id):
 
         if not all_candles:
             # Create empty table for 0-candle symbol so find_table_in_dbs finds it next time
-            if last_ts == 0:
+            # (but not for symbols the exchange itself reports as non-existent)
+            if last_ts == 0 and (ccxt_id, symbol) not in _DEAD_SYMBOLS:
                 await create_empty_symbol_table(DB_LOW, tbl)
             return 0, 0, 0, 0
 
@@ -1264,6 +1295,13 @@ async def process_exchange(ccxt_name):
         syms = select_symbols_for_exchange(
             exchange.symbols, exchange.markets, ccxt_name
         )
+        live_syms = [s for s in syms if (ccxt_name, s) not in _DEAD_SYMBOLS]
+        if len(live_syms) < len(syms):
+            log(
+                f"  [15M] 🪦 {ccxt_name}: skipping {len(syms) - len(live_syms)} symbol(s) "
+                f"the exchange reports as not found (delisted) until restart"
+            )
+        syms = live_syms
         total = len(syms)
         sem = asyncio.Semaphore(CONCURRENT_PER_EXCHANGE)
 

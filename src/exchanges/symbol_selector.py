@@ -28,6 +28,11 @@ def should_skip_pair(symbol: str, exchange: str = "") -> bool:
     if SKIP_PATTERNS.search(spot_like):
         return True
 
+    # Skip synthetic *STOCK* tokens (MEXC stock perps like CXMTSTOCK): their
+    # klines carry garbage timestamps that poison tables and charts.
+    if base.endswith("STOCK"):
+        return True
+
     # Bitget: Skip R* tokenized stock symbols (e.g. RAAPL, RGOOGL, RSAM, RSNOW, etc.)
     # These tokenized equity contracts fail parameter validation on Bitget API.
     if exchange.lower() in ("bitget", "bg") and base.startswith("R"):
