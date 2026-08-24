@@ -150,6 +150,27 @@ def load_summary_cached(db_host, db_port, db_user, db_pass, timeframe: str) -> p
         st.error(f"Database connection error: {e}")
         return pd.DataFrame()
 
+@st.cache_data(ttl=15, show_spinner=False)
+def _probe_db_error(db_host, db_port, db_user, db_pass):
+    """Quick connect probe used by the 'no tables' diagnostic: returns the
+    actual connection/auth error text instead of a generic warning."""
+
+    async def _probe():
+        try:
+            conn = await asyncpg.connect(
+                host=db_host, port=db_port, user=db_user, password=db_pass,
+                database=settings.db_high_15m, timeout=10,
+            )
+            await conn.close()
+            return None
+        except Exception as e:
+            return str(e) or type(e).__name__
+
+    try:
+        return asyncio.run(_probe())
+    except Exception as e:
+        return str(e) or type(e).__name__
+
 
 async def _load_candles(db_name: str, table_name: str, limit: int, db_host, db_port, db_user, db_pass) -> pd.DataFrame:
     """Fetches only the last `limit` candles (DESC + reverse) instead of the full history."""
@@ -1048,10 +1069,13 @@ demo_mode = st.sidebar.checkbox(
 if demo_mode:
     db_host = db_port = db_user = db_pass = ""
 else:
-    db_host = st.sidebar.text_input("DB Host", value=os.getenv("DB_HOST", "localhost"))
-    db_port = st.sidebar.number_input("DB Port", value=int(os.getenv("DB_PORT", 5432)))
-    db_user = st.sidebar.text_input("DB User", value=os.getenv("DB_USER", "postgres"))
-    db_pass = st.sidebar.text_input("DB Password", value=os.getenv("DB_PASSWORD", "postgres"), type="password")
+    # Defaults come from config settings (db_config.py / .env priority), NOT a
+    # bare "postgres" fallback — the shell environment often has no DB_USER
+    # exported, and guessing "postgres/postgres" just fails authentication.
+    db_host = st.sidebar.text_input("DB Host", value=os.getenv("DB_HOST", settings.db_host))
+    db_port = st.sidebar.number_input("DB Port", value=int(os.getenv("DB_PORT", settings.db_port)))
+    db_user = st.sidebar.text_input("DB User", value=os.getenv("DB_USER", settings.db_user))
+    db_pass = st.sidebar.text_input("DB Password", value=os.getenv("DB_PASSWORD", settings.db_password), type="password")
 
 # --- Exchange filter (which exchanges the dashboard is wired to) -------------
 # Options respect the collector's ALLOWED_EXCHANGES whitelist (empty = all).
@@ -1129,6 +1153,14 @@ if not enabled_exs:
     st.stop()
 
 if df_15m.empty and df_1d.empty:
+    _probe_err = None if demo_mode else _probe_db_error(db_host, db_port, db_user, db_pass)
+    if _probe_err:
+        st.error(
+            f"❌ Cannot connect to TimescaleDB at `{db_host}:{db_port}` as user "
+            f"`{db_user}`: **{_probe_err}**\n\n"
+            f"Check DB Host/User/Password in the sidebar — defaults now come from "
+            f"db_config.py / .env (user `{settings.db_user}`)."
+        )
     st.warning(
         "⚠️ No data tables found in historical databases. Ensure PostgreSQL/TimescaleDB is running "
         "or enable 🧪 Demo mode in the sidebar."
