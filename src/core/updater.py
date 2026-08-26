@@ -21,6 +21,7 @@ from src.core.history_prefill import (
     extract_older_rows,
     prefill_needed,
     prefill_page_since_ms,
+    should_attempt_prefill,
 )
 from src.db.migrations import ensure_databases_exist
 from src.db.repository import HistoricalMarketRepository
@@ -183,7 +184,7 @@ class MarketDataEngine:
         self._gap_since: Dict[str, float] = {}     # tbl -> ts of last gap check
         self._gap_budget_until = 0.0               # gap filling deadline for the current cycle
         self._gap_budget_logged = False
-        self._prefill_done: Dict[str, int] = {}    # tbl -> first_ts at the failed history-prefill attempt
+        self._prefill_done: Dict[str, tuple] = {}  # tbl -> (min_ts_at_latch, attempt_ts) — see should_attempt_prefill
 
     def _should_attempt_backfill(self, tbl_name: str) -> bool:
         """Empty symbols (0 candles: tokenized stocks, delisted) are retried
@@ -271,6 +272,13 @@ class MarketDataEngine:
         logger.info(
             f"Engine initialized for timeframe '{self.timeframe}' with databases: "
             f"HIGH='{high_db}', LOW='{low_db}'"
+        )
+        logger.info(
+            f"[{self.timeframe.upper()}] ⚙️ BUILD 2026-08-26-history-repair-v2 ACTIVE: "
+            f"backward prefill floor={settings.backfill_start_date}, "
+            f"≤{settings.history_prefill_max_pages} pages/pair/cycle, "
+            f"retry={settings.history_prefill_retry_sec // 3600}h. "
+            f"Expect 🔧 (start), 📜 (progress), ✅/⛔ (stop), ⚠️ (fetch error) lines."
         )
         # Automatically clean up Bitget tokenized stock tables on startup
         await self.repository.cleanup_invalid_bitget_tables()
@@ -411,12 +419,20 @@ class MarketDataEngine:
                     .timestamp()
                 )
                 step_sec = 900 if self.timeframe == "15m" else 86400
-                if (
-                    prefill_needed(first_ts, floor_sec, slack_sec=step_sec * 2)
-                    and self._prefill_done.get(tbl_name) != first_ts
+                if prefill_needed(first_ts, floor_sec, slack_sec=step_sec * 2) and should_attempt_prefill(
+                    self._prefill_done.get(tbl_name),
+                    first_ts,
+                    retry_after_sec=settings.history_prefill_retry_sec,
                 ):
+                    logger.info(
+                        f"  [{self.timeframe.upper()}] 🔧 {symbol} @{ccxt_id}: history repair — "
+                        f"table starts {pd.to_datetime(int(first_ts), unit='s')}, "
+                        f"filling back to {settings.backfill_start_date}"
+                    )
                     oldest = int(first_ts)
                     prefilled = 0
+                    terminal_at = None   # (reason, oldest_at_latch)
+                    failed = False
                     for _ in range(settings.history_prefill_max_pages):
                         since_ms = prefill_page_since_ms(
                             oldest, step_sec, bf_limit,
@@ -424,33 +440,70 @@ class MarketDataEngine:
                             target_floor_sec=floor_sec,
                         )
                         if since_ms is None:
-                            break  # floor reached — table complete
+                            terminal_at = ("floor reached — history complete", oldest)
+                            break
                         try:
                             batch = await hard_wait_for(
                                 exchange.fetch_ohlcv(symbol, self.timeframe, since=since_ms, limit=bf_limit),
-                                6.0,
+                                12.0,
                                 label=f"{symbol}@{ccxt_id} history-prefill",
                             )
-                        except Exception:
-                            self._prefill_done[tbl_name] = oldest
+                        except Exception as e:
+                            # NEVER silent: a failed page used to latch the pair
+                            # for the whole process run with zero log output —
+                            # that is how "везде +1 свеча, история не качается".
+                            logger.warning(
+                                f"  [{self.timeframe.upper()}] ⚠️ {symbol} @{ccxt_id}: "
+                                f"history-prefill page fetch failed "
+                                f"({type(e).__name__}: {e}); since="
+                                f"{pd.to_datetime(since_ms, unit='ms')} — will retry "
+                                f"after {settings.history_prefill_retry_sec // 3600}h or on restart"
+                            )
+                            failed = True
                             break
                         if not batch:
-                            self._prefill_done[tbl_name] = oldest
+                            terminal_at = ("exchange returned nothing", oldest)
                             break
                         older = extract_older_rows(batch, oldest, floor_sec)
                         if not older:
-                            self._prefill_done[tbl_name] = oldest  # exchange has nothing older
+                            terminal_at = ("exchange has nothing older", oldest)
                             break
-                        await self.repository.upsert_candles(
-                            current_db, tbl_name,
-                            _candles_df_from_rows(older, symbol, ccxt_id),
-                            timeframe=self.timeframe,
-                        )
+                        try:
+                            await self.repository.upsert_candles(
+                                current_db, tbl_name,
+                                _candles_df_from_rows(older, symbol, ccxt_id),
+                                timeframe=self.timeframe,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"  [{self.timeframe.upper()}] ⚠️ {symbol} @{ccxt_id}: "
+                                f"history-prefill DB save failed ({type(e).__name__}: {e}) — "
+                                f"will retry after {settings.history_prefill_retry_sec // 3600}h or on restart"
+                            )
+                            failed = True
+                            break
                         prefilled += len(older)
                         oldest = int(older[0][0]) // 1000
                         await asyncio.sleep(0.05)
                         if oldest <= floor_sec:
+                            terminal_at = ("floor reached — history complete", oldest)
                             break
+                    if failed:
+                        # Cooldown-latch on the (unchanged) table start so we
+                        # don't hammer the exchange every cycle, but DO retry.
+                        self._prefill_done[tbl_name] = (int(first_ts), time.time())
+                    elif terminal_at is not None:
+                        reason, latch_min = terminal_at
+                        self._prefill_done[tbl_name] = (int(latch_min), time.time())
+                        mark = "✅" if "floor" in reason else "⛔"
+                        logger.info(
+                            f"  [{self.timeframe.upper()}] {mark} {symbol} @{ccxt_id}: "
+                            f"history repair stop — {reason} at "
+                            f"{pd.to_datetime(int(latch_min), unit='s')}"
+                            + (f" (+{prefilled} older candles this round)" if prefilled else "")
+                        )
+                    # Success with progress and more pages likely available:
+                    # leave UNLATCHED so the next cycle continues left at once.
                     if prefilled:
                         logger.info(
                             f"  [{self.timeframe.upper()}] 📜 {symbol} @{ccxt_id}: history repair "
@@ -548,7 +601,12 @@ class MarketDataEngine:
                 logger.debug(f"Exchange error for {symbol} on {ccxt_id}: {e}")
             return 0
         except Exception as e:
-            logger.debug(f"Uncatched error processing {symbol} on {ccxt_id}: {e}")
+            # Loud, not debug: this catch-all also intercepts errors escaping
+            # the history-prefill block — invisible at debug level.
+            logger.warning(
+                f"  [{self.timeframe.upper()}] ⚠️ UNCAUGHT error processing {symbol} on {ccxt_id}: "
+                f"{type(e).__name__}: {e}"
+            )
             return 0
 
     async def precount_exchange_pairs(self, ccxt_name: str) -> int:

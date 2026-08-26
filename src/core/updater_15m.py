@@ -20,8 +20,10 @@ import ccxt.async_support as ccxt_async
 
 from src.core.history_prefill import (
     extract_older_rows,
+    normalize_epoch_sec,
     prefill_needed,
     prefill_page_since_ms,
+    should_attempt_prefill,
 )
 from src.exchanges.symbol_selector import get_exchange_url, get_swap_url
 from pytz import timezone as pytz_timezone
@@ -120,7 +122,7 @@ _DEAD_SYMBOLS: set = set()  # {(ccxt_name, symbol)}
 # anything older than the current table start (empty/lose-progress attempt) —
 # skipped until their table start actually improves.
 PREFILL_MAX_PAGES = 10
-_PREFILL_DONE: dict = {}  # {(ccxt_id, symbol): min_ts_sec at the failed attempt}
+_PREFILL_DONE: dict = {}  # {(ccxt_id, symbol): (min_ts_at_latch, attempt_ts)} — see should_attempt_prefill
 
 
 def _is_symbol_not_found_error(e: Exception) -> bool:
@@ -269,8 +271,18 @@ async def find_table_in_dbs(table_name: str) -> Tuple[Optional[str], int, int]:
                 row = await conn.fetchrow(
                     f'SELECT MAX("Timestamp") AS mx, MIN("Timestamp") AS mn FROM "{table_name}"'
                 )
-                last_ts = row["mx"] if row else None
-                min_ts = row["mn"] if row else None
+                raw_max = int(row["mx"]) if row and row["mx"] else None
+                raw_min = int(row["mn"]) if row and row["mn"] else None
+                last_ts = normalize_epoch_sec(raw_max) if raw_max else None
+                min_ts = normalize_epoch_sec(raw_min) if raw_min else None
+                if (raw_max and raw_max != last_ts) or (raw_min and raw_min != min_ts):
+                    # Legacy epoch-ms rows poison catch-up ("+0 свечей вечно")
+                    # and history-prefill (absurd `since`) — repair the cursors.
+                    log(
+                        f"  [15M] ⚠️ [EPOCH-FIX] '{table_name}' in '{db}' stores Timestamp "
+                        f"in epoch-ms (MIN={raw_min}, MAX={raw_max}) — cursors normalized "
+                        f"to seconds; next save rewrites the table in seconds."
+                    )
                 return (
                     db,
                     int(last_ts) if last_ts else 1,  # 1 indicates table exists even if empty
@@ -870,18 +882,24 @@ async def process_pair(exchange, symbol, ccxt_id):
                 added += 1
             return added, newest
 
-        async def _fetch_page(since_ms, phase: str):
+        async def _fetch_page(since_ms, phase: str, timeout: float = 6.0):
             """One OHLCV page; None on failure (error already logged + dead-marked)."""
             try:
                 return await asyncio.wait_for(
                     exchange.fetch_ohlcv(symbol, "15m", since=since_ms, limit=FETCH_LIMIT),
-                    timeout=6.0,
+                    timeout=timeout,
                 )
             except Exception as e:
                 _mark_dead_symbol_if_gone(e, ccxt_id, symbol)
+                hint = (
+                    f" — history-prefill retries after {settings.history_prefill_retry_sec // 3600}h "
+                    f"or on restart"
+                    if phase == "history-prefill"
+                    else ""
+                )
                 log(
                     f"  [15M] ⚠️ {symbol} @{ccxt_id}: {phase} fetch_ohlcv failed "
-                    f"({type(e).__name__}: {e})"
+                    f"({type(e).__name__}: {e}); since={pd.to_datetime(int(since_ms), unit='ms')}{hint}"
                 )
                 return None
 
@@ -936,9 +954,22 @@ async def process_pair(exchange, symbol, ccxt_id):
         # paginated). Resumable: each cycle pages further left until the floor.
         if current_db and prefill_needed(min_ts, target_floor_ts, GAP_TOLERANCE_SEC):
             key = (ccxt_id, symbol)
-            if _PREFILL_DONE.get(key) != min_ts:  # retry only when start improved
+            # Cooldown-gated retry: a failed/terminal attempt latches the pair
+            # only for history_prefill_retry_sec (not for the whole run), and
+            # any table-start improvement re-arms an attempt immediately.
+            if should_attempt_prefill(
+                _PREFILL_DONE.get(key), min_ts,
+                retry_after_sec=settings.history_prefill_retry_sec,
+            ):
+                log(
+                    f"  [15M] 🔧 {symbol} @{ccxt_id}: history repair — "
+                    f"table starts {pd.to_datetime(int(min_ts), unit='s')}, "
+                    f"filling back to {pd.to_datetime(target_floor_ts, unit='s')}"
+                )
                 oldest = min_ts
                 prefilled = 0
+                terminal_at = None   # (reason, oldest_at_latch)
+                failed = False
                 for _ in range(PREFILL_MAX_PAGES):
                     since_ms = prefill_page_since_ms(
                         oldest, 900, FETCH_LIMIT,
@@ -946,14 +977,20 @@ async def process_pair(exchange, symbol, ccxt_id):
                         target_floor_sec=target_floor_ts,
                     )
                     if since_ms is None:
-                        break  # floor / exchange window reached — fully repaired
-                    cs = await _fetch_page(since_ms, "history-prefill")
+                        terminal_at = ("floor / exchange window reached — history complete", oldest)
+                        break
+                    # 12s here (not 6s): deep-history pages are the slowest
+                    # calls and must not die silently on transient lag.
+                    cs = await _fetch_page(since_ms, "history-prefill", timeout=12.0)
+                    if cs is None:                      # fetch error (already logged)
+                        failed = True
+                        break
                     if not cs:
-                        _PREFILL_DONE[key] = oldest
+                        terminal_at = ("exchange returned nothing", oldest)
                         break
                     older = extract_older_rows(cs, oldest, target_floor_ts)
                     if not older:
-                        _PREFILL_DONE[key] = oldest  # exchange has nothing older
+                        terminal_at = ("exchange has nothing older", oldest)
                         break
                     for c in older:
                         if int(c[0]) not in seen_ts:
@@ -963,7 +1000,21 @@ async def process_pair(exchange, symbol, ccxt_id):
                     oldest = int(older[0][0]) // 1000
                     await asyncio.sleep(0.05)
                     if oldest <= target_floor_ts:
+                        terminal_at = ("floor / exchange window reached — history complete", oldest)
                         break
+                if failed:
+                    _PREFILL_DONE[key] = (int(min_ts), time.time())  # retry after cooldown
+                elif terminal_at is not None:
+                    reason, latch_min = terminal_at
+                    _PREFILL_DONE[key] = (int(latch_min), time.time())
+                    mark = "✅" if "complete" in reason else "⛔"
+                    log(
+                        f"  [15M] {mark} {symbol} @{ccxt_id}: history repair stop — "
+                        f"{reason} at {pd.to_datetime(int(latch_min), unit='s')}"
+                        + (f" (+{prefilled} older candles this round)" if prefilled else "")
+                    )
+                # Progress without a terminal state: stay UNLATCHED so the next
+                # cycle keeps walking left immediately.
                 if prefilled:
                     log(
                         f"  [15M] 📜 {symbol} @{ccxt_id}: history repair "
@@ -1136,6 +1187,11 @@ async def process_pair(exchange, symbol, ccxt_id):
                 log(f"  🗑️ [DROP DELISTED] Dropped table {tbl} from {current_db}")
         return 0, 0, 0, 0
     except Exception as e:
+        # NEVER silent: an uncaught error here used to return +0 with zero log
+        # output — exactly how a crashing history-prefill would stay invisible.
+        log(
+            f"  [15M] ⚠️ UNCAUGHT {symbol} @{ccxt_id}: {type(e).__name__}: {e}"
+        )
         return 0, 0, 0, 0
 
 
@@ -1440,6 +1496,13 @@ async def process_exchange(ccxt_name):
 async def main_15m_loop():
     await init_db_pools()
     await drop_not_allowed_exchange_tables()
+
+    log(
+        f"[15M] ⚙️ BUILD 2026-08-26-history-repair-v2 ACTIVE: backward prefill "
+        f"floor=now-{settings.data_retention_days}d, ≤{PREFILL_MAX_PAGES} pages/pair/cycle, "
+        f"retry={settings.history_prefill_retry_sec // 3600}h. "
+        f"Expect 🔧 (start), 📜 (progress), ✅/⛔ (stop), ⚠️ (fetch error) lines."
+    )
 
     global GLOBAL_PROGRESS
     while True:

@@ -128,6 +128,10 @@ class Settings(BaseSettings):
     # fetched per pair per cycle; resumable across cycles until
     # backfill_start_date / the retention floor is reached.
     history_prefill_max_pages: int = Field(default=10, alias="HISTORY_PREFILL_MAX_PAGES")
+    # How long a terminal/failed prefill attempt suppresses retries for the
+    # same unchanged table start (a failed fetch must NOT mute the pair for
+    # the whole process run — that was the silent "ничего не докачалось").
+    history_prefill_retry_sec: int = Field(default=4 * 3600, alias="HISTORY_PREFILL_RETRY_SEC")
 
     backfill_request_limit_per_exchange: Dict[str, int] = {
         "bybit": 1000,

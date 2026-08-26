@@ -20,7 +20,59 @@ candles OLDER than the current table start:
 The functions are pure (no I/O) so the pagination/stop logic is fully
 unit-testable without an exchange or a database.
 """
-from typing import List, Optional
+import time
+from typing import List, Optional, Tuple
+
+# A "Timestamp" column stores epoch SECONDS (~1.7e9 today). Values above
+# 1e11 can only be epoch MILLISECONDS written by a legacy buggy import
+# (that is the mixed-epoch data the dashboard has to special-case). Such
+# rows poison every cursor derived from MIN()/MAX(): catch-up asks the
+# exchange for candles of the year 57000 (gets nothing -> "+0 forever")
+# and history-prefill computes an absurd `since`, then latches as if the
+# exchange had nothing older. Normalizing on READ repairs the cursors,
+# and the next save (`DELETE WHERE "Timestamp" >= min_new_ts`) physically
+# replaces the ms-rows with proper seconds rows.
+MS_EPOCH_THRESHOLD_SEC = 100_000_000_000
+
+
+def normalize_epoch_sec(ts: Optional[int]) -> Optional[int]:
+    """None -> None; epoch-ms -> epoch-sec; epoch-sec -> unchanged."""
+    if ts is None:
+        return None
+    t = int(ts)
+    if t > MS_EPOCH_THRESHOLD_SEC:
+        return t // 1000
+    return t
+
+
+def should_attempt_prefill(
+    done_record: Optional[Tuple[int, float]],
+    min_ts_sec: int,
+    now_sec: Optional[float] = None,
+    retry_after_sec: float = 4 * 3600,
+) -> bool:
+    """
+    Resumable/cooldown gate for the backward history prefill.
+
+    `done_record` is what the engine latched at the end of the previous
+    attempt: (table_min_ts_seen_at_latch, unix_time_of_attempt) or None.
+    Attempt again when:
+      * never attempted (`done_record` is None);
+      * the table start IMPROVED since the latch (progress happened — keep
+        walking left immediately, do not wait out the cooldown);
+      * the last attempt is older than `retry_after_sec` (transient fetch
+        failures must not suppress the pair for the whole process run).
+    A fresh latch on the SAME min_ts means "terminal state confirmed
+    recently" (floor reached / exchange has nothing older / fetch keeps
+    failing) — skip so we don't hammer the exchange every cycle.
+    """
+    if not done_record:
+        return True
+    latched_min, attempt_ts = done_record
+    if int(latched_min) != int(min_ts_sec):
+        return True
+    now = time.time() if now_sec is None else float(now_sec)
+    return (now - float(attempt_ts)) >= float(retry_after_sec)
 
 
 def prefill_needed(min_ts_sec: Optional[int], target_floor_sec: int, slack_sec: int = 1800) -> bool:

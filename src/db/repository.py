@@ -11,6 +11,7 @@ import pandas as pd
 from pytz import timezone as pytz_timezone
 
 from config.settings import settings
+from src.core.history_prefill import normalize_epoch_sec
 
 logger = logging.getLogger("repository")
 MSK_TZ = pytz_timezone("Europe/Moscow")
@@ -95,8 +96,18 @@ class HistoricalMarketRepository:
                     row = await conn.fetchrow(
                         f'SELECT MAX("Timestamp") as mx, MIN("Timestamp") as mn FROM "{table_name}"'
                     )
-                    mx = int(row["mx"]) if row and row["mx"] else 0
-                    mn = int(row["mn"]) if row and row["mn"] else 0
+                    raw_mx = int(row["mx"]) if row and row["mx"] else 0
+                    raw_mn = int(row["mn"]) if row and row["mn"] else 0
+                    mx = normalize_epoch_sec(raw_mx) or 0
+                    mn = normalize_epoch_sec(raw_mn) or 0
+                    if (raw_mx and raw_mx != mx) or (raw_mn and raw_mn != mn):
+                        # Legacy epoch-ms rows poison both catch-up ("+0
+                        # forever") and history-prefill (absurd `since`).
+                        logger.warning(
+                            f"[EPOCH-FIX] '{table_name}' in '{db}' stores Timestamp in "
+                            f"epoch-ms (MIN={raw_mn}, MAX={raw_mx}) — cursors normalized "
+                            f"to seconds; the next save will rewrite the table in seconds."
+                        )
                     return db, mx, mn
         return None, 0, 0
 
