@@ -512,7 +512,13 @@ def _live_infra() -> dict:
             chart then mistook for 'start of history'. The predicate accepts
             BOTH units: seconds rows directly, ms rows via to_sec*1000; the
             ms->s conversion + garbage filtering happens in
-            rows_to_compact_candles afterwards."""
+            rows_to_compact_candles afterwards.
+
+            Errors are REPORTED, not swallowed: an exception yields
+            {"c": None, "err": ...} (the chart shows a red badge instead of
+            'start of history') and is printed to the dashboard console.
+            An empty-but-valid chunk includes the table's true MIN/MAX dates
+            so the badge can say when the table actually starts."""
             try:
                 pool = await get_pool(db_name)
                 async with pool.acquire() as conn:
@@ -524,11 +530,46 @@ def _live_infra() -> dict:
                         f' ORDER BY "Timestamp" DESC LIMIT $2',
                         int(to_ts), int(limit),
                     )
-            except Exception:
-                return None
-            # rows arrive DESC; rows_to_compact_candles re-sorts ascending and
-            # applies the same garbage-timestamp policy as the chart pipeline.
-            return {"c": rows_to_compact_candles([dict(r) for r in rows])}
+            except Exception as e:
+                print(
+                    f"[candles] ERROR {db_name}.{table_name} to={to_ts}: "
+                    f"{type(e).__name__}: {e}",
+                    flush=True,
+                )
+                return {"c": None, "err": f"{type(e).__name__}: {e}"}
+
+            out = rows_to_compact_candles([dict(r) for r in rows])
+            print(
+                f"[candles] {db_name}.{table_name} to={to_ts} limit={limit}"
+                f" -> {len(out)} rows",
+                flush=True,
+            )
+            resp = {"c": out}
+            if not out:
+                # 'no rows' is ambiguous: tell the badge when the table really
+                # starts/ends, so 'no older data' is verifiable at a glance.
+                try:
+                    async with pool.acquire() as conn:
+                        mm = await conn.fetchrow(
+                            f'SELECT MIN("Timestamp") AS mn, MAX("Timestamp") AS mx'
+                            f' FROM "{table_name}"'
+                        )
+
+                    def _iso(v):
+                        try:
+                            v = int(v)
+                        except (TypeError, ValueError):
+                            return None
+                        if v > 1e11:  # ms epoch table
+                            v //= 1000
+                        return time.strftime("%Y-%m-%d", time.gmtime(v))
+
+                    if mm:
+                        resp["mn"] = _iso(mm["mn"])
+                        resp["mx"] = _iso(mm["mx"])
+                except Exception:
+                    pass
+            return resp
 
         def submit_upsert(db, ex, sym, payload, timeout=5.0):
             try:
@@ -634,7 +675,10 @@ def _live_infra() -> dict:
                         self._send({"c": []})
                         return
                     data = infra["submit_candles"](db, table, to_ts, limit)
-                    self._send(data or {"c": []}, allow_gzip=True)
+                    self._send(
+                        data if data is not None else {"c": None, "err": "endpoint loop timeout"},
+                        allow_gzip=True,
+                    )
                     return
                 if u.path != "/tick":
                     self._send({}, status=404)
@@ -663,6 +707,7 @@ def _live_infra() -> dict:
                 continue
             srv.daemon_threads = True
             infra["tick_port"] = port
+            print(f"[live-api] serving /tick /candles /healthz on 0.0.0.0:{port}", flush=True)
             port_ready.set()
             srv.serve_forever()
             return

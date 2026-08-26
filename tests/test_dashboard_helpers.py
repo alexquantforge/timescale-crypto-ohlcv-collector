@@ -642,6 +642,8 @@ def test_build_history_loader_js_content():
     assert "/healthz" in js
     assert "http://localhost:" in js and "http://127.0.0.1:" in js
     assert "hist-status" in js  # drives the visible status badge
+    assert "j.err" in js        # server-side errors surface on the badge
+    assert "j.mn" in js         # 'table starts at <date>' on valid empty pages
 
 
 def test_chart_html_injects_history_loader():

@@ -511,6 +511,13 @@ _HISTORY_LOADER_TEMPLATE = """
       showStatus('… загружаю старую историю');
       const r = await fetch(SVC + BASE + '&to=' + first + '&limit=' + CHUNK, { cache: 'no-store' });
       const j = await r.json();
+      if (j && j.err) {
+        // Server-side error (SQL/pool) — reported, never mistaken for the
+        // start of history; details are in the dashboard console.
+        console.warn('[hist] /candles server error:', j.err);
+        showStatus('⚠ история: ошибка БД — смотри консоль дашборда', '#ef5350');
+        return;
+      }
       if (!j || !Array.isArray(j.c)) {
         // Unexpected response shape — an OLD dashboard process (started
         // before git pull) is still serving this port without /candles.
@@ -522,7 +529,9 @@ _HISTORY_LOADER_TEMPLATE = """
       const rows = j.c;
       if (rows.length === 0) {
         exhausted = true;
-        showStatus('⇤ начало истории — раньше данных нет');
+        showStatus(j.mn
+          ? ('⇤ таблица начинается ' + j.mn + ' — раньше данных в ней нет')
+          : '⇤ начало истории — раньше данных нет');
         return;
       }
       const olderC = [];
@@ -535,7 +544,9 @@ _HISTORY_LOADER_TEMPLATE = """
       }
       if (olderC.length === 0) {
         exhausted = true;
-        showStatus('⇤ начало истории — раньше данных нет');
+        showStatus(j.mn
+          ? ('⇤ таблица начинается ' + j.mn + ' — раньше данных в ней нет')
+          : '⇤ начало истории — раньше данных нет');
         return;
       }
       allCandles = olderC.concat(allCandles);
