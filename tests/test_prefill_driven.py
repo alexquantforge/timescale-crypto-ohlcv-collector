@@ -61,25 +61,41 @@ class FakeExchange:
     `fail_on_prefill` makes only DEEP-history page requests raise (like a
     flaky exchange on far-past `since`), while fresh catch-up requests stay
     fine — this is the exact split that made prefill failures invisible.
+
+    `empty_before_ms` models a symbol listed at that time on an exchange
+    that answers pre-listing `since` with an EMPTY array instead of
+    clamping (mexc/bingx quirk). `error_before_ms` models a hard lookback
+    window (bingx 380d code 100204).
     """
 
-    def __init__(self, step_ms, now_ms=None, fail_on_prefill=False, prefill_limit=1000):
+    def __init__(self, step_ms, now_ms=None, fail_on_prefill=False, prefill_limit=1000,
+                 empty_before_ms=None, error_before_ms=None):
         self.step_ms = step_ms
         self.now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
         self.fail_on_prefill = fail_on_prefill
         self.prefill_limit = prefill_limit
+        self.empty_before_ms = empty_before_ms
+        self.error_before_ms = error_before_ms
         self.calls = []  # (since_ms, limit)
 
     async def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None):
         limit = int(limit or 500)
         since_ms = int(since if since is not None else self.now_ms - limit * self.step_ms)
         self.calls.append((since_ms, limit))
+        if self.error_before_ms is not None and since_ms < self.error_before_ms:
+            raise RuntimeError(
+                'bingx {"code":100204,"msg":"The maximum query range for X_USDT '
+                'K-lines is 380 days and 0 hours."}'
+            )
         if (
             self.fail_on_prefill
             and limit >= self.prefill_limit
             and since_ms < self.now_ms - 2 * 86400 * 1000
         ):
             raise RuntimeError("simulated exchange failure on deep-history page")
+        if self.empty_before_ms is not None and since_ms < self.empty_before_ms:
+            await asyncio.sleep(0)
+            return []  # pre-listing since -> empty (NOT clamped)
         last_closed = self.now_ms - self.step_ms
         if since_ms > last_closed:
             await asyncio.sleep(0)
@@ -319,6 +335,87 @@ def test_15m_truncated_table_is_filled_toward_180d_floor(monkeypatch, caplog):
     assert min_ts <= table_start - ten_pages_cover + 2 * M15
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "📜" in text and "history repair" in text
+
+
+def test_prefill_empty_action():
+    from src.core.history_prefill import prefill_empty_action
+    oldest = 1_700_000_000
+    step = 900
+    # batch clamped to the listing: starts right at the table start -> done
+    touching = [[oldest * 1000, 1, 1, 1, 1, 1]]
+    assert prefill_empty_action(touching, oldest, step, 1000)[0] == "terminal"
+    # empty page with a big window -> probe smaller, not "terminal"
+    assert prefill_empty_action([], oldest, step, 1000) == ("shrink", 500)
+    assert prefill_empty_action([], oldest, step, 2) == ("shrink", 1)
+    # empty page even at a 1-candle window -> genuinely nothing older
+    action, reason = prefill_empty_action([], oldest, step, 1)
+    assert action == "terminal" and "probed" in reason
+    # batch disconnected from the table start (exchange ignored `since`)
+    far = [[(oldest + 100 * step) * 1000, 1, 1, 1, 1, 1]]
+    assert prefill_empty_action(far, oldest, step, 1000)[0] == "shrink"
+    action, reason = prefill_empty_action(far, oldest, step, 1)
+    assert action == "terminal" and "1-candle probe" in reason
+
+
+def test_15m_empty_before_listing_still_fills_via_probing(monkeypatch, caplog):
+    """Regression for the user's log pattern "⛔ exchange returned nothing" on
+    truncated tables: exchanges answering pre-listing `since` with [] must NOT
+    stop the repair — the window-probing walks down to the true listing."""
+    from src.core import updater_15m as u15
+
+    listing_ms = (NOW - 6 * DAY) * 1000     # real history starts 6 days ago
+    table_start = NOW - 3 * DAY             # ...but the table only from 3d ago
+    conn = _FakeConn()
+    monkeypatch.setattr(u15, "db_pools", {"db_high": _FakePool(conn), "db_low": _FakePool(_FakeConn())})
+
+    async def fake_find_table(t):
+        return "db_high", NOW - M15, table_start
+
+    async def fake_gaps(*a, **k):
+        return 0, 0, 0
+
+    monkeypatch.setattr(u15, "find_table_in_dbs", fake_find_table)
+    monkeypatch.setattr(u15, "check_and_fill_table_gaps", fake_gaps)
+    monkeypatch.setattr(u15, "COLLECT_ORDERBOOK", False)
+    u15._PREFILL_DONE.pop(("mexc", "XYZ/USDT:USDT"), None)
+
+    exchange = FakeExchange(M15 * 1000, empty_before_ms=listing_ms)
+    with caplog.at_level(logging.INFO, logger="updater_15m"):
+        res = _run(u15.process_pair(exchange, "XYZ/USDT:USDT", "mexc"))
+
+    min_ts = min(int(r[0]) for r in conn.saved) if conn.saved else table_start
+    # The OLD code stopped on the first empty page (window 1000 bars reached
+    # back past the listing) and saved NOTHING. The probing code must make
+    # real progress toward the listing despite the empty pages.
+    assert min_ts <= table_start - DAY, f"no backward progress: min={min_ts}"
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "📜" in text  # progress was made and logged
+
+
+def test_1d_bingx_380d_window_is_clamped_not_errored(monkeypatch, caplog):
+    """BingX rejects kline ranges older than ~380 days (code 100204). The 1D
+    engine must clamp the cursor to the window instead of erroring on every
+    page — and declare the table complete at the window."""
+    from src.core import updater
+    _settings_1d(monkeypatch)
+
+    table_start = NOW - 5 * DAY
+    repo = FakeRepo1D(last_ts=NOW - DAY, first_ts=table_start)
+    engine = updater.MarketDataEngine(timeframe="1d")
+    engine.repository = repo
+    window_ms = (NOW - 379 * DAY) * 1000
+    exchange = FakeExchange(DAY * 1000, error_before_ms=window_ms)
+
+    with caplog.at_level(logging.INFO, logger="engine"):
+        _run(engine.process_pair(exchange, "CREO/USDT", "bingx"))
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "100204" not in text  # never even asked beyond the window
+    saved = pd.concat([df for _, df in repo.upserts])
+    oldest_saved = int(saved["Timestamp"].min())
+    assert oldest_saved <= NOW - 374 * DAY  # essentially at the window floor
+    assert "✅" in text and "window" in text
+    assert "📜" in text
 
 
 def test_15m_prefill_failure_is_loud_and_cooldown_latched(monkeypatch, caplog):

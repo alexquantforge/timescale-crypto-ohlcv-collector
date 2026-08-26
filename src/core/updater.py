@@ -19,6 +19,7 @@ from src.utils.timeouts import hard_wait_for
 from src.db.connection import get_db_pools, close_all_db_pools
 from src.core.history_prefill import (
     extract_older_rows,
+    prefill_empty_action,
     prefill_needed,
     prefill_page_since_ms,
     should_attempt_prefill,
@@ -34,6 +35,24 @@ from src.exchanges.symbol_selector import (
 )
 
 logger = logging.getLogger("engine")
+
+# Known per-exchange kline lookback windows (1D engine, days). BingX
+# hard-rejects any kline range older than ~380 days
+# (code 100204: "The maximum query range for XXX K-lines is 380 days") —
+# without the clamp, its initial import from backfill_start_date dies on the
+# very first page and the table is created EMPTY ("+0 candles" forever),
+# and history-prefill burns requests on guaranteed errors.
+EXCHANGE_MAX_LOOKBACK_DAYS_1D: Dict[str, int] = {
+    "bingx": 379,
+}
+
+
+def _lookback_floor_ms_1d(ccxt_id: str) -> Optional[int]:
+    """Epoch-ms floor imposed by the exchange's kline lookback window, if any."""
+    days = EXCHANGE_MAX_LOOKBACK_DAYS_1D.get(ccxt_id)
+    if not days:
+        return None
+    return (int(time.time()) - int(days) * 86400) * 1000
 
 
 def _candles_df_from_rows(cs, symbol: str, ccxt_id: str) -> pd.DataFrame:
@@ -347,6 +366,18 @@ class MarketDataEngine:
                 if settings.data_retention_days and self.timeframe == "15m":
                     retention_ms = int(time.time() - (settings.data_retention_days * 86400)) * 1000
                     backfill_ms = max(backfill_ms, retention_ms)
+                # Exchange kline lookback window (BingX: 380d): an initial
+                # import starting BEFORE the window dies with 100204 on page
+                # one and the table is created empty — clamp the cursor.
+                _exw_ms = _lookback_floor_ms_1d(ccxt_id)
+                if _exw_ms is not None and backfill_ms < _exw_ms:
+                    logger.warning(
+                        f"  [{self.timeframe.upper()}] ⚠️ {symbol} @{ccxt_id}: exchange kline "
+                        f"window is ~{EXCHANGE_MAX_LOOKBACK_DAYS_1D[ccxt_id]}d — initial history "
+                        f"starts at {pd.to_datetime(_exw_ms, unit='ms')} instead of "
+                        f"{settings.backfill_start_date}"
+                    )
+                    backfill_ms = _exw_ms
 
                 cursor_ms = backfill_ms
                 seen_ts: Set[int] = set()
@@ -433,14 +464,19 @@ class MarketDataEngine:
                     prefilled = 0
                     terminal_at = None   # (reason, oldest_at_latch)
                     failed = False
+                    span = bf_limit  # window in candles; shrinks geometrically
+                    # when the exchange answers an out-of-range `since` with an
+                    # EMPTY page instead of clamping to the listing (see
+                    # prefill_empty_action) — one empty big page proves nothing.
+                    ex_floor_ms = _lookback_floor_ms_1d(ccxt_id)
                     for _ in range(settings.history_prefill_max_pages):
                         since_ms = prefill_page_since_ms(
-                            oldest, step_sec, bf_limit,
-                            exchange_floor_ms=None,
+                            oldest, step_sec, span,
+                            exchange_floor_ms=ex_floor_ms,
                             target_floor_sec=floor_sec,
                         )
                         if since_ms is None:
-                            terminal_at = ("floor reached — history complete", oldest)
+                            terminal_at = ("floor / exchange window reached — history complete", oldest)
                             break
                         try:
                             batch = await hard_wait_for(
@@ -461,12 +497,13 @@ class MarketDataEngine:
                             )
                             failed = True
                             break
-                        if not batch:
-                            terminal_at = ("exchange returned nothing", oldest)
-                            break
-                        older = extract_older_rows(batch, oldest, floor_sec)
+                        older = extract_older_rows(batch, oldest, floor_sec) if batch else []
                         if not older:
-                            terminal_at = ("exchange has nothing older", oldest)
+                            action, payload = prefill_empty_action(batch, oldest, step_sec, span)
+                            if action == "shrink":
+                                span = payload
+                                continue
+                            terminal_at = (payload, oldest)
                             break
                         try:
                             await self.repository.upsert_candles(
@@ -484,9 +521,13 @@ class MarketDataEngine:
                             break
                         prefilled += len(older)
                         oldest = int(older[0][0]) // 1000
+                        # AIMD: grow the window back gradually (an exchange
+                        # that empties on out-of-range `since` would otherwise
+                        # cost log2 probes before EVERY successful page).
+                        span = min(span * 2, bf_limit)
                         await asyncio.sleep(0.05)
                         if oldest <= floor_sec:
-                            terminal_at = ("floor reached — history complete", oldest)
+                            terminal_at = ("floor / exchange window reached — history complete", oldest)
                             break
                     if failed:
                         # Cooldown-latch on the (unchanged) table start so we

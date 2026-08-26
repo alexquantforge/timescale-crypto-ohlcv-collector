@@ -45,6 +45,48 @@ def normalize_epoch_sec(ts: Optional[int]) -> Optional[int]:
     return t
 
 
+def prefill_empty_action(
+    batch,
+    oldest_ts_sec: int,
+    step_sec: int,
+    span: int,
+) -> Tuple[str, object]:
+    """
+    Decide what to do when a prefill page yielded ZERO usable older rows.
+
+    Exchanges disagree on out-of-range `since`:
+      * most CLAMP pre-listing `since` to the listing date (the batch then
+        starts right at/after the table start -> nothing older exists);
+      * some return an EMPTY array whenever `since` is before their first
+        candle (bingx/mexc style). One empty big-window page then proves
+        NOTHING about candles between the listing and the table start —
+        the window must be PROBED smaller and smaller before declaring the
+        history exhausted;
+      * some ignore a too-old `since` and return the LATEST candles (batch
+        disconnected from the table start).
+
+    Returns:
+      ("terminal", reason:str) — history exhausted, latch the pair;
+      ("shrink", new_span:int) — retry the same table start with a
+      geometrically smaller window (span candles), bounded by max_pages.
+    """
+    if batch:
+        try:
+            batch_min_ms = min(int(c[0]) for c in batch)
+        except (TypeError, ValueError, IndexError):
+            batch_min_ms = None
+        older_ms = (int(oldest_ts_sec) + 2 * int(step_sec)) * 1000
+        if batch_min_ms is not None and batch_min_ms <= older_ms:
+            # The batch visibly runs right up to the table start — the
+            # exchange's data starts there (clamped pre-listing response).
+            return "terminal", "exchange has nothing older"
+    if int(span) > 1:
+        return "shrink", max(1, int(span) // 2)
+    if batch:
+        return "terminal", "exchange has nothing older (verified by a 1-candle probe)"
+    return "terminal", "exchange returned nothing (window probed down to 1 candle)"
+
+
 def should_attempt_prefill(
     done_record: Optional[Tuple[int, float]],
     min_ts_sec: int,

@@ -21,6 +21,7 @@ import ccxt.async_support as ccxt_async
 from src.core.history_prefill import (
     extract_older_rows,
     normalize_epoch_sec,
+    prefill_empty_action,
     prefill_needed,
     prefill_page_since_ms,
     should_attempt_prefill,
@@ -970,9 +971,13 @@ async def process_pair(exchange, symbol, ccxt_id):
                 prefilled = 0
                 terminal_at = None   # (reason, oldest_at_latch)
                 failed = False
+                span = FETCH_LIMIT  # window in candles; shrinks geometrically
+                # when the exchange answers an out-of-range `since` with an
+                # EMPTY page instead of clamping to the listing (mexc/bingx
+                # style) — one empty big page proves nothing.
                 for _ in range(PREFILL_MAX_PAGES):
                     since_ms = prefill_page_since_ms(
-                        oldest, 900, FETCH_LIMIT,
+                        oldest, 900, span,
                         exchange_floor_ms=floor_ms_ex,
                         target_floor_sec=target_floor_ts,
                     )
@@ -985,12 +990,13 @@ async def process_pair(exchange, symbol, ccxt_id):
                     if cs is None:                      # fetch error (already logged)
                         failed = True
                         break
-                    if not cs:
-                        terminal_at = ("exchange returned nothing", oldest)
-                        break
-                    older = extract_older_rows(cs, oldest, target_floor_ts)
+                    older = extract_older_rows(cs, oldest, target_floor_ts) if cs else []
                     if not older:
-                        terminal_at = ("exchange has nothing older", oldest)
+                        action, payload = prefill_empty_action(cs, oldest, 900, span)
+                        if action == "shrink":
+                            span = payload
+                            continue
+                        terminal_at = (payload, oldest)
                         break
                     for c in older:
                         if int(c[0]) not in seen_ts:
@@ -998,6 +1004,10 @@ async def process_pair(exchange, symbol, ccxt_id):
                             all_candles.append(c)
                     prefilled += len(older)
                     oldest = int(older[0][0]) // 1000
+                    # AIMD: grow the window back gradually (an exchange that
+                    # empties on out-of-range `since` would otherwise cost
+                    # log2 probes before EVERY successful page).
+                    span = min(span * 2, FETCH_LIMIT)
                     await asyncio.sleep(0.05)
                     if oldest <= target_floor_ts:
                         terminal_at = ("floor / exchange window reached — history complete", oldest)
