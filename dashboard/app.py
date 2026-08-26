@@ -504,13 +504,23 @@ def _live_infra() -> dict:
 
         async def select_candles(db_name, table_name, to_ts, limit):
             """Older-history chunk for the chart's infinite left-scroll:
-            `limit` rows strictly older than `to_ts`, ascending."""
+            `limit` rows strictly older than `to_ts` (SECONDS), ascending.
+
+            Some tables store epochs in MILLISECONDS — a plain
+            `WHERE "Timestamp" < to_sec` would return ZERO rows for them
+            (every ms value is larger than any seconds cursor), which the
+            chart then mistook for 'start of history'. The predicate accepts
+            BOTH units: seconds rows directly, ms rows via to_sec*1000; the
+            ms->s conversion + garbage filtering happens in
+            rows_to_compact_candles afterwards."""
             try:
                 pool = await get_pool(db_name)
                 async with pool.acquire() as conn:
                     rows = await conn.fetch(
                         f'SELECT "Timestamp" AS ts, open, high, low, close, volume'
-                        f' FROM "{table_name}" WHERE "Timestamp" < $1'
+                        f' FROM "{table_name}"'
+                        f' WHERE "Timestamp" < $1'
+                        f'    OR ("Timestamp" >= 100000000000 AND "Timestamp" < $1 * 1000)'
                         f' ORDER BY "Timestamp" DESC LIMIT $2',
                         int(to_ts), int(limit),
                     )

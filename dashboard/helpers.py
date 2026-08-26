@@ -481,7 +481,14 @@ _HISTORY_LOADER_TEMPLATE = """
       const first = allCandles[0].time;
       const r = await fetch(SVC + BASE + '&to=' + first + '&limit=' + CHUNK, { cache: 'no-store' });
       const j = await r.json();
-      const rows = (j && j.c) || [];
+      if (!j || !Array.isArray(j.c)) {
+        // Unexpected response shape (e.g. an OLD dashboard process still
+        // serving this port without the /candles route) — NOT the start of
+        // history: do not set `exhausted`, the next left-pan retries.
+        console.warn('[hist] unexpected /candles response', j);
+        return;
+      }
+      const rows = j.c;
       if (rows.length === 0) { exhausted = true; return; }
       const olderC = [];
       const olderV = [];
@@ -501,6 +508,7 @@ _HISTORY_LOADER_TEMPLATE = """
       if (rows.length < CHUNK * 0.95) { exhausted = true; }   // short page = start of history
     } catch (e) {
       // transient endpoint failure — the next left-pan retries automatically
+      console.warn('[hist] /candles fetch failed:', e);
     } finally { inflight = false; }
   }
   chart.timeScale().subscribeVisibleLogicalRangeChange(function(range){
