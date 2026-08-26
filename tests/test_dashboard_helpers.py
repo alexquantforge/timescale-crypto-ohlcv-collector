@@ -600,6 +600,26 @@ def test_rows_to_compact_candles_sanitizes_and_sorts():
     assert rows_to_compact_candles(None, now_sec=now) == []
 
 
+def test_rows_to_compact_candles_drops_nonfinite_values():
+    """A single NaN/Inf must never reach json.dumps — the bare `NaN` literal
+    is invalid JSON and would break response.json() in the chart's loader."""
+    from dashboard.helpers import rows_to_compact_candles
+
+    now = 1_786_100_000
+    rows = [
+        {"ts": now - 900, "open": 2, "high": 3, "low": 1, "close": 2.5, "volume": float("nan")},
+        {"ts": now - 800, "open": float("nan"), "high": 3, "low": 1, "close": 2.5, "volume": 5},
+        {"ts": now - 700, "open": 2, "high": 3, "low": 1, "close": float("inf"), "volume": 5},
+    ]
+    out = rows_to_compact_candles(rows, now_sec=now)
+    assert len(out) == 1                      # both NaN-open and Inf-close rows skipped
+    assert out[0][0] == now - 900
+    assert out[0][5] == 0.0                   # NaN volume -> 0
+    import json as _json
+    s = _json.dumps({"c": out})
+    assert "NaN" not in s and "Infinity" not in s
+
+
 def test_build_history_loader_js_requires_endpoint_bits():
     from dashboard.helpers import build_history_loader_js
 
@@ -625,3 +645,10 @@ def test_chart_html_injects_history_loader():
     assert "HISTORY_STUB();" in html
     off = _build_chart_html()
     assert "HISTORY_STUB" not in off
+
+
+def test_chart_html_has_history_status_badge():
+    """The loader's visible status badge (proves to the user which code the
+    page runs and shows why history did not load)."""
+    html = _build_chart_html()
+    assert 'id="hist-status"' in html

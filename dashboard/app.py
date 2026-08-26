@@ -609,6 +609,11 @@ def _live_infra() -> dict:
         def do_GET(self):
             try:
                 u = _urlparse(self.path)
+                if u.path == "/healthz":
+                    # Liveness/probe: which routes this process actually serves.
+                    # curl http://localhost:8511/healthz -> {"ok": true, "routes": [...]}
+                    self._send({"ok": True, "routes": ["/tick", "/candles"], "ts": int(time.time())})
+                    return
                 if u.path == "/candles":
                     # Older-history chunks for the chart's infinite left-scroll.
                     q = _parse_qs(u.query)

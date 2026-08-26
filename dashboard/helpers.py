@@ -426,12 +426,26 @@ def rows_to_compact_candles(rows, min_ts: int = 1356998400, now_sec: int = None)
     [[ts, o, h, l, c, v], ...] arrays, applying the SAME garbage-timestamp
     policy as sanitize_candle_frame (per-row ms->s when the epoch looks like
     milliseconds, then sane min/max bounds). Returns [] for empty input.
+
+    All numbers are guaranteed FINITE: a single NaN/Inf in a row would make
+    json.dumps emit a bare `NaN` literal, which is invalid JSON — the
+    browser's response.json() then throws and the chart's history loader
+    silently retries forever. Rows with non-finite OHLC are skipped; a
+    non-finite volume becomes 0.
     """
     if not rows:
         return []
     now = _time.time() if now_sec is None else now_sec
     out = []
     hi = now + 2 * 86400
+
+    def _f(x):
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            return None
+        return v if v == v and abs(v) != float("inf") else None
+
     for r in rows:
         try:
             ts = int(r["ts"])
@@ -441,13 +455,15 @@ def rows_to_compact_candles(rows, min_ts: int = 1356998400, now_sec: int = None)
             ts //= 1000
         if ts < min_ts or ts > hi:
             continue
-        v = r.get("volume")
-        out.append([
-            ts,
-            _sig10(r["open"]), _sig10(r["high"]),
-            _sig10(r["low"]), _sig10(r["close"]),
-            round(float(v), 2) if v is not None else 0.0,
-        ])
+        o = _f(r.get("open"))
+        h_ = _f(r.get("high"))
+        l_ = _f(r.get("low"))
+        c = _f(r.get("close"))
+        if o is None or h_ is None or l_ is None or c is None:
+            continue
+        v = _f(r.get("volume"))
+        out.append([ts, _sig10(o), _sig10(h_), _sig10(l_), _sig10(c),
+                    round(v, 2) if v is not None else 0.0])
     out.sort(key=lambda a: a[0])
     return out
 
@@ -468,7 +484,14 @@ _HISTORY_LOADER_TEMPLATE = """
     } catch (e) { return null; }
   }
   const SVC = svc();
+  const statusEl = document.getElementById('hist-status');
+  function showStatus(txt, color){
+    if (!statusEl) { return; }
+    statusEl.textContent = txt;
+    statusEl.style.color = color || '#808495';
+  }
   if (!SVC) { return; }
+  showStatus('⇤ скролл влево — подгружу старую историю');
   let inflight = false;
   let exhausted = false;
   // Infinite history: when the user pans the chart to the left edge of the
@@ -479,17 +502,23 @@ _HISTORY_LOADER_TEMPLATE = """
     inflight = true;
     try {
       const first = allCandles[0].time;
+      showStatus('… загружаю старую историю');
       const r = await fetch(SVC + BASE + '&to=' + first + '&limit=' + CHUNK, { cache: 'no-store' });
       const j = await r.json();
       if (!j || !Array.isArray(j.c)) {
-        // Unexpected response shape (e.g. an OLD dashboard process still
-        // serving this port without the /candles route) — NOT the start of
-        // history: do not set `exhausted`, the next left-pan retries.
+        // Unexpected response shape — an OLD dashboard process (started
+        // before git pull) is still serving this port without /candles.
+        // NOT the start of history: do not set `exhausted`.
         console.warn('[hist] unexpected /candles response', j);
+        showStatus('⚠ история: на порту старый процесс — перезапусти дашборд', '#ef5350');
         return;
       }
       const rows = j.c;
-      if (rows.length === 0) { exhausted = true; return; }
+      if (rows.length === 0) {
+        exhausted = true;
+        showStatus('⇤ начало истории — раньше данных нет');
+        return;
+      }
       const olderC = [];
       const olderV = [];
       for (let i = 0; i < rows.length; i++) {
@@ -498,17 +527,24 @@ _HISTORY_LOADER_TEMPLATE = """
         olderC.push({ time: a[0], open: a[1], high: a[2], low: a[3], close: a[4] });
         olderV.push({ time: a[0], value: a[5] || 0, color: (a[4] >= a[1] ? UP_VOL_COLOR : DN_VOL_COLOR) });
       }
-      if (olderC.length === 0) { exhausted = true; return; }
+      if (olderC.length === 0) {
+        exhausted = true;
+        showStatus('⇤ начало истории — раньше данных нет');
+        return;
+      }
       allCandles = olderC.concat(allCandles);
       mainSeries.setData(allCandles);
       if (typeof volumeSeries !== 'undefined' && allVolume) {
         allVolume = olderV.concat(allVolume);
         volumeSeries.setData(allVolume);
       }
+      const dt = new Date(allCandles[0].time * 1000).toISOString().slice(0, 10);
+      showStatus('⇤ +' + olderC.length + ' баров, теперь с ' + dt, '#66bb6a');
       if (rows.length < CHUNK * 0.95) { exhausted = true; }   // short page = start of history
     } catch (e) {
       // transient endpoint failure — the next left-pan retries automatically
       console.warn('[hist] /candles fetch failed:', e);
+      showStatus('⚠ история: /candles недоступен (retry при скролле)', '#ef5350');
     } finally { inflight = false; }
   }
   chart.timeScale().subscribeVisibleLogicalRangeChange(function(range){
@@ -609,10 +645,11 @@ def build_lightweight_chart_html(
         <style>
             body {{ margin: 0; padding: 0; background-color: #131722; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; }}
             #tv-chart {{ width: 100%; height: {chart_height}px; position: relative; }}
+            #hist-status {{ position: absolute; left: 8px; bottom: 8px; font-size: 11px; color: #808495; pointer-events: none; z-index: 30; opacity: 0.85; }}
         </style>
     </head>
     <body>
-        <div id="tv-chart"></div>
+        <div id="tv-chart"><div id="hist-status"></div></div>
         <script>
             const UP_VOL_COLOR = 'rgba(38, 166, 154, 0.5)';
             const DN_VOL_COLOR = 'rgba(239, 83, 80, 0.5)';
