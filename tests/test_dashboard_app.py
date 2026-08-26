@@ -191,3 +191,59 @@ def test_summary_row_for_table_reports_broken_table():
     row = asyncio.run(_summary_row_for_table(_Pool(), "broken_tbl", asyncio.Semaphore(1), errors))
     assert row is None
     assert errors and errors[0][0] == "broken_tbl"
+
+
+# ---------------------------------------------------------------------------
+# /candles endpoint parameter guard — the perp-history regression.
+# Table names are symbol.replace('/', '_')_on_<exchange>.lower(), so perp
+# symbols carry ':' (PIXEL/USDT:USDT -> pixel_usdt:usdt_on_bybit). The old
+# charset [A-Za-z0-9_] rejected every perp table, the endpoint answered
+# {"c": []} and the chart's history loader read that as 'start of history':
+# perp charts (both 15m and 1D, every exchange) silently stopped paging older
+# chunks while spot scrolled infinitely.
+# ---------------------------------------------------------------------------
+
+
+def test_candles_guard_accepts_perp_and_spot_tables(monkeypatch):
+    from dashboard import app as dapp
+
+    monkeypatch.setattr(dapp, "_KNOWN_DBS", {"db1"}, raising=False)
+    ts = 1756108800
+    assert dapp._candles_query_ok("db1", "pixel_usdt:usdt_on_bybit", ts)
+    assert dapp._candles_query_ok("db1", "btc_usdt_on_bybit", ts)
+    assert dapp._candles_query_ok("db1", "1000sats_usdt:usdt_on_okx", ts)
+
+
+def test_candles_guard_still_rejects_injection(monkeypatch):
+    from dashboard import app as dapp
+
+    monkeypatch.setattr(dapp, "_KNOWN_DBS", {"db1"}, raising=False)
+    ts = 1756108800
+    # '"' must stay banned — the name is interpolated as a quoted identifier
+    assert not dapp._candles_query_ok("db1", 'x"evil', ts)
+    assert not dapp._candles_query_ok("db1", 'btc_usdt_on_bybit" OR 1=1 --', ts)
+    assert not dapp._candles_query_ok("db1", "tbl; DROP TABLE x", ts)
+    # structural checks
+    assert not dapp._candles_query_ok("db1", "no_exchange_suffix", ts)  # no _on_
+    assert not dapp._candles_query_ok("unknown_db", "btc_usdt_on_bybit", ts)
+    assert not dapp._candles_query_ok("db1", "btc_usdt_on_bybit", 0)
+    assert not dapp._candles_query_ok("db1", "", ts)
+    assert not dapp._candles_query_ok("db1", "a" * 97 + "_on_bybit", ts)  # too long
+
+
+def test_history_loader_url_roundtrips_colon_table():
+    """build_history_loader_js must produce a /candles URL whose table param
+    decodes back to the exact perp table name (with ':')."""
+    import json
+    import re
+    from urllib.parse import parse_qs, urlparse
+
+    from dashboard.helpers import build_history_loader_js
+
+    js = build_history_loader_js("db1", "pixel_usdt:usdt_on_bybit", 900, 8511, chunk=1200)
+    m = re.search(r'const BASE = (".*?");', js)
+    assert m, "history loader JS lost its BASE url"
+    url = json.loads(m.group(1))
+    qs = parse_qs(urlparse(url).query)
+    assert qs["table"] == ["pixel_usdt:usdt_on_bybit"]
+    assert qs["db"] == ["db1"]

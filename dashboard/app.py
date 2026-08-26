@@ -15,6 +15,7 @@ Layout: the Charts tab is first — 15m chart on top, 1D chart below, with
 ⏪ Prev / Next ⏩ buttons flanking each chart for instant pair cycling.
 """
 import os
+import re
 import sys
 import json
 import time
@@ -450,6 +451,28 @@ _KNOWN_DBS = {
     getattr(settings, "db_low_15m", ""),
 } - {""}
 
+# Guards for the tiny live JSON endpoints (/tick, /candles). Table names are
+# built as `symbol.replace('/', '_')_on_{exchange}.lower()`, so PERP symbols
+# legitimately carry a ':' (PIXEL/USDT:USDT -> pixel_usdt:usdt_on_bybit).
+# The previous charset [A-Za-z0-9_] REJECTED every perp table, /candles
+# answered {"c": []}, and the chart's history loader read that as "start of
+# history" — perp charts silently stopped paging older chunks (stuck at the
+# initial window) while spot scrolled infinitely. ':' is safe here: the name
+# is only interpolated as a double-quoted identifier, and '"' stays banned.
+_LIVE_EX_RE = re.compile(r"[A-Za-z0-9_\-]{1,32}")
+_LIVE_SYM_RE = re.compile(r"[A-Za-z0-9/:\._\-]{1,64}")
+_LIVE_TBL_RE = re.compile(r"[A-Za-z0-9_:]{1,96}")
+
+
+def _candles_query_ok(db: str, table: str, to_ts: int) -> bool:
+    """Parameter guard for /candles (kept module-level for unit tests)."""
+    return bool(
+        db in _KNOWN_DBS
+        and _LIVE_TBL_RE.fullmatch(table or "")
+        and "_on_" in (table or "")
+        and to_ts > 0
+    )
+
 
 def _set_live_target(pairs: list) -> None:
     """Replaces the writer's working set (current pair ± 5 neighbours)."""
@@ -647,11 +670,6 @@ def _live_infra() -> dict:
     # --- tiny JSON endpoint for the in-chart pollers (/tick?db&ex&sym) -------
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs
-    import re as _re
-
-    _EX_RE = _re.compile(r"[A-Za-z0-9_\-]{1,32}")
-    _SYM_RE = _re.compile(r"[A-Za-z0-9/:\._\-]{1,64}")
-    _TBL_RE = _re.compile(r"[A-Za-z0-9_]{1,96}")
 
     class _TickHandler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -706,13 +724,18 @@ def _live_infra() -> dict:
                     except (TypeError, ValueError):
                         to_ts, limit = 0, 1200
                     limit = max(1, min(3000, limit))
-                    if (
-                        db not in _KNOWN_DBS
-                        or not _TBL_RE.fullmatch(table or "")
-                        or "_on_" not in table
-                        or to_ts <= 0
-                    ):
-                        self._send({"c": []})
+                    if not _candles_query_ok(db, table, to_ts):
+                        # NEVER answer a guard rejection with {"c": []}: the
+                        # chart reads an empty chunk as 'start of history' and
+                        # stops paging — that is exactly how perp charts (':'
+                        # in table names) got stuck at their initial window.
+                        # Be loud instead: red badge in the chart + a line in
+                        # the dashboard console.
+                        print(
+                            f"[candles] REJECTED db={db!r} table={table!r} to={to_ts}",
+                            flush=True,
+                        )
+                        self._send({"c": None, "err": f"rejected /candles params (table={table!r})"})
                         return
                     data = infra["submit_candles"](db, table, to_ts, limit)
                     self._send(
@@ -729,8 +752,8 @@ def _live_infra() -> dict:
                 sym = (q.get("sym") or [""])[0]
                 if (
                     db not in _KNOWN_DBS
-                    or not _EX_RE.fullmatch(ex or "")
-                    or not _SYM_RE.fullmatch(sym or "")
+                    or not _LIVE_EX_RE.fullmatch(ex or "")
+                    or not _LIVE_SYM_RE.fullmatch(sym or "")
                 ):
                     self._send({})
                     return
