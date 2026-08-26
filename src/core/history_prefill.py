@@ -45,6 +45,25 @@ def normalize_epoch_sec(ts: Optional[int]) -> Optional[int]:
     return t
 
 
+def is_transient_fetch_error(e: Exception) -> bool:
+    """
+    True for RATE-LIMIT / transient network failures (ccxt.NetworkError
+    family: RateLimitExceeded, DDoSProtection, ExchangeNotAvailable,
+    RequestTimeout... plus local timeouts): the exchange asked us to slow
+    down, not "no data" — the caller must NOT cooldown-latch the pair for
+    hours, it should simply retry on the next engine cycle. Hard failures
+    (BadRequest, "symbol is not found", BadSymbol) return False.
+    Lazily imports ccxt so this module keeps zero import-time deps.
+    """
+    import asyncio
+
+    import ccxt
+
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    return isinstance(e, ccxt.NetworkError)
+
+
 def prefill_empty_action(
     batch,
     oldest_ts_sec: int,

@@ -20,6 +20,7 @@ import ccxt.async_support as ccxt_async
 
 from src.core.history_prefill import (
     extract_older_rows,
+    is_transient_fetch_error,
     normalize_epoch_sec,
     prefill_empty_action,
     prefill_needed,
@@ -883,26 +884,33 @@ async def process_pair(exchange, symbol, ccxt_id):
                 added += 1
             return added, newest
 
-        async def _fetch_page(since_ms, phase: str, timeout: float = 6.0):
-            """One OHLCV page; None on failure (error already logged + dead-marked)."""
+        async def _fetch_page(since_ms, phase: str, timeout: float = 12.0):
+            """One OHLCV page -> (rows, transient). rows=None on failure
+            (already logged + dead-marked); transient=True means rate-limit /
+            network flakiness — retry next cycle, never a cooldown latch.
+            12s default: MEXC under repair load answers plain downloads
+            slower than 6s and whole pairs used to lose their cycle."""
             try:
                 return await asyncio.wait_for(
                     exchange.fetch_ohlcv(symbol, "15m", since=since_ms, limit=FETCH_LIMIT),
                     timeout=timeout,
-                )
+                ), False
             except Exception as e:
                 _mark_dead_symbol_if_gone(e, ccxt_id, symbol)
-                hint = (
-                    f" — history-prefill retries after {settings.history_prefill_retry_sec // 3600}h "
-                    f"or on restart"
-                    if phase == "history-prefill"
-                    else ""
-                )
+                transient = is_transient_fetch_error(e)
+                if phase == "history-prefill":
+                    hint = (
+                        " — transient (rate limit/network), retries NEXT cycle"
+                        if transient
+                        else f" — history-prefill retries after {settings.history_prefill_retry_sec // 3600}h or on restart"
+                    )
+                else:
+                    hint = ""
                 log(
                     f"  [15M] ⚠️ {symbol} @{ccxt_id}: {phase} fetch_ohlcv failed "
                     f"({type(e).__name__}: {e}); since={pd.to_datetime(int(since_ms), unit='ms')}{hint}"
                 )
-                return None
+                return None, transient
 
         async def _paged_forward_fill(start_ms: int, max_pages: int) -> None:
             """
@@ -915,7 +923,7 @@ async def process_pair(exchange, symbol, ccxt_id):
             """
             cursor_ms = start_ms
             for _ in range(max_pages):
-                cs = await _fetch_page(cursor_ms, "download")
+                cs, _transient = await _fetch_page(cursor_ms, "download")
                 if not cs:
                     break
                 added, newest = _append_new(cs)
@@ -971,6 +979,7 @@ async def process_pair(exchange, symbol, ccxt_id):
                 prefilled = 0
                 terminal_at = None   # (reason, oldest_at_latch)
                 failed = False
+                retry_next_cycle = False  # transient fetch error — leave unlatched
                 span = FETCH_LIMIT  # window in candles; shrinks geometrically
                 # when the exchange answers an out-of-range `since` with an
                 # EMPTY page instead of clamping to the listing (mexc/bingx
@@ -984,11 +993,14 @@ async def process_pair(exchange, symbol, ccxt_id):
                     if since_ms is None:
                         terminal_at = ("floor / exchange window reached — history complete", oldest)
                         break
-                    # 12s here (not 6s): deep-history pages are the slowest
-                    # calls and must not die silently on transient lag.
-                    cs = await _fetch_page(since_ms, "history-prefill", timeout=12.0)
+                    cs, transient = await _fetch_page(since_ms, "history-prefill")
                     if cs is None:                      # fetch error (already logged)
-                        failed = True
+                        if transient:
+                            # Rate limit / network flake: do NOT cooldown-latch
+                            # for hours — the next cycle retries right away.
+                            retry_next_cycle = True
+                        else:
+                            failed = True
                         break
                     older = extract_older_rows(cs, oldest, target_floor_ts) if cs else []
                     if not older:
@@ -1014,6 +1026,15 @@ async def process_pair(exchange, symbol, ccxt_id):
                         break
                 if failed:
                     _PREFILL_DONE[key] = (int(min_ts), time.time())  # retry after cooldown
+                elif retry_next_cycle:
+                    # UNLATCHED on purpose: rate limits clear in minutes, and
+                    # the next cycle continues the repair from the same (or
+                    # improved) table start. Any prefilled rows were saved.
+                    log(
+                        f"  [15M] ⏳ {symbol} @{ccxt_id}: history repair paused "
+                        f"by rate limit/network — continues next cycle"
+                        + (f" (+{prefilled} older candles so far)" if prefilled else "")
+                    )
                 elif terminal_at is not None:
                     reason, latch_min = terminal_at
                     _PREFILL_DONE[key] = (int(latch_min), time.time())

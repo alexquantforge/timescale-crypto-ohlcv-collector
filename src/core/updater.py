@@ -19,6 +19,7 @@ from src.utils.timeouts import hard_wait_for
 from src.db.connection import get_db_pools, close_all_db_pools
 from src.core.history_prefill import (
     extract_older_rows,
+    is_transient_fetch_error,
     prefill_empty_action,
     prefill_needed,
     prefill_page_since_ms,
@@ -464,6 +465,7 @@ class MarketDataEngine:
                     prefilled = 0
                     terminal_at = None   # (reason, oldest_at_latch)
                     failed = False
+                    retry_next_cycle = False  # transient fetch error — leave unlatched
                     span = bf_limit  # window in candles; shrinks geometrically
                     # when the exchange answers an out-of-range `since` with an
                     # EMPTY page instead of clamping to the listing (see
@@ -488,14 +490,22 @@ class MarketDataEngine:
                             # NEVER silent: a failed page used to latch the pair
                             # for the whole process run with zero log output —
                             # that is how "везде +1 свеча, история не качается".
+                            transient = is_transient_fetch_error(e)
                             logger.warning(
                                 f"  [{self.timeframe.upper()}] ⚠️ {symbol} @{ccxt_id}: "
                                 f"history-prefill page fetch failed "
                                 f"({type(e).__name__}: {e}); since="
-                                f"{pd.to_datetime(since_ms, unit='ms')} — will retry "
-                                f"after {settings.history_prefill_retry_sec // 3600}h or on restart"
+                                f"{pd.to_datetime(since_ms, unit='ms')} — "
+                                + (
+                                    "transient (rate limit/network), retrying NEXT cycle"
+                                    if transient
+                                    else f"will retry after {settings.history_prefill_retry_sec // 3600}h or on restart"
+                                )
                             )
-                            failed = True
+                            if transient:
+                                retry_next_cycle = True
+                            else:
+                                failed = True
                             break
                         older = extract_older_rows(batch, oldest, floor_sec) if batch else []
                         if not older:
@@ -533,6 +543,14 @@ class MarketDataEngine:
                         # Cooldown-latch on the (unchanged) table start so we
                         # don't hammer the exchange every cycle, but DO retry.
                         self._prefill_done[tbl_name] = (int(first_ts), time.time())
+                    elif retry_next_cycle:
+                        # UNLATCHED on purpose: rate limits clear in minutes —
+                        # the next cycle continues the repair at once.
+                        logger.info(
+                            f"  [{self.timeframe.upper()}] ⏳ {symbol} @{ccxt_id}: history repair "
+                            f"paused by rate limit/network — continues next cycle"
+                            + (f" (+{prefilled} older candles so far)" if prefilled else "")
+                        )
                     elif terminal_at is not None:
                         reason, latch_min = terminal_at
                         self._prefill_done[tbl_name] = (int(latch_min), time.time())

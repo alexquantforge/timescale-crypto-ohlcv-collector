@@ -69,13 +69,14 @@ class FakeExchange:
     """
 
     def __init__(self, step_ms, now_ms=None, fail_on_prefill=False, prefill_limit=1000,
-                 empty_before_ms=None, error_before_ms=None):
+                 empty_before_ms=None, error_before_ms=None, fail_exc_cls=None):
         self.step_ms = step_ms
         self.now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
         self.fail_on_prefill = fail_on_prefill
         self.prefill_limit = prefill_limit
         self.empty_before_ms = empty_before_ms
         self.error_before_ms = error_before_ms
+        self.fail_exc_cls = fail_exc_cls or RuntimeError
         self.calls = []  # (since_ms, limit)
 
     async def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None):
@@ -92,7 +93,7 @@ class FakeExchange:
             and limit >= self.prefill_limit
             and since_ms < self.now_ms - 2 * 86400 * 1000
         ):
-            raise RuntimeError("simulated exchange failure on deep-history page")
+            raise self.fail_exc_cls("simulated exchange failure on deep-history page")
         if self.empty_before_ms is not None and since_ms < self.empty_before_ms:
             await asyncio.sleep(0)
             return []  # pre-listing since -> empty (NOT clamped)
@@ -453,3 +454,68 @@ def test_15m_prefill_failure_is_loud_and_cooldown_latched(monkeypatch, caplog):
         _run(u15.process_pair(exchange, "BTC/USDT:USDT", "bybit"))
     deep_calls = [c for c in exchange.calls if c[0] < (NOW - 2 * DAY) * 1000]
     assert deep_calls == []
+
+
+def test_15m_prefill_rate_limit_retries_next_cycle_not_4h(monkeypatch, caplog):
+    """OKX-style 50011 flood: rate limits must retry on the NEXT cycle —
+    a 4h cooldown latch would stall the repair for hours while the limit
+    itself clears in minutes."""
+    import ccxt
+    from src.core import updater_15m as u15
+
+    table_start = NOW - 5 * DAY
+    conn = _FakeConn()
+    monkeypatch.setattr(u15, "db_pools", {"db_high": _FakePool(conn), "db_low": _FakePool(_FakeConn())})
+
+    async def fake_find_table(t):
+        return "db_high", NOW - M15, table_start
+
+    async def fake_gaps(*a, **k):
+        return 0, 0, 0
+
+    monkeypatch.setattr(u15, "find_table_in_dbs", fake_find_table)
+    monkeypatch.setattr(u15, "check_and_fill_table_gaps", fake_gaps)
+    monkeypatch.setattr(u15, "COLLECT_ORDERBOOK", False)
+    key = ("okx", "ARX/USDT:USDT")
+    u15._PREFILL_DONE.pop(key, None)
+
+    exchange = FakeExchange(M15 * 1000, fail_on_prefill=True, fail_exc_cls=ccxt.RateLimitExceeded)
+    with caplog.at_level(logging.INFO, logger="updater_15m"):
+        res = _run(u15.process_pair(exchange, "ARX/USDT:USDT", "okx"))
+
+    assert res[0] >= 1  # fresh candle still lands
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "transient" in text and "NEXT cycle" in text
+    assert key not in u15._PREFILL_DONE  # NO cooldown latch for rate limits
+
+    # Immediate retry next "cycle": the deep page is requested again at once.
+    exchange.calls.clear()
+    with caplog.at_level(logging.INFO, logger="updater_15m"):
+        _run(u15.process_pair(exchange, "ARX/USDT:USDT", "okx"))
+    deep_calls = [c for c in exchange.calls if c[0] < (NOW - 2 * DAY) * 1000]
+    assert deep_calls, "rate-limited pair must retry on the next cycle"
+
+
+def test_1d_prefill_rate_limit_retries_next_cycle_not_4h(monkeypatch, caplog):
+    import ccxt
+    from src.core import updater
+    _settings_1d(monkeypatch)
+
+    table_start = NOW - 5 * DAY
+    repo = FakeRepo1D(last_ts=NOW - DAY, first_ts=table_start)
+    engine = updater.MarketDataEngine(timeframe="1d")
+    engine.repository = repo
+    exchange = FakeExchange(DAY * 1000, fail_on_prefill=True, fail_exc_cls=ccxt.RateLimitExceeded)
+
+    with caplog.at_level(logging.INFO, logger="engine"):
+        _run(engine.process_pair(exchange, "CREO/USDT", "okx"))
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "transient" in text and "NEXT cycle" in text
+    tbl = "creo_usdt_on_okx"
+    assert tbl not in engine._prefill_done
+
+    exchange.calls.clear()
+    with caplog.at_level(logging.INFO, logger="engine"):
+        _run(engine.process_pair(exchange, "CREO/USDT", "okx"))
+    assert any(c[1] >= 1000 for c in exchange.calls)
