@@ -17,6 +17,11 @@ from src.analytics.orderbook import fetch_orderbook_snapshot
 from src.core.progress import GlobalProgress
 from src.utils.timeouts import hard_wait_for
 from src.db.connection import get_db_pools, close_all_db_pools
+from src.core.history_prefill import (
+    extract_older_rows,
+    prefill_needed,
+    prefill_page_since_ms,
+)
 from src.db.migrations import ensure_databases_exist
 from src.db.repository import HistoricalMarketRepository
 from src.exchanges.client import create_exchange, close_exchange_safely
@@ -28,6 +33,29 @@ from src.exchanges.symbol_selector import (
 )
 
 logger = logging.getLogger("engine")
+
+
+def _candles_df_from_rows(cs, symbol: str, ccxt_id: str) -> pd.DataFrame:
+    """Raw ccxt OHLCV rows -> fully-decorated candle frame (shared by the
+    forward save path and the backward history-prefill repair)."""
+    df = pd.DataFrame(cs, columns=["ts", "open", "high", "low", "close", "volume"])
+    df["Timestamp"] = df["ts"] // 1000
+    df["ticker"] = symbol
+    df["exchange"] = ccxt_id
+    df["volume_x_low"] = df["volume"] * df["low"]
+    df["volume_x_close"] = df["volume"] * df["close"]
+
+    is_swap = ":" in symbol
+    df["asset_type"] = "swap" if is_swap else "spot"
+    spot_url = get_exchange_url(ccxt_id, symbol)
+    swap_url = get_swap_url(ccxt_id, symbol)
+    df["url_of_trading_pair"] = swap_url if is_swap else spot_url
+    df["url_of_swap_contract_if_it_exists"] = None if is_swap else swap_url
+
+    dt_utc = pd.to_datetime(df["Timestamp"], unit="s", utc=True)
+    df["open_time_msk"] = dt_utc.dt.tz_convert(MSK_TZ).dt.strftime("%Y-%m-%d %H:%M:%S")
+    df["open_time_almaty"] = dt_utc.dt.tz_convert(ALMATY_TZ).dt.strftime("%Y-%m-%d %H:%M:%S")
+    return df
 MSK_TZ = pytz_timezone("Europe/Moscow")
 ALMATY_TZ = pytz_timezone("Asia/Almaty")
 
@@ -155,6 +183,7 @@ class MarketDataEngine:
         self._gap_since: Dict[str, float] = {}     # tbl -> ts of last gap check
         self._gap_budget_until = 0.0               # gap filling deadline for the current cycle
         self._gap_budget_logged = False
+        self._prefill_done: Dict[str, int] = {}    # tbl -> first_ts at the failed history-prefill attempt
 
     def _should_attempt_backfill(self, tbl_name: str) -> bool:
         """Empty symbols (0 candles: tokenized stocks, delisted) are retried
@@ -333,9 +362,16 @@ class MarketDataEngine:
                     for c in new_rows:
                         seen_ts.add(int(c[0]))
                     cs.extend(new_rows)
-                    if len(batch) < bf_limit:
+                    # Progress-based pagination: the next page is keyed off the
+                    # newest timestamp actually received, never off
+                    # `len(page) == limit` — exchanges whose kline page cap is
+                    # smaller than bf_limit silently broke that signal and
+                    # truncated perp initial imports to the latest few days.
+                    newest_ms = max(int(c[0]) for c in new_rows)
+                    live_edge_ms = (int(time.time()) - (900 if self.timeframe == "15m" else 86400)) * 1000
+                    if newest_ms >= live_edge_ms:
                         break
-                    cursor_ms = int(new_rows[-1][0]) + (900000 if self.timeframe == "15m" else 86400000)
+                    cursor_ms = newest_ms + (900000 if self.timeframe == "15m" else 86400000)
             else:
                 # Paged catch-up from the last stored candle up to now:
                 # fully synchronises lagging tables in one cycle (a single
@@ -353,29 +389,7 @@ class MarketDataEngine:
 
             # --- Save Candles ---
             if cs:
-                df = pd.DataFrame(
-                    cs, columns=["ts", "open", "high", "low", "close", "volume"]
-                )
-                df["Timestamp"] = df["ts"] // 1000
-                df["ticker"] = symbol
-                df["exchange"] = ccxt_id
-                df["volume_x_low"] = df["volume"] * df["low"]
-                df["volume_x_close"] = df["volume"] * df["close"]
-
-                is_swap = ":" in symbol
-                df["asset_type"] = "swap" if is_swap else "spot"
-                spot_url = get_exchange_url(ccxt_id, symbol)
-                swap_url = get_swap_url(ccxt_id, symbol)
-                df["url_of_trading_pair"] = swap_url if is_swap else spot_url
-                df["url_of_swap_contract_if_it_exists"] = None if is_swap else swap_url
-
-                dt_utc = pd.to_datetime(df["Timestamp"], unit="s", utc=True)
-                df["open_time_msk"] = dt_utc.dt.tz_convert(MSK_TZ).dt.strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-                df["open_time_almaty"] = dt_utc.dt.tz_convert(ALMATY_TZ).dt.strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
+                df = _candles_df_from_rows(cs, symbol, ccxt_id)
 
                 if not current_db:
                     current_db = self.repository.low_db
@@ -384,6 +398,65 @@ class MarketDataEngine:
                 await self.repository.upsert_candles(
                     current_db, tbl_name, df, timeframe=self.timeframe
                 )
+
+            # --- Backward history prefill (repair of truncated table starts) ---
+            # Perp tables created by a non-paginating initial import start only
+            # a few days back while the exchange has full history. Page OLDER
+            # candles in, resumably: every cycle walks the table start left
+            # until backfill_start_date (1D keeps the FULL available history).
+            if current_db and first_ts:
+                floor_sec = int(
+                    datetime.datetime.strptime(settings.backfill_start_date, "%Y-%m-%d")
+                    .replace(tzinfo=datetime.timezone.utc)
+                    .timestamp()
+                )
+                step_sec = 900 if self.timeframe == "15m" else 86400
+                if (
+                    prefill_needed(first_ts, floor_sec, slack_sec=step_sec * 2)
+                    and self._prefill_done.get(tbl_name) != first_ts
+                ):
+                    oldest = int(first_ts)
+                    prefilled = 0
+                    for _ in range(settings.history_prefill_max_pages):
+                        since_ms = prefill_page_since_ms(
+                            oldest, step_sec, bf_limit,
+                            exchange_floor_ms=None,
+                            target_floor_sec=floor_sec,
+                        )
+                        if since_ms is None:
+                            break  # floor reached — table complete
+                        try:
+                            batch = await hard_wait_for(
+                                exchange.fetch_ohlcv(symbol, self.timeframe, since=since_ms, limit=bf_limit),
+                                6.0,
+                                label=f"{symbol}@{ccxt_id} history-prefill",
+                            )
+                        except Exception:
+                            self._prefill_done[tbl_name] = oldest
+                            break
+                        if not batch:
+                            self._prefill_done[tbl_name] = oldest
+                            break
+                        older = extract_older_rows(batch, oldest, floor_sec)
+                        if not older:
+                            self._prefill_done[tbl_name] = oldest  # exchange has nothing older
+                            break
+                        await self.repository.upsert_candles(
+                            current_db, tbl_name,
+                            _candles_df_from_rows(older, symbol, ccxt_id),
+                            timeframe=self.timeframe,
+                        )
+                        prefilled += len(older)
+                        oldest = int(older[0][0]) // 1000
+                        await asyncio.sleep(0.05)
+                        if oldest <= floor_sec:
+                            break
+                    if prefilled:
+                        logger.info(
+                            f"  [{self.timeframe.upper()}] 📜 {symbol} @{ccxt_id}: history repair "
+                            f"+{prefilled} older candles (table now from "
+                            f"{pd.to_datetime(oldest, unit='s')}, floor {settings.backfill_start_date})"
+                        )
 
             # --- Check Gap Filling ---
             if settings.check_and_fill_gaps and current_db and self._should_gap_check(tbl_name):

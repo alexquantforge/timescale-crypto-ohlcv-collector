@@ -123,6 +123,11 @@ class Settings(BaseSettings):
     backfill_start_date: str = Field(default="2018-01-01", alias="BACKFILL_START_DATE")
     backfill_max_iterations: int = Field(default=400, alias="BACKFILL_MAX_ITERATIONS")
     backfill_request_limit: int = Field(default=1000, alias="BACKFILL_REQUEST_LIMIT")
+    # Backward history prefill (repair of truncated table starts — e.g. perp
+    # tables whose initial import never paginated): pages of older candles
+    # fetched per pair per cycle; resumable across cycles until
+    # backfill_start_date / the retention floor is reached.
+    history_prefill_max_pages: int = Field(default=10, alias="HISTORY_PREFILL_MAX_PAGES")
 
     backfill_request_limit_per_exchange: Dict[str, int] = {
         "bybit": 1000,

@@ -18,6 +18,11 @@ import numpy as np
 import ccxt  # FIX: ccxt.BadSymbol / ccxt.ExchangeError are referenced in exception handlers
 import ccxt.async_support as ccxt_async
 
+from src.core.history_prefill import (
+    extract_older_rows,
+    prefill_needed,
+    prefill_page_since_ms,
+)
 from src.exchanges.symbol_selector import get_exchange_url, get_swap_url
 from pytz import timezone as pytz_timezone
 
@@ -110,6 +115,13 @@ def ohlcv_since_floor_ms(exchange_name: str):
 # skipped for the rest of the process run (a restart re-tries them once).
 _DEAD_SYMBOLS: set = set()  # {(ccxt_name, symbol)}
 
+# Backward history prefill (repair of truncated table starts): pages fetched
+# per pair per cycle, and pairs for which the exchange could not deliver
+# anything older than the current table start (empty/lose-progress attempt) —
+# skipped until their table start actually improves.
+PREFILL_MAX_PAGES = 10
+_PREFILL_DONE: dict = {}  # {(ccxt_id, symbol): min_ts_sec at the failed attempt}
+
 
 def _is_symbol_not_found_error(e: Exception) -> bool:
     """Delisted/unknown market — permanent until the next engine restart."""
@@ -193,13 +205,6 @@ OB_DEPTH_MIN_GOOD: float = 50000.0
 
 db_pools: Dict[str, asyncpg.Pool] = {}
 
-PER_PAGE_LIMIT: Dict[str, int] = {
-    "bitget": 200,
-    "coinex": 1000,
-    "htx": 2000,
-}
-DEFAULT_PER_PAGE = 1000
-
 
 def should_skip_pair(symbol: str, exchange: str = "") -> bool:
     if not symbol:
@@ -249,7 +254,9 @@ async def init_db_pools():
     log("✓ DB pools initialized for 15M")
 
 
-async def find_table_in_dbs(table_name: str) -> Tuple[Optional[str], int]:
+async def find_table_in_dbs(table_name: str) -> Tuple[Optional[str], int, int]:
+    """Returns (db_name, max_ts, min_ts); max_ts=1 / min_ts=0 marks an existing
+    but EMPTY table (legacy convention, keeps process_pair on the initial path)."""
     for db in [DB_HIGH, DB_LOW]:
         if db not in db_pools:
             continue
@@ -259,11 +266,17 @@ async def find_table_in_dbs(table_name: str) -> Tuple[Optional[str], int]:
                 table_name,
             )
             if exists:
-                last_ts = await conn.fetchval(
-                    f'SELECT MAX("Timestamp") FROM "{table_name}"'
+                row = await conn.fetchrow(
+                    f'SELECT MAX("Timestamp") AS mx, MIN("Timestamp") AS mn FROM "{table_name}"'
                 )
-                return db, int(last_ts) if last_ts else 1  # 1 indicates table exists even if empty
-    return None, 0
+                last_ts = row["mx"] if row else None
+                min_ts = row["mn"] if row else None
+                return (
+                    db,
+                    int(last_ts) if last_ts else 1,  # 1 indicates table exists even if empty
+                    int(min_ts) if min_ts else 0,
+                )
+    return None, 0, 0
 
 
 async def move_table(table_name, from_db, to_db):
@@ -826,119 +839,138 @@ async def create_empty_symbol_table(db_name: str, tbl_name: str) -> None:
 
 async def process_pair(exchange, symbol, ccxt_id):
     tbl = f"{symbol.replace('/', '_').replace('-', '_')}_on_{ccxt_id}".lower()
-    current_db, last_ts = await find_table_in_dbs(tbl)
+    current_db, last_ts, min_ts = await find_table_in_dbs(tbl)
 
     download_min_ts = get_download_min_timestamp()
+    floor_ms_ex = ohlcv_since_floor_ms(ccxt_id)
+    target_floor_ts = max(
+        download_min_ts,
+        floor_ms_ex // 1000 if floor_ms_ex is not None else 0,
+    )
 
     try:
         all_candles: List[list] = []
+        seen_ts: Set[int] = set()
+        live_edge_ms = (int(time.time()) - 900) * 1000  # forming bar excluded
 
-        if last_ts > 0:
-            if last_ts * 1000 < download_min_ts * 1000:
-                last_ts = download_min_ts
-
-            per_page = PER_PAGE_LIMIT.get(ccxt_id, DEFAULT_PER_PAGE)
-            cursor_ms = clamp_ohlcv_since_ms(ccxt_id, last_ts * 1000)
-            pages = 0
-            while pages < 20:
+        def _append_new(cs) -> Tuple[int, int]:
+            """Dedupe-merge a fetched page; returns (added_count, newest_ts_ms)."""
+            added = 0
+            newest = 0
+            for c in cs:
                 try:
-                    cs = await asyncio.wait_for(
-                        exchange.fetch_ohlcv(
-                            symbol, "15m", since=cursor_ms, limit=FETCH_LIMIT
-                        ),
-                        timeout=6.0,
-                    )
-                except Exception as e:
-                    _mark_dead_symbol_if_gone(e, ccxt_id, symbol)
-                    log(
-                        f"  [15M] ⚠️ {symbol} @{ccxt_id}: catch-up fetch_ohlcv failed "
-                        f"({type(e).__name__}: {e}) — table stays behind"
-                    )
-                    break
+                    t = int(c[0])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                newest = max(newest, t)
+                if t in seen_ts:
+                    continue
+                seen_ts.add(t)
+                all_candles.append(c)
+                added += 1
+            return added, newest
+
+        async def _fetch_page(since_ms, phase: str):
+            """One OHLCV page; None on failure (error already logged + dead-marked)."""
+            try:
+                return await asyncio.wait_for(
+                    exchange.fetch_ohlcv(symbol, "15m", since=since_ms, limit=FETCH_LIMIT),
+                    timeout=6.0,
+                )
+            except Exception as e:
+                _mark_dead_symbol_if_gone(e, ccxt_id, symbol)
+                log(
+                    f"  [15M] ⚠️ {symbol} @{ccxt_id}: {phase} fetch_ohlcv failed "
+                    f"({type(e).__name__}: {e})"
+                )
+                return None
+
+        async def _paged_forward_fill(start_ms: int, max_pages: int) -> None:
+            """
+            Progress-based FORWARD pagination (start -> now). The NEXT page is
+            keyed off the newest timestamp actually received, and the loop stops
+            when a page adds nothing new or reaches the live edge — never off
+            `len(page) == limit`, which silently broke on exchanges whose kline
+            page cap is smaller than FETCH_LIMIT (that is how perp tables ended
+            up with only the latest few days).
+            """
+            cursor_ms = start_ms
+            for _ in range(max_pages):
+                cs = await _fetch_page(cursor_ms, "download")
                 if not cs:
                     break
-                all_candles.extend(cs)
-                if len(cs) < per_page:
+                added, newest = _append_new(cs)
+                if added == 0 or newest >= live_edge_ms:
                     break
-                cursor_ms = cs[-1][0] + 900 * 1000
-                pages += 1
+                cursor_ms = newest + 900 * 1000
                 await asyncio.sleep(0.05)
-            if not all_candles:
-                return 0, 0, 0, 0
+
+        if last_ts > 0:
+            # Catch-up: from the last stored candle forward to now.
+            if last_ts < download_min_ts:
+                last_ts = download_min_ts
+            cursor_ms = clamp_ohlcv_since_ms(ccxt_id, last_ts * 1000)
+            await _paged_forward_fill(cursor_ms, max_pages=40)
         else:
-            # Auto-discover new symbol and download initial history
+            # New symbol: full initial history FORWARD from the retention floor
+            # (same unified path as catch-up — spot and perp behave identically).
             log(f"  [15M] 🚀 New symbol detected: {symbol} ({ccxt_id}) -> Downloading initial history...")
-            per_page = PER_PAGE_LIMIT.get(ccxt_id, DEFAULT_PER_PAGE)
-            start_since = clamp_ohlcv_since_ms(ccxt_id, download_min_ts * 1000)
+            start_since = clamp_ohlcv_since_ms(ccxt_id, target_floor_ts * 1000)
             if start_since > download_min_ts * 1000:
                 log(
                     f"  [15M] ℹ️ {symbol} @{ccxt_id}: exchange kline window — "
                     f"initial history limited to the latest "
                     f"{EXCHANGE_MAX_LOOKBACK_CANDLES_15M.get(ccxt_id)} candles"
                 )
-
-            try:
-                cs = await asyncio.wait_for(
-                    exchange.fetch_ohlcv(
-                        symbol, "15m", since=start_since, limit=FETCH_LIMIT
-                    ),
-                    timeout=6.0,
-                )
-            except Exception as e:
-                _mark_dead_symbol_if_gone(e, ccxt_id, symbol)
+            await _paged_forward_fill(start_since, max_pages=40)
+            if all_candles:
                 log(
-                    f"  [15M] ⚠️ {symbol} @{ccxt_id}: initial fetch_ohlcv failed "
-                    f"({type(e).__name__}: {e})"
+                    f"  [15M] 📥 {symbol} @{ccxt_id}: initial history downloaded "
+                    f"{len(all_candles)} candles (from "
+                    f"{pd.to_datetime(min(seen_ts) // 1000, unit='s')})"
                 )
-                cs = []
 
-            if cs:
-                all_candles.extend(cs)
-                seen_ts = {c[0] for c in cs}
-                oldest_ts = cs[0][0]
-
-                page = 1
-                while page < MAX_PAGES:
-                    since_ms = oldest_ts - per_page * 900 * 1000
-                    if since_ms < start_since:
-                        since_ms = start_since
-
-                    try:
-                        prev_cs = await asyncio.wait_for(
-                            exchange.fetch_ohlcv(
-                                symbol, "15m", since=since_ms, limit=FETCH_LIMIT
-                            ),
-                            timeout=6.0,
-                        )
-                    except Exception as e:
-                        _mark_dead_symbol_if_gone(e, ccxt_id, symbol)
-                        log(
-                            f"  [15M] ⚠️ {symbol} @{ccxt_id}: backfill fetch_ohlcv failed "
-                            f"({type(e).__name__}: {e})"
-                        )
+        # --- Backward history prefill (repair of truncated table starts) ----
+        # A table whose first candle sits notably LATER than the 180d floor is
+        # missing its old history (e.g. perp initial imports that never
+        # paginated). Resumable: each cycle pages further left until the floor.
+        if current_db and prefill_needed(min_ts, target_floor_ts, GAP_TOLERANCE_SEC):
+            key = (ccxt_id, symbol)
+            if _PREFILL_DONE.get(key) != min_ts:  # retry only when start improved
+                oldest = min_ts
+                prefilled = 0
+                for _ in range(PREFILL_MAX_PAGES):
+                    since_ms = prefill_page_since_ms(
+                        oldest, 900, FETCH_LIMIT,
+                        exchange_floor_ms=floor_ms_ex,
+                        target_floor_sec=target_floor_ts,
+                    )
+                    if since_ms is None:
+                        break  # floor / exchange window reached — fully repaired
+                    cs = await _fetch_page(since_ms, "history-prefill")
+                    if not cs:
+                        _PREFILL_DONE[key] = oldest
                         break
-
-                    if not prev_cs:
+                    older = extract_older_rows(cs, oldest, target_floor_ts)
+                    if not older:
+                        _PREFILL_DONE[key] = oldest  # exchange has nothing older
                         break
-
-                    new_prev_cs = [c for c in prev_cs if c[0] not in seen_ts]
-                    if not new_prev_cs:
-                        break
-
-                    all_candles.extend(new_prev_cs)
-                    for c in new_prev_cs:
-                        seen_ts.add(c[0])
-
-                    new_prev_cs.sort(key=lambda x: x[0])
-                    oldest_ts = new_prev_cs[0][0]
-
-                    if since_ms <= start_since:
-                        break
-
-                    page += 1
+                    for c in older:
+                        if int(c[0]) not in seen_ts:
+                            seen_ts.add(int(c[0]))
+                            all_candles.append(c)
+                    prefilled += len(older)
+                    oldest = int(older[0][0]) // 1000
                     await asyncio.sleep(0.05)
-
-                all_candles.sort(key=lambda x: x[0])
+                    if oldest <= target_floor_ts:
+                        break
+                if prefilled:
+                    log(
+                        f"  [15M] 📜 {symbol} @{ccxt_id}: history repair "
+                        f"+{prefilled} older candles (table now from "
+                        f"{pd.to_datetime(oldest, unit='s')}, floor "
+                        f"{pd.to_datetime(target_floor_ts, unit='s')})"
+                    )
 
         if not all_candles:
             # Create empty table for 0-candle symbol so find_table_in_dbs finds it next time
