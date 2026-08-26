@@ -118,6 +118,7 @@ def ohlcv_since_floor_ms(exchange_name: str):
 # on every 5-minute cycle is pure noise and pure rate-limit burn: they are
 # skipped for the rest of the process run (a restart re-tries them once).
 _DEAD_SYMBOLS: set = set()  # {(ccxt_name, symbol)}
+_OB_WARNED: set = set()  # {(ccxt_name, symbol)} — orderbook warning printed once per process
 
 # Backward history prefill (repair of truncated table starts): pages fetched
 # per pair per cycle, and pairs for which the exchange could not deliver
@@ -1190,7 +1191,19 @@ async def process_pair(exchange, symbol, ccxt_id):
                     snap = await fetch_orderbook_snapshot(exchange, symbol, g_atr)
                     await save_orderbook_snapshot(current_db, tbl, full_df, snap)
             except Exception as e_ob:
-                if DEBUG_ORDERBOOK:
+                # Once per pair per process (was: only behind DEBUG_ORDERBOOK —
+                # invisible). A table missing ob_* columns also vanished from
+                # the dashboard scan until SELECT * replaced the fixed column
+                # list, so this warning is the engine-side trace of that bug.
+                ob_key = (ccxt_id, symbol)
+                if ob_key not in _OB_WARNED:
+                    _OB_WARNED.add(ob_key)
+                    log(
+                        f"    ⚠️ [OB] {symbol} @{ccxt_id}: orderbook snapshot failed "
+                        f"({type(e_ob).__name__}: {e_ob}) — ob_* metrics will stay empty "
+                        f"for this pair (repeat errors for it are logged only in debug)"
+                    )
+                elif DEBUG_ORDERBOOK:
                     log(f"    ⚠️ [OB] {symbol}: orderbook snapshot error: {e_ob}")
 
         return len(cs), total_bars, gaps_found, gaps_filled

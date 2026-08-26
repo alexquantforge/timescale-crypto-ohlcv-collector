@@ -205,6 +205,7 @@ class MarketDataEngine:
         self._gap_budget_until = 0.0               # gap filling deadline for the current cycle
         self._gap_budget_logged = False
         self._prefill_done: Dict[str, tuple] = {}  # tbl -> (min_ts_at_latch, attempt_ts) — see should_attempt_prefill
+        self._ob_warned: Set[str] = set()          # tbl -> orderbook warning printed once per process
 
     def _should_attempt_backfill(self, tbl_name: str) -> bool:
         """Empty symbols (0 candles: tokenized stocks, delisted) are retried
@@ -643,7 +644,16 @@ class MarketDataEngine:
                                 min_days_check=settings.min_days_volume_check,
                             )
                 except Exception as e:
-                    logger.debug(f"Orderbook snapshot error for {symbol}: {e}")
+                    # Once per pair per process (was: debug only — invisible).
+                    if tbl_name not in self._ob_warned:
+                        self._ob_warned.add(tbl_name)
+                        logger.warning(
+                            f"  [{self.timeframe.upper()}] ⚠️ [OB] {symbol} @{ccxt_id}: orderbook "
+                            f"snapshot failed ({type(e).__name__}: {e}) — ob_* metrics will stay "
+                            f"empty for this pair (repeat errors for it are logged only in debug)"
+                        )
+                    else:
+                        logger.debug(f"Orderbook snapshot error for {symbol}: {e}")
 
             return len(cs)
         except asyncio.TimeoutError:

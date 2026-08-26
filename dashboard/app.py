@@ -80,6 +80,43 @@ SUMMARY_COLUMNS = """
     ob_imbalance, ob_trades_per_min, ob_buy_pressure_pct, ob_is_barcode
 """
 
+# Keys every summary row must expose. The scan reads `SELECT *` (NEVER a fixed
+# column list): tables whose orderbook snapshot never landed simply LACK the
+# ob_* columns, and a fixed SELECT used to raise UndefinedColumn -> the row
+# was silently dropped -> "No 15m table for X" while the engine was happily
+# storing 180 days of candles into that very table (PIXEL/USDT:USDT @bybit).
+_EXPECTED_SUMMARY_KEYS = [
+    "ticker", "exchange", "asset_type", "close", "volume",
+    "ob_vitality_score", "ob_vitality_grade",
+    "ob_spread_abs", "ob_spread_pct", "ob_spread_atr_pct", "ob_atr_no_paranormal",
+    "ob_best_bid", "ob_best_ask", "ob_bid_depth_usd", "ob_ask_depth_usd",
+    "ob_cvd_5m", "ob_total_depth_usd", "ob_min_7d_volume_usd",
+    "ob_imbalance", "ob_trades_per_min", "ob_buy_pressure_pct", "ob_is_barcode",
+]
+
+
+async def _summary_row_for_table(pool, tbl: str, sem: asyncio.Semaphore, errors: list):
+    """Last row of one candle table normalized to the summary schema; missing
+    columns are padded with None. Returns None for empty/broken tables (broken
+    ones are REPORTED into `errors`, never silently skipped)."""
+    async with sem:
+        try:
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    f'SELECT * FROM "{tbl}" ORDER BY "Timestamp" DESC LIMIT 1'
+                )
+        except Exception as e:
+            errors.append((tbl, f"{type(e).__name__}: {e}"))
+            return None
+    if not row:
+        return None
+    d = dict(row)
+    # historical alias used by every downstream consumer
+    d.setdefault("max_ts", d.get("Timestamp"))
+    for key in _EXPECTED_SUMMARY_KEYS:
+        d.setdefault(key, None)
+    return d
+
 
 # ---------------------------------------------------------------------------
 # Data loading (cached)
@@ -104,25 +141,28 @@ async def _scan_database(db_name: str, tier_label: str, db_host, db_port, db_use
         tables = [r["table_name"] for r in rows]
 
         sem = asyncio.Semaphore(pool_size)
+        errors: list = []
 
         async def fetch_one(tbl: str):
-            async with sem:
-                try:
-                    async with pool.acquire() as conn:
-                        row = await conn.fetchrow(
-                            f'SELECT {SUMMARY_COLUMNS} FROM "{tbl}" ORDER BY "Timestamp" DESC LIMIT 1'
-                        )
-                except Exception:
-                    return None
-            if not row:
+            d = await _summary_row_for_table(pool, tbl, sem, errors)
+            if d is None:
                 return None
-            d = dict(row)
             d["table_name"] = tbl
             d["db_name"] = db_name
             d["volume_tier"] = tier_label
             return d
 
         results = await asyncio.gather(*[fetch_one(t) for t in tables])
+        if errors:
+            # Loud, once per scan: a silently skipped table was the
+            # "No 15m table for PIXEL" ghost — must stay visible.
+            preview = "; ".join(f"{t}: {e}" for t, e in errors[:5])
+            print(
+                f"[scan] {db_name}: {len(errors)}/{len(tables)} tables failed "
+                f"the last-row read and were skipped: {preview}"
+                + (" …" if len(errors) > 5 else ""),
+                flush=True,
+            )
         return [r for r in results if r]
     finally:
         await pool.close()

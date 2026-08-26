@@ -115,3 +115,79 @@ def test_only_with_15m_toggle_defaults_off_and_is_safe(app_test):
     app_test.checkbox(key="only_with_15m").uncheck()
     app_test.run()
     assert not app_test.exception
+
+
+def test_summary_row_for_table_pads_missing_ob_columns():
+    """Regression for 'No 15m table for PIXEL/USDT:USDT': the summary scan
+    used a fixed column list including ob_* snapshot columns; tables whose
+    snapshot never landed raised UndefinedColumn and were silently dropped.
+    The scan now SELECTs * and pads missing keys with None."""
+    import asyncio
+
+    from dashboard.app import _EXPECTED_SUMMARY_KEYS, _summary_row_for_table
+
+    class _Conn:
+        async def fetchrow(self, query):
+            assert "SELECT *" in query  # never a fixed ob_* column list again
+            # Table WITHOUT any ob_* columns — only base candle data:
+            return {
+                "Timestamp": 1_787_700_000, "open": 1.0, "high": 2.0,
+                "low": 0.5, "close": 1.5, "volume": 42.0,
+                "ticker": "PIXEL/USDT:USDT", "exchange": "bybit",
+                "asset_type": "swap",
+            }
+
+    class _Pool:
+        def acquire(self):
+            conn = _Conn()
+
+            class _A:
+                async def __aenter__(self):
+                    return conn
+
+                async def __aexit__(self, *exc):
+                    return False
+
+            return _A()
+
+    errors = []
+    row = asyncio.run(
+        _summary_row_for_table(_Pool(), "pixel_usdt:usdt_on_bybit", asyncio.Semaphore(1), errors)
+    )
+    assert errors == []
+    assert row is not None
+    assert row["ticker"] == "PIXEL/USDT:USDT"
+    assert row["max_ts"] == 1_787_700_000
+    for key in _EXPECTED_SUMMARY_KEYS:
+        assert key in row
+    assert row["ob_vitality_score"] is None  # padded, not missing
+
+
+def test_summary_row_for_table_reports_broken_table():
+    """A genuinely broken table returns None but is REPORTED into errors
+    (never silently skipped)."""
+    import asyncio
+
+    from dashboard.app import _summary_row_for_table
+
+    class _Conn:
+        async def fetchrow(self, query):
+            raise RuntimeError("relation is corrupted")
+
+    class _Pool:
+        def acquire(self):
+            conn = _Conn()
+
+            class _A:
+                async def __aenter__(self):
+                    return conn
+
+                async def __aexit__(self, *exc):
+                    return False
+
+            return _A()
+
+    errors = []
+    row = asyncio.run(_summary_row_for_table(_Pool(), "broken_tbl", asyncio.Semaphore(1), errors))
+    assert row is None
+    assert errors and errors[0][0] == "broken_tbl"
