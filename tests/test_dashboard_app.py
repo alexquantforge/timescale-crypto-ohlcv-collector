@@ -95,3 +95,23 @@ def test_stacked_layout_toggle_and_nav(app_test):
     assert not app_test.exception
     after, _ = _pair(app_test)
     assert after == expected
+
+
+def test_only_with_15m_toggle_defaults_off_and_is_safe(app_test):
+    """Chart options checkbox 'Only pairs with 15m data': OFF by default;
+    toggling it must not break rendering (demo pairs exist on both TFs,
+    so the pair list itself is unchanged here)."""
+    box = app_test.checkbox(key="only_with_15m")
+    assert box.value is False
+
+    before, options_before = _pair(app_test)
+    box.check()
+    app_test.run()
+    assert not app_test.exception, f"only_with_15m ON raised: {[e.value for e in app_test.exception]}"
+    after, options_after = _pair(app_test)
+    assert len(options_after) == len(options_before) > 0  # demo: both TFs exist
+    assert after == before  # same pair stays selected
+
+    app_test.checkbox(key="only_with_15m").uncheck()
+    app_test.run()
+    assert not app_test.exception

@@ -1406,15 +1406,38 @@ def _unique_sorted(values):
     return sorted(set(v for v in values if v))
 
 
-TICKER_OPTIONS = _unique_sorted(
-    ([] if df_15m.empty else df_15m["ticker"].dropna().tolist())
-    + ([] if df_1d.empty else df_1d["ticker"].dropna().tolist())
-)
+# Optional pair filter from the Chart options: only tickers that have a 15m
+# table. Many pairs have a 1D table but no 15m data — with this enabled the
+# pair list and Prev/Next skip them. The flag itself lives in a checkbox
+# (key="only_with_15m") inside the Charts tab; reading session_state here is
+# safe: on toggle reruns the new value is already set, default False.
+_only_15m = bool(st.session_state.get("only_with_15m", False))
+if _only_15m and not df_15m.empty:
+    _15m_tickers = df_15m["ticker"].dropna().unique().tolist()
+    _filtered_opts = _unique_sorted(_15m_tickers)
+    if _filtered_opts:  # never lock the UI behind an empty list
+        TICKER_OPTIONS = _filtered_opts
+    else:
+        TICKER_OPTIONS = _unique_sorted(
+            ([] if df_15m.empty else df_15m["ticker"].dropna().tolist())
+            + ([] if df_1d.empty else df_1d["ticker"].dropna().tolist())
+        )
+else:
+    TICKER_OPTIONS = _unique_sorted(
+        ([] if df_15m.empty else df_15m["ticker"].dropna().tolist())
+        + ([] if df_1d.empty else df_1d["ticker"].dropna().tolist())
+    )
 
 if not TICKER_OPTIONS:
     st.warning(
-        "No pairs yet for the exchanges enabled in the sidebar — "
-        "enable more exchanges or let the collector build their tables."
+        ("No 15m pairs for the exchanges enabled in the sidebar — "
+         "disable '⏱ Only pairs with 15m data' in ⚙️ Chart options, enable more exchanges, "
+         "or let the 15m collector build their tables.")
+        if _only_15m
+        else (
+            "No pairs yet for the exchanges enabled in the sidebar — "
+            "enable more exchanges or let the collector build their tables."
+        )
     )
     st.stop()
 
@@ -1474,13 +1497,18 @@ with tab_charts:
         )
         chart_style = opt3.selectbox("📊 Chart Style", options=["OHLCV Bars", "Candlesticks"], index=0)
         show_volume = opt4.checkbox("📊 Show volume bars", value=False, key="show_volume")
-        opt5, opt6, opt7 = st.columns(3)
+        opt5, opt6, opt7, opt8 = st.columns(4)
         live_refresh = opt5.selectbox(
             "🔴 Live refresh", options=["1s", "2s", "5s", "Off"], index=0, key="live_refresh",
         )
         auto_reload = opt6.checkbox("Auto-reload DB (60s)", value=True, key="auto_reload")
         stitch_gaps = opt7.checkbox("🩹 Stitch gaps", value=True, key="stitch_gaps",
                                     help="Fetch missing candles from the exchange into the chart (in-memory).")
+        opt8.checkbox(
+            "⏱ Only pairs with 15m data", value=False, key="only_with_15m",
+            help="Pair list and Prev/Next skip tickers that only have a 1D table "
+                 "(no 15m candles). Default OFF.",
+        )
 
     # Resolve table rows per timeframe (same exchange preferred)
     row_15m = find_table_row(df_15m, sym_ticker, sym_ex)
