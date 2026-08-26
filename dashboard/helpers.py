@@ -625,6 +625,13 @@ def build_history_loader_js(
     )
 
 
+# Height (px) of the history-loader badge line rendered BELOW the chart.
+# The iframe height in app.py must reserve this much extra room, so keep
+# this constant in sync with the #hist-status CSS height in
+# build_lightweight_chart_html.
+HIST_STATUS_HEIGHT = 16
+
+
 def build_lightweight_chart_html(
     candles_json: str,
     volume_json: Optional[str],
@@ -689,11 +696,16 @@ def build_lightweight_chart_html(
         <style>
             body {{ margin: 0; padding: 0; background-color: #131722; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; }}
             #tv-chart {{ width: 100%; height: {chart_height}px; position: relative; }}
-            #hist-status {{ position: absolute; left: 8px; bottom: 8px; font-size: 11px; color: #808495; pointer-events: none; z-index: 30; opacity: 0.85; }}
+            /* History-loader badge lives BELOW the chart, under the time/date
+               axis line: absolutely positioned inside #tv-chart it overlapped
+               the axis labels ('⇤ таблица начинается…' vs the dates) and was
+               unreadable. Static block with a fixed height = HIST_STATUS_HEIGHT. */
+            #hist-status {{ height: {HIST_STATUS_HEIGHT}px; line-height: {HIST_STATUS_HEIGHT}px; padding-left: 8px; font-size: 11px; color: #808495; pointer-events: none; opacity: 0.85; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
         </style>
     </head>
     <body>
-        <div id="tv-chart"><div id="hist-status"></div></div>
+        <div id="tv-chart"></div>
+        <div id="hist-status"></div>
         <script>
             const UP_VOL_COLOR = 'rgba(38, 166, 154, 0.5)';
             const DN_VOL_COLOR = 'rgba(239, 83, 80, 0.5)';

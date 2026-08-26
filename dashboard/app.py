@@ -51,6 +51,7 @@ from dashboard.helpers import (
     build_live_poller_js,
     build_history_loader_js,
     build_lightweight_chart_html,
+    HIST_STATUS_HEIGHT,
     build_series_arrays,
     find_missing_bucket_ranges,
     rows_to_compact_candles,
@@ -1278,7 +1279,7 @@ def render_tradingview_lightweight_chart(
         live_poller_js=live_poller_js,
         history_loader_js=history_loader_js,
     )
-    _html_component(html_code, chart_height + 10)
+    _html_component(html_code, chart_height + 10 + HIST_STATUS_HEIGHT)
 
 
 def render_tradingview_official_widget(ticker: str, exchange: str, interval: str = "D", style_code: str = "0"):
@@ -1693,7 +1694,7 @@ with tab_charts:
                 return
             html_code, stitch_txt = res
             _render_stitch_caption(stitch_txt)
-            _html_component(html_code, chart_height + 10)
+            _html_component(html_code, chart_height + 10 + HIST_STATUS_HEIGHT)
             return
 
         # --- LEGACY PATH (demo mode / TradingView widget / Plotly) ----------

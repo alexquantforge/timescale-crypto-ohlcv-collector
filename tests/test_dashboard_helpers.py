@@ -658,3 +658,23 @@ def test_chart_html_has_history_status_badge():
     page runs and shows why history did not load)."""
     html = _build_chart_html()
     assert 'id="hist-status"' in html
+
+
+def test_hist_status_badge_sits_below_chart_not_on_time_axis():
+    """Regression: the history-loader badge used to be absolutely positioned
+    INSIDE #tv-chart (bottom-left), overlapping the time/date axis line —
+    '⇤ таблица начинается…' and the axis labels painted over each other.
+    The badge must be a static block rendered AFTER (below) the chart div,
+    with a fixed height matched by HIST_STATUS_HEIGHT (reserved in the
+    iframe height by app.py)."""
+    from dashboard.helpers import HIST_STATUS_HEIGHT
+
+    html = _build_chart_html()
+    chart_div = html.index('<div id="tv-chart">')
+    status_div = html.index('<div id="hist-status">')
+    assert chart_div < status_div, "badge must render after (below) the chart"
+    assert '<div id="tv-chart"><div id="hist-status">' not in html, (
+        "badge must NOT be nested inside the chart div (it lands on the axis)"
+    )
+    assert f"height: {HIST_STATUS_HEIGHT}px" in html
+    assert "position: absolute" not in html.split("#hist-status", 1)[1].split("}}", 1)[0]
