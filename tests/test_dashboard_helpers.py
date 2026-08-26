@@ -638,6 +638,10 @@ def test_build_history_loader_js_content():
     assert "const CHUNK = 1200;" in js
     assert "exhausted = true;" in js  # stops fetching at the start of history
     assert "olderC.concat(allCandles)" in js  # prepends older chunk
+    # robust server discovery: probes /healthz on referrer-host, then localhost
+    assert "/healthz" in js
+    assert "http://localhost:" in js and "http://127.0.0.1:" in js
+    assert "hist-status" in js  # drives the visible status badge
 
 
 def test_chart_html_injects_history_loader():

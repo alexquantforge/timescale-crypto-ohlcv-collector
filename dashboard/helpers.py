@@ -474,31 +474,37 @@ _HISTORY_LOADER_TEMPLATE = """
   const PORT = __PORT__;
   const BASE = __BASE__;      // '/candles?db=..&table=..' served by the dashboard
   const CHUNK = __CHUNK__;
-  function svc(){
-    if (!PORT) { return null; }
-    try {
-      const ref = document.referrer || ((location.ancestorOrigins && location.ancestorOrigins[0]) || '');
-      if (!ref) { return null; }
-      const u = new URL(ref);
-      return u.protocol + '//' + u.hostname + ':' + PORT;
-    } catch (e) { return null; }
-  }
-  const SVC = svc();
   const statusEl = document.getElementById('hist-status');
   function showStatus(txt, color){
     if (!statusEl) { return; }
     statusEl.textContent = txt;
     statusEl.style.color = color || '#808495';
   }
-  if (!SVC) { return; }
-  showStatus('⇤ скролл влево — подгружу старую историю');
+  // Candidate dashboard endpoints, in order: the host the page was loaded
+  // from (document.referrer), then plain localhost/127.0.0.1 — the referrer
+  // may be empty in some iframe setups, and a pure localhost dashboard is
+  // the overwhelmingly common case anyway. Probing /healthz picks the first
+  // candidate that actually answers, so the loader works even when the
+  // referrer is blank.
+  const CANDS = [];
+  try {
+    const ref = document.referrer || ((location.ancestorOrigins && location.ancestorOrigins[0]) || '');
+    if (ref) {
+      const u = new URL(ref);
+      CANDS.push(u.protocol + '//' + u.hostname + ':' + PORT);
+    }
+  } catch (e) {}
+  CANDS.push('http://localhost:' + PORT, 'http://127.0.0.1:' + PORT);
+
+  let SVC = null;
   let inflight = false;
   let exhausted = false;
+
   // Infinite history: when the user pans the chart to the left edge of the
   // loaded window, fetch the next OLDER chunk straight from the dashboard's
   // /candles endpoint (no Streamlit rerun!) and prepend it.
   async function loadOlder(){
-    if (inflight || exhausted || !allCandles || !allCandles.length) { return; }
+    if (!SVC || inflight || exhausted || !allCandles || !allCandles.length) { return; }
     inflight = true;
     try {
       const first = allCandles[0].time;
@@ -547,6 +553,33 @@ _HISTORY_LOADER_TEMPLATE = """
       showStatus('⚠ история: /candles недоступен (retry при скролле)', '#ef5350');
     } finally { inflight = false; }
   }
+
+  showStatus('⇤ история: ищу сервер /tick…');   // synchronous: badge proves the loader JS ran
+  (async function(){
+    let sawAny = false;
+    for (const b of CANDS) {
+      try {
+        const r = await fetch(b + '/healthz', { cache: 'no-store' });
+        const j = await r.json();
+        sawAny = true;
+        if (j && j.ok) { SVC = b; break; }
+      } catch (e) {}
+    }
+    if (!SVC) {
+      showStatus(
+        sawAny ? '⚠ история: на порту старый процесс — перезапусти дашборд'
+               : '⚠ история: сервер /tick недоступен из браузера',
+        '#ef5350'
+      );
+      return;
+    }
+    showStatus('⇤ скролл влево — подгружу старую историю');
+    try {
+      const lr = chart.timeScale().getVisibleLogicalRange();
+      if (lr && lr.from < 10) { loadOlder(); }   // already parked at the left edge
+    } catch (e) {}
+  })();
+
   chart.timeScale().subscribeVisibleLogicalRangeChange(function(range){
     if (range && range.from < 10) { loadOlder(); }
   });
@@ -776,16 +809,25 @@ _LIVE_POLLER_TEMPLATE = """
   const TICK_PORT = __TICK_PORT__;    // dashboard live-tick endpoint port, or 0
   const DIRECT_URL = __DIRECT_URL__;  // exchange public REST ticker URL, or ''
   function directParse(j){ let price = NaN, bid = NaN, ask = NaN; __PARSE__ return price; }
-  function dbTickUrl(){
-    if (!TICK_PATH || !TICK_PORT) { return null; }
+  // Candidate dashboard endpoints, in order: the host the page was loaded
+  // from (document.referrer), then plain localhost/127.0.0.1 — the referrer
+  // may be empty in some iframe setups, and a PURE localhost dashboard is
+  // the overwhelmingly common case anyway.
+  function dbTickUrls(){
+    const urls = [];
+    if (!TICK_PATH || !TICK_PORT) { return urls; }
     try {
       const ref = document.referrer || ((location.ancestorOrigins && location.ancestorOrigins[0]) || '');
-      if (!ref) { return null; }
-      const u = new URL(ref);
-      return u.protocol + '//' + u.hostname + ':' + TICK_PORT + TICK_PATH;
-    } catch (e) { return null; }
+      if (ref) {
+        const u = new URL(ref);
+        urls.push(u.protocol + '//' + u.hostname + ':' + TICK_PORT + TICK_PATH);
+      }
+    } catch (e) {}
+    urls.push('http://localhost:' + TICK_PORT + TICK_PATH);
+    urls.push('http://127.0.0.1:' + TICK_PORT + TICK_PATH);
+    return urls;
   }
-  const TURL = dbTickUrl();
+  const TURLS = dbTickUrls();
   let inflight = false;
   async function grabPrice(url, parse){
     const r = await fetch(url, { cache: 'no-store' });
@@ -800,8 +842,8 @@ _LIVE_POLLER_TEMPLATE = """
       inflight = true;
       try {
         let price = NaN;
-        if (TURL) {
-          try { price = await grabPrice(TURL, function(j){ return +j.last; }); } catch (e) {}
+        for (let i = 0; i < TURLS.length && (!isFinite(price) || price <= 0); i++) {
+          try { price = await grabPrice(TURLS[i], function(j){ return +j.last; }); } catch (e) {}
         }
         if ((!isFinite(price) || price <= 0) && DIRECT_URL) {
           try { price = await grabPrice(DIRECT_URL, directParse); } catch (e) {}
