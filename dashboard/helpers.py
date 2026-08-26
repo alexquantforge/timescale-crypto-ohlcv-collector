@@ -385,12 +385,165 @@ def build_pair_links_html(symbol: str, exchange: str, perp_ticker: Optional[str]
 # ---------------------------------------------------------------------------
 
 
+def _sig10(x) -> float:
+    """Round to 10 significant digits — shrinks JSON payloads a lot without
+    any visible precision loss (prices span 1e-8 .. 1e5, so a fixed decimal
+    round would destroy small-cap prices)."""
+    return float(f"{float(x):.10g}")
+
+
+def build_series_arrays(hist_df: pd.DataFrame, with_volume: bool = False):
+    """
+    Compact chart payloads as ARRAYS instead of objects:
+      candles: [[ts, open, high, low, close], ...]
+      volume:  [[ts, value, dir], ...]   dir = +1 up / -1 down
+    Roughly half the JSON size of {time, open, ...} objects — faster to
+    serialize on pair switch and faster for the iframe to JSON.parse.
+    """
+    t = hist_df["ts"].to_numpy(dtype=np.int64)
+    o = hist_df["open"].to_numpy(dtype=float)
+    h = hist_df["high"].to_numpy(dtype=float)
+    l = hist_df["low"].to_numpy(dtype=float)
+    c = hist_df["close"].to_numpy(dtype=float)
+
+    candles = [
+        [int(t[i]), _sig10(o[i]), _sig10(h[i]), _sig10(l[i]), _sig10(c[i])]
+        for i in range(len(t))
+    ]
+    volume_data = None
+    if with_volume:
+        v = np.nan_to_num(hist_df["volume"].to_numpy(dtype=float))
+        volume_data = [
+            [int(t[i]), round(float(v[i]), 2), 1 if c[i] >= o[i] else -1]
+            for i in range(len(t))
+        ]
+    return candles, volume_data
+
+
+def rows_to_compact_candles(rows, min_ts: int = 1356998400, now_sec: int = None):
+    """
+    Server-side (history endpoint): asyncpg row dicts -> ascending compact
+    [[ts, o, h, l, c, v], ...] arrays, applying the SAME garbage-timestamp
+    policy as sanitize_candle_frame (per-row ms->s when the epoch looks like
+    milliseconds, then sane min/max bounds). Returns [] for empty input.
+    """
+    if not rows:
+        return []
+    now = _time.time() if now_sec is None else now_sec
+    out = []
+    hi = now + 2 * 86400
+    for r in rows:
+        try:
+            ts = int(r["ts"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if ts > 1e11:  # millisecond epoch stored in the table
+            ts //= 1000
+        if ts < min_ts or ts > hi:
+            continue
+        v = r.get("volume")
+        out.append([
+            ts,
+            _sig10(r["open"]), _sig10(r["high"]),
+            _sig10(r["low"]), _sig10(r["close"]),
+            round(float(v), 2) if v is not None else 0.0,
+        ])
+    out.sort(key=lambda a: a[0])
+    return out
+
+
+_HISTORY_LOADER_TEMPLATE = """
+(function(){
+  'use strict';
+  const PORT = __PORT__;
+  const BASE = __BASE__;      // '/candles?db=..&table=..' served by the dashboard
+  const CHUNK = __CHUNK__;
+  function svc(){
+    if (!PORT) { return null; }
+    try {
+      const ref = document.referrer || ((location.ancestorOrigins && location.ancestorOrigins[0]) || '');
+      if (!ref) { return null; }
+      const u = new URL(ref);
+      return u.protocol + '//' + u.hostname + ':' + PORT;
+    } catch (e) { return null; }
+  }
+  const SVC = svc();
+  if (!SVC) { return; }
+  let inflight = false;
+  let exhausted = false;
+  // Infinite history: when the user pans the chart to the left edge of the
+  // loaded window, fetch the next OLDER chunk straight from the dashboard's
+  // /candles endpoint (no Streamlit rerun!) and prepend it.
+  async function loadOlder(){
+    if (inflight || exhausted || !allCandles || !allCandles.length) { return; }
+    inflight = true;
+    try {
+      const first = allCandles[0].time;
+      const r = await fetch(SVC + BASE + '&to=' + first + '&limit=' + CHUNK, { cache: 'no-store' });
+      const j = await r.json();
+      const rows = (j && j.c) || [];
+      if (rows.length === 0) { exhausted = true; return; }
+      const olderC = [];
+      const olderV = [];
+      for (let i = 0; i < rows.length; i++) {
+        const a = rows[i];
+        if (!a || a[0] >= first) { continue; }   // strictly older + ms-epoch defence
+        olderC.push({ time: a[0], open: a[1], high: a[2], low: a[3], close: a[4] });
+        olderV.push({ time: a[0], value: a[5] || 0, color: (a[4] >= a[1] ? UP_VOL_COLOR : DN_VOL_COLOR) });
+      }
+      if (olderC.length === 0) { exhausted = true; return; }
+      allCandles = olderC.concat(allCandles);
+      mainSeries.setData(allCandles);
+      if (typeof volumeSeries !== 'undefined' && allVolume) {
+        allVolume = olderV.concat(allVolume);
+        volumeSeries.setData(allVolume);
+      }
+      if (rows.length < CHUNK * 0.95) { exhausted = true; }   // short page = start of history
+    } catch (e) {
+      // transient endpoint failure — the next left-pan retries automatically
+    } finally { inflight = false; }
+  }
+  chart.timeScale().subscribeVisibleLogicalRangeChange(function(range){
+    if (range && range.from < 10) { loadOlder(); }
+  });
+})();
+"""
+
+
+def build_history_loader_js(
+    db_name: Optional[str],
+    table_name: Optional[str],
+    step_sec: int,
+    tick_port: Optional[int],
+    chunk: int = 1200,
+) -> str:
+    """
+    Browser-side JS that gives the chart INFINITE left-scroll history: on a
+    visible-range change near the left edge it fetches the next older chunk
+    from the dashboard's /candles HTTP endpoint (same tiny server as /tick)
+    and prepends it — no Streamlit rerun, no slider bumping. Returns "" when
+    no endpoint is available; the chart then behaves exactly as before.
+    """
+    if not tick_port or not db_name or not table_name:
+        return ""
+    from urllib.parse import urlencode
+
+    base = "/candles?" + urlencode({"db": db_name, "table": table_name})
+    return (
+        _HISTORY_LOADER_TEMPLATE
+        .replace("__BASE__", json.dumps(base))
+        .replace("__PORT__", str(int(tick_port)))
+        .replace("__CHUNK__", str(int(chunk)))
+    )
+
+
 def build_lightweight_chart_html(
     candles_json: str,
     volume_json: Optional[str],
     chart_height: int,
     chart_style: str,
     live_poller_js: str = "",
+    history_loader_js: str = "",
 ) -> str:
     """
     Assembles the complete TradingView Lightweight Charts page as a pure
@@ -429,7 +582,7 @@ def build_lightweight_chart_html(
     volume_js = ""
     if volume_json is not None:
         volume_js = f"""
-            const volumeData = {volume_json};
+            const volumeData = ({volume_json}).map(function(r){{ return {{ time: r[0], value: r[1], color: (r[2] >= 0 ? UP_VOL_COLOR : DN_VOL_COLOR) }}; }});
             const volumeSeries = chart.addHistogramSeries({{
                 color: '#26a69a',
                 priceFormat: {{ type: 'volume' }},
@@ -437,6 +590,7 @@ def build_lightweight_chart_html(
                 scaleMargins: {{ top: 0.82, bottom: 0 }},
             }});
             volumeSeries.setData(volumeData);
+            allVolume = volumeData;
         """
 
     return f"""
@@ -452,6 +606,8 @@ def build_lightweight_chart_html(
     <body>
         <div id="tv-chart"></div>
         <script>
+            const UP_VOL_COLOR = 'rgba(38, 166, 154, 0.5)';
+            const DN_VOL_COLOR = 'rgba(239, 83, 80, 0.5)';
             const fmtPrice = (p) => {{
                 const a = Math.abs(p);
                 const trim = (x) => {{
@@ -495,9 +651,11 @@ def build_lightweight_chart_html(
                 }},
             }});
 
-            const candlesData = {candles_json};
+            const candlesData = ({candles_json}).map(function(r){{ return {{ time: r[0], open: r[1], high: r[2], low: r[3], close: r[4] }}; }});
             {series_js_code}
             mainSeries.setData(candlesData);
+            let allCandles = candlesData;   // grows leftwards via the history loader
+            let allVolume = null;           // wired when the volume series exists
 
             {volume_js}
 
@@ -514,6 +672,7 @@ def build_lightweight_chart_html(
                 }});
             }} catch (e) {{}}
 {live_poller_js}
+{history_loader_js}
 
             window.addEventListener('resize', () => {{
                 chart.applyOptions({{ width: chartElement.clientWidth }});

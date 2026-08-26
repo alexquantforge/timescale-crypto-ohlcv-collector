@@ -23,7 +23,6 @@ import threading
 from typing import Optional
 
 import asyncpg
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -49,8 +48,11 @@ from dashboard.helpers import (
     filter_sane_summary_rows,
     merge_intraday_into_daily,
     build_live_poller_js,
+    build_history_loader_js,
     build_lightweight_chart_html,
+    build_series_arrays,
     find_missing_bucket_ranges,
+    rows_to_compact_candles,
     stitch_candle_gaps,
 )
 
@@ -254,6 +256,15 @@ def get_candles(timeframe: str, row: dict, limit: int, demo: bool) -> pd.DataFra
     if demo:
         return _demo_candles_cached(timeframe, row["ticker"], row["exchange"], limit)
     return load_candles_cached(db_host, db_port, db_user, db_pass, row["db_name"], row["table_name"], limit)
+
+
+def _safe_max_ts(row: Optional[dict]) -> int:
+    """Summary-row last-candle epoch as int; 0 for missing/NaN garbage
+    (`int(float('nan'))` would raise, and `nan or 0` stays nan)."""
+    try:
+        return int(float((row or {}).get("max_ts") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +502,24 @@ def _live_infra() -> dict:
             data["age"] = age
             return data
 
+        async def select_candles(db_name, table_name, to_ts, limit):
+            """Older-history chunk for the chart's infinite left-scroll:
+            `limit` rows strictly older than `to_ts`, ascending."""
+            try:
+                pool = await get_pool(db_name)
+                async with pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        f'SELECT "Timestamp" AS ts, open, high, low, close, volume'
+                        f' FROM "{table_name}" WHERE "Timestamp" < $1'
+                        f' ORDER BY "Timestamp" DESC LIMIT $2',
+                        int(to_ts), int(limit),
+                    )
+            except Exception:
+                return None
+            # rows arrive DESC; rows_to_compact_candles re-sorts ascending and
+            # applies the same garbage-timestamp policy as the chart pipeline.
+            return {"c": rows_to_compact_candles([dict(r) for r in rows])}
+
         def submit_upsert(db, ex, sym, payload, timeout=5.0):
             try:
                 return asyncio.run_coroutine_threadsafe(
@@ -507,8 +536,17 @@ def _live_infra() -> dict:
             except Exception:
                 return None
 
+        def submit_candles(db, table, to_ts, limit, timeout=8.0):
+            try:
+                return asyncio.run_coroutine_threadsafe(
+                    select_candles(db, table, to_ts, limit), loop
+                ).result(timeout=timeout)
+            except Exception:
+                return None
+
         infra["submit_upsert"] = submit_upsert
         infra["submit_select"] = submit_select
+        infra["submit_candles"] = submit_candles
         ready.put(infra)
         loop.run_forever()
 
@@ -522,21 +560,33 @@ def _live_infra() -> dict:
 
     _EX_RE = _re.compile(r"[A-Za-z0-9_\-]{1,32}")
     _SYM_RE = _re.compile(r"[A-Za-z0-9/:\._\-]{1,64}")
+    _TBL_RE = _re.compile(r"[A-Za-z0-9_]{1,96}")
 
     class _TickHandler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             return
 
-        def _send(self, obj, status=200):
+        def _send(self, obj, status=200, allow_gzip=False):
             body = json.dumps(obj).encode()
+            gz = None
+            if allow_gzip and len(body) > 4096:
+                if "gzip" in (self.headers.get("Accept-Encoding") or ""):
+                    import gzip as _gzip
+
+                    gz = _gzip.compress(body, compresslevel=6)
             try:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Content-Length", str(len(body)))
+                if gz is not None:
+                    self.send_header("Content-Encoding", "gzip")
+                    self.send_header("Vary", "Accept-Encoding")
+                    self.send_header("Content-Length", str(len(gz)))
+                else:
+                    self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                self.wfile.write(gz if gz is not None else body)
             except Exception:
                 pass
 
@@ -549,6 +599,28 @@ def _live_infra() -> dict:
         def do_GET(self):
             try:
                 u = _urlparse(self.path)
+                if u.path == "/candles":
+                    # Older-history chunks for the chart's infinite left-scroll.
+                    q = _parse_qs(u.query)
+                    db = (q.get("db") or [""])[0]
+                    table = (q.get("table") or [""])[0]
+                    try:
+                        to_ts = int(float((q.get("to") or ["0"])[0]))
+                        limit = int(float((q.get("limit") or ["1200"])[0]))
+                    except (TypeError, ValueError):
+                        to_ts, limit = 0, 1200
+                    limit = max(1, min(3000, limit))
+                    if (
+                        db not in _KNOWN_DBS
+                        or not _TBL_RE.fullmatch(table or "")
+                        or "_on_" not in table
+                        or to_ts <= 0
+                    ):
+                        self._send({"c": []})
+                        return
+                    data = infra["submit_candles"](db, table, to_ts, limit)
+                    self._send(data or {"c": []}, allow_gzip=True)
+                    return
                 if u.path != "/tick":
                     self._send({}, status=404)
                     return
@@ -891,13 +963,19 @@ def _warm_live_snapshot(ticker: str, exchange_name: str, ccxt_id: str, atr_val: 
 
 
 def _warm_pair_caches(
-    ticker, exchange_name, ccxt_id, row_15m, row_1d, lim15, lim1d, atr_period, full_live: bool
+    ticker, exchange_name, ccxt_id, row_15m, row_1d, lim15, lim1d, atr_period, full_live: bool,
+    chart_ctx: dict = None,
 ) -> None:
     """
     Warms ALL data a pair view needs so Prev/Next renders instantly:
     candle frames (15m+1D), the exchange-side gap/tail stitch fetches,
     the live chip feeds (ticker/orderbook/trade tape), and — for the
     immediate ±2 neighbours — the full live orderbook snapshot.
+
+    With `chart_ctx` (style/height/volume/stitch/tick-port of the current
+    view) it also pre-builds BOTH chart pages into `_render_chart_html_cached`,
+    so the very first flip to a neighbour skips the DB round-trip AND the
+    JSON/HTML build — the render path becomes a pure memory lookup.
     """
     for tf, row, lim in (("15m", row_15m, lim15), ("1d", row_1d, lim1d)):
         if not row:
@@ -938,32 +1016,114 @@ def _warm_pair_caches(
             pass
         _warm_live_snapshot(ticker, exchange_name, ccxt_id, atr_nb)
 
-def build_series_payloads(hist_df: pd.DataFrame, with_volume: bool = True):
-    """
-    Builds lightweight-charts payloads (int-epoch times): candles + optional volume.
-    """
-    t = hist_df["ts"].to_numpy(dtype=np.int64)
-    o = hist_df["open"].to_numpy(dtype=float)
-    h = hist_df["high"].to_numpy(dtype=float)
-    l = hist_df["low"].to_numpy(dtype=float)
-    c = hist_df["close"].to_numpy(dtype=float)
-    v = np.nan_to_num(hist_df["volume"].to_numpy(dtype=float))
+    # --- Pre-build both neighbour chart pages into the HTML cache -----------
+    # Keys MUST match the render path exactly (same primitives in the same
+    # order), otherwise the flip would miss the cache and rebuild.
+    if chart_ctx:
+        for tf_label, row, lim in (("15m", row_15m, lim15), ("1D", row_1d, lim1d)):
+            if not row:
+                continue
+            step = 900 if tf_label == "15m" else 86400
+            nb_live_db = _live_db_for(row_1d, row_15m)
+            tick_path = (
+                _live_tick_path(nb_live_db, exchange_name, ticker)
+                if chart_ctx.get("interval_ms")
+                else None
+            )
+            poller = build_live_poller_js(
+                exchange_name, ticker, step,
+                chart_ctx.get("interval_ms", 0),
+                tick_path=tick_path,
+                tick_port=chart_ctx.get("tick_port"),
+            )
+            hist = ""
+            if chart_ctx.get("tick_port"):
+                hist = build_history_loader_js(
+                    row["db_name"], row["table_name"], step,
+                    chart_ctx["tick_port"], chunk=1200 if tf_label == "15m" else 700,
+                )
+            m_db = m_tbl = ""
+            m_lim = 0
+            if tf_label == "1D" and row_15m:
+                m_db, m_tbl = row_15m["db_name"], row_15m["table_name"]
+                m_lim = max(int(lim15), 200)
+            _render_chart_html_cached(
+                db_host, db_port, db_user, db_pass,
+                row["db_name"], row["table_name"], _safe_max_ts(row),
+                tf_label, int(lim), m_db, m_tbl, m_lim,
+                ccxt_id, ticker, exchange_name,
+                chart_ctx["style"], chart_ctx["height"],
+                chart_ctx["volume"], chart_ctx["stitch"],
+                poller, hist,
+            )
 
-    candles = [
-        {"time": int(t[i]), "open": float(o[i]), "high": float(h[i]), "low": float(l[i]), "close": float(c[i])}
-        for i in range(len(t))
-    ]
-    volume_data = []
-    if with_volume:
-        volume_data = [
-            {
-                "time": int(t[i]),
-                "value": float(v[i]),
-                "color": "rgba(38, 166, 154, 0.5)" if c[i] >= o[i] else "rgba(239, 83, 80, 0.5)",
-            }
-            for i in range(len(t))
-        ]
-    return candles, volume_data
+
+@st.cache_data(ttl=45, show_spinner=False)
+def _render_chart_html_cached(
+    db_host, db_port, db_user, db_pass,
+    db_name: str, table_name: str, max_ts: int,
+    tf_label: str, limit: int,
+    merge_db: str, merge_table: str, merge_limit: int,
+    ccxt_id: str, sym_ticker: str, sym_ex: str,
+    chart_style: str, chart_height: int,
+    show_volume: bool, stitch_enabled: bool,
+    live_poller_js: str, history_loader_js: str,
+):
+    """
+    Fully-built chart page (candles → stitch → daily merge → compact JSON →
+    HTML) cached ~45 s. Pair switching always re-runs the whole Streamlit
+    script; with this cache — pre-warmed for the ±5 neighbours by
+    `_warm_pair_caches` — the flip is a memory lookup plus an iframe refresh
+    instead of a DB round-trip + JSON build for two charts. Returns
+    (html, stitch_caption_text) or None when the table has no usable candles.
+    """
+    frame = load_candles_cached(db_host, db_port, db_user, db_pass, db_name, table_name, limit)
+    if frame is None or frame.empty:
+        return None
+
+    tf_key = "15m" if tf_label == "15m" else "1d"
+    step = 900 if tf_key == "15m" else 86400
+
+    def _stitch(fr):
+        if stitch_enabled and fr is not None and len(fr) > 1:
+            return stitch_candle_gaps(
+                fr,
+                lambda r0, r1: _fetch_missing_candles_cached(ccxt_id, sym_ticker, tf_key, r0, r1),
+                step,
+            )
+        return fr, 0
+
+    frame, stitched = _stitch(frame)
+
+    if tf_key == "1d" and merge_table:
+        df15 = load_candles_cached(db_host, db_port, db_user, db_pass, merge_db, merge_table, merge_limit)
+        df15, _ = _stitch(df15)
+        frame = merge_intraday_into_daily(frame, df15)
+
+    stale_hint = ""
+    if stitched and max_ts and max_ts > 0:
+        mt = max_ts // 1000 if max_ts > 1e11 else max_ts
+        age_h = (time.time() - mt) / 3600.0
+        thr = 1.0 if tf_key == "15m" else 49.0
+        if age_h > thr:
+            stale_hint = f" · ⏳ collector {age_h:.1f}h behind"
+    stitch_txt = (
+        f"🩹 {stitched} missing {tf_label} candles stitched from exchange (in-memory){stale_hint}"
+        if stitched
+        else "&nbsp;"
+    )
+
+    candles_arr, volume_arr = build_series_arrays(frame, with_volume=show_volume)
+    dumps = lambda x: json.dumps(x, separators=(",", ":"))
+    html = build_lightweight_chart_html(
+        candles_json=dumps(candles_arr),
+        volume_json=dumps(volume_arr) if show_volume else None,
+        chart_height=chart_height,
+        chart_style=chart_style,
+        live_poller_js=live_poller_js,
+        history_loader_js=history_loader_js,
+    )
+    return html, stitch_txt
 
 
 def render_tradingview_lightweight_chart(
@@ -975,6 +1135,7 @@ def render_tradingview_lightweight_chart(
     chart_style: str = "OHLCV Bars",
     show_volume: bool = False,
     live_poller_js: str = "",
+    history_loader_js: str = "",
 ):
     """Renders a TradingView Lightweight Charts canvas with OHLCV Bars/Candles,
     volume histogram, crosshair tooltips, and fast rolling ATR channels."""
@@ -982,7 +1143,7 @@ def render_tradingview_lightweight_chart(
         st.info(f"No {tf_label} candles available for {ticker} ({exchange}).")
         return
 
-    candles, volume_data = build_series_payloads(hist_df, with_volume=show_volume)
+    candles, volume_data = build_series_arrays(hist_df, with_volume=show_volume)
 
     dumps = lambda x: json.dumps(x, separators=(",", ":"))
 
@@ -992,6 +1153,7 @@ def render_tradingview_lightweight_chart(
         chart_height=chart_height,
         chart_style=chart_style,
         live_poller_js=live_poller_js,
+        history_loader_js=history_loader_js,
     )
     _html_component(html_code, chart_height + 10)
 
@@ -1094,7 +1256,10 @@ enabled_exs = st.sidebar.multiselect(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.caption("⚡ Charts load only the last N candles (cached 60 s) — instant pair switching.")
+st.sidebar.caption(
+    "⚡ Last N candles load instantly (chart pages cached ~45 s, neighbours pre-built); "
+    "older history streams in automatically as you scroll the chart left."
+)
 limit_15m = st.sidebar.slider("Candles · 15m chart", min_value=100, max_value=3000, value=700, step=100)
 limit_1d = st.sidebar.slider("Candles · 1D chart", min_value=100, max_value=1500, value=400, step=50)
 
@@ -1104,6 +1269,7 @@ if st.sidebar.button("🔄 Refresh data (clear caches)"):
     load_summary_cached.clear()
     load_candles_cached.clear()
     fetch_live_cached.clear()
+    _render_chart_html_cached.clear()
     st.rerun()
 
 # Compact layout: no big page title — charts come first with minimal top padding
@@ -1316,11 +1482,70 @@ with tab_charts:
     else:
         _render_live_panel(sym_ticker, sym_ex, demo_mode, db_name=live_db)
 
+    def _render_stitch_caption(stitch_txt: str) -> None:
+        # Always render the stitch caption line at a fixed height (empty when
+        # nothing was stitched) so the side-by-side 15m / 1D charts stay
+        # perfectly level — previously the 15m chart was pushed ~20px down
+        # whenever it had a stitched-gap caption and the 1D chart did not.
+        st.markdown(
+            f"<div style='font-size:12px;color:#808495;height:20px;line-height:20px;"
+            f"margin:0 0 2px 4px;white-space:nowrap;overflow:hidden;'>{stitch_txt}</div>",
+            unsafe_allow_html=True,
+        )
+
     def render_chart(row, tf_label, limit, interval, chart_height=470):
         """Renders one timeframe chart into the current container."""
         if row is None:
             st.info(f"No {tf_label} table for {sym_ticker}.")
             return
+
+        # --- FAST PATH: Lightweight Charts against the real DB --------------
+        # The whole chart page (candles → stitch → merge → compact JSON →
+        # HTML) is one st.cache_data entry pre-warmed for the ±5 neighbours,
+        # so Prev/Next flipping costs a memory lookup + iframe refresh.
+        if chart_engine == "TradingView Lightweight Canvas" and not demo_mode:
+            step = 900 if tf_label == "15m" else 86400
+            interval_ms = int(live_interval * 1000) if live_interval > 0 else 0
+            # Chart poller reads the DB live row through the dashboard's own
+            # /tick endpoint (host resolved in-browser); direct exchange REST
+            # is kept only as fallback. Works for all 9 exchanges and never
+            # gives up on errors. The same tiny endpoint also serves /candles
+            # history chunks for infinite left-scroll.
+            _infra = _live_infra_or_none() if live_db else None
+            tick_path = _live_tick_path(live_db, sym_ex, sym_ticker) if (_infra and interval_ms > 0) else None
+            poller_js = build_live_poller_js(
+                sym_ex, sym_ticker, step, interval_ms,
+                tick_path=tick_path,
+                tick_port=(_infra or {}).get("tick_port"),
+            )
+            hist_js = ""
+            if _infra and _infra.get("tick_port"):
+                hist_js = build_history_loader_js(
+                    row["db_name"], row["table_name"], step,
+                    _infra["tick_port"], chunk=1200 if tf_label == "15m" else 700,
+                )
+            m_db = m_tbl = ""
+            m_lim = 0
+            if tf_label == "1D" and row_15m is not None:
+                m_db, m_tbl = row_15m["db_name"], row_15m["table_name"]
+                m_lim = max(limit_15m, 200)
+            res = _render_chart_html_cached(
+                db_host, db_port, db_user, db_pass,
+                row["db_name"], row["table_name"], _safe_max_ts(row),
+                tf_label, limit, m_db, m_tbl, m_lim,
+                ccxt_id, sym_ticker, sym_ex,
+                chart_style, chart_height, bool(show_volume), bool(stitch_gaps),
+                poller_js, hist_js,
+            )
+            if res is None:
+                st.info(f"No {tf_label} candles available for {sym_ticker} ({sym_ex}).")
+                return
+            html_code, stitch_txt = res
+            _render_stitch_caption(stitch_txt)
+            _html_component(html_code, chart_height + 10)
+            return
+
+        # --- LEGACY PATH (demo mode / TradingView widget / Plotly) ----------
         hist_df = get_candles(tf_label, row, limit, demo_mode)
 
         def _stitch(frame, timeframe):
@@ -1352,20 +1577,12 @@ with tab_charts:
                 _thr = 1.0 if tf_label == "15m" else 49.0  # 1D: last closed day is ~24-48h back, normal
                 if _age_h > _thr:
                     stale_hint = f" · ⏳ collector {_age_h:.1f}h behind"
-        # Always render the stitch caption line at a fixed height (empty when
-        # nothing was stitched) so the side-by-side 15m / 1D charts stay
-        # perfectly level — previously the 15m chart was pushed ~20px down
-        # whenever it had a stitched-gap caption and the 1D chart did not.
         stitch_txt = (
             f"🩹 {stitched} missing {tf_label} candles stitched from exchange (in-memory){stale_hint}"
             if stitched
             else "&nbsp;"
         )
-        st.markdown(
-            f"<div style='font-size:12px;color:#808495;height:20px;line-height:20px;"
-            f"margin:0 0 2px 4px;white-space:nowrap;overflow:hidden;'>{stitch_txt}</div>",
-            unsafe_allow_html=True,
-        )
+        _render_stitch_caption(stitch_txt)
 
         # Keep the daily chart in sync: aggregate fresher 15m candles of today
         # (the 15m frame is stitched too, so today's daily bar is always fresh)
@@ -1522,7 +1739,17 @@ with tab_charts:
     # pairs into TimescaleDB, and all live widgets above just read those rows.
     if not demo_mode and sym_ticker and sym_ex and TICKER_OPTIONS:
         try:
-            _live_infra()  # starts the writer daemon + /tick endpoint (runs once)
+            _infra_main = _live_infra()  # starts the writer daemon + /tick + /candles endpoints (runs once)
+            # Current chart-rendering parameters shared by every neighbour
+            # warm, so the pre-built HTML cache keys match the render path.
+            _chart_ctx = {
+                "interval_ms": int(live_interval * 1000) if live_interval > 0 else 0,
+                "tick_port": (_infra_main or {}).get("tick_port"),
+                "style": chart_style,
+                "height": 470 if stacked_layout else 430,
+                "volume": bool(show_volume),
+                "stitch": bool(stitch_gaps),
+            }
             live_pairs = []
             seen = set()
             cur_idx = TICKER_OPTIONS.index(sym_ticker)
@@ -1543,10 +1770,11 @@ with tab_charts:
                     continue
                 _bg(
                     ("pair", nb_ticker, sym_ex),
-                    lambda t=nb_ticker, r15=nb_15, r1=nb_1d, fl=abs(delta) <= 2:
+                    lambda t=nb_ticker, r15=nb_15, r1=nb_1d, fl=abs(delta) <= 2, ctx=_chart_ctx:
                         _warm_pair_caches(
                             t, sym_ex, ccxt_id, r15, r1,
                             limit_15m, limit_1d, atr_days, fl,
+                            chart_ctx=ctx,
                         ),
                 )
             _set_live_target([p for p in live_pairs if p["db"]])

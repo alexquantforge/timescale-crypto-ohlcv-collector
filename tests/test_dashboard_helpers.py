@@ -492,18 +492,20 @@ def test_stitch_candle_gaps_tail_disabled():
 # ---------------------------------------------------------------------------
 
 
-def _build_chart_html(with_volume=False, poller="POLLER_STUB();"):
+def _build_chart_html(with_volume=False, poller="POLLER_STUB();", history=""):
     import json as _json
     from dashboard.helpers import build_lightweight_chart_html
 
-    candles = [{"time": 1000, "open": 1.0, "high": 1.2, "low": 0.9, "close": 1.1}]
-    vol = [{"time": 1000, "value": 10.0, "color": "rgba(38,166,154,0.5)"}]
+    # payloads are COMPACT ARRAYS: candles [ts,o,h,l,c], volume [ts,value,dir]
+    candles = [[1000, 1.0, 1.2, 0.9, 1.1]]
+    vol = [[1000, 10.0, 1]]
     return build_lightweight_chart_html(
         candles_json=_json.dumps(candles),
         volume_json=_json.dumps(vol) if with_volume else None,
         chart_height=470,
         chart_style="OHLCV Bars",
         live_poller_js=poller,
+        history_loader_js=history,
     )
 
 
@@ -546,3 +548,80 @@ def test_chart_html_volume_optional():
     on = _build_chart_html(with_volume=True)
     assert "const volumeData =" in on
     assert "volumeSeries.setData(volumeData)" in on
+    assert "allVolume = volumeData;" in on
+
+
+def test_chart_html_maps_compact_arrays_and_tracks_all_candles():
+    """Payloads are compact arrays remapped to objects in JS; `allCandles` /
+    `allVolume` aliases exist for the infinite-history loader to prepend into."""
+    html = _build_chart_html()
+    assert "const candlesData = (" in html
+    assert ".map(function(r){ return { time: r[0], open: r[1], high: r[2], low: r[3], close: r[4] }; });" in html
+    assert "let allCandles = candlesData;" in html
+    assert "let allVolume = null;" in html
+    assert "UP_VOL_COLOR" in html and "DN_VOL_COLOR" in html
+
+
+def test_build_series_arrays_shape_rounding_and_volume_dir():
+    from dashboard.helpers import build_series_arrays
+
+    df = pd.DataFrame({
+        "ts": [1000, 1900],
+        "open": [1.234567890123, 2.0],
+        "high": [1.5, 2.5],
+        "low": [1.0, 1.5],
+        "close": [1.4, 1.8],
+        "volume": [12345.678, float("nan")],
+    })
+    candles, vol = build_series_arrays(df, with_volume=True)
+    assert candles == [[1000, 1.23456789, 1.5, 1.0, 1.4], [1900, 2.0, 2.5, 1.5, 1.8]]
+    # volume: [ts, rounded value, dir (+1 up / -1 down)], NaN -> 0
+    assert vol == [[1000, 12345.68, 1], [1900, 0.0, -1]]
+    candles_nv, vol_nv = build_series_arrays(df, with_volume=False)
+    assert vol_nv is None and candles_nv == candles
+
+
+def test_rows_to_compact_candles_sanitizes_and_sorts():
+    from dashboard.helpers import rows_to_compact_candles
+
+    now = 1_786_100_000
+    rows = [
+        {"ts": now - 900, "open": 2, "high": 3, "low": 1, "close": 2.5, "volume": 10.005},
+        {"ts": (now - 1800) * 1000, "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": None},  # ms epoch
+        {"ts": 800_000_000, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},  # pre-2013 garbage
+        {"ts": now + 10 * 86400, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},  # future garbage
+    ]
+    out = rows_to_compact_candles(rows, now_sec=now)
+    assert [r[0] for r in out] == [now - 1800, now - 900]  # ascending, ms converted
+    assert out[0][1:5] == [1.0, 2.0, 0.5, 1.5]
+    assert out[0][5] == 0.0       # None volume -> 0
+    assert out[1][5] == 10.01     # rounded to 2 decimals
+    assert rows_to_compact_candles([], now_sec=now) == []
+    assert rows_to_compact_candles(None, now_sec=now) == []
+
+
+def test_build_history_loader_js_requires_endpoint_bits():
+    from dashboard.helpers import build_history_loader_js
+
+    assert build_history_loader_js(None, "t_on_x", 900, 8512) == ""
+    assert build_history_loader_js("db", None, 900, 8512) == ""
+    assert build_history_loader_js("db", "t_on_x", 900, None) == ""
+
+
+def test_build_history_loader_js_content():
+    from dashboard.helpers import build_history_loader_js
+
+    js = build_history_loader_js("ohlcv15m", "ada_usdt_on_bybit", 900, 8512, chunk=1200)
+    assert "subscribeVisibleLogicalRangeChange" in js
+    assert "const PORT = 8512;" in js
+    assert "/candles?db=ohlcv15m&table=ada_usdt_on_bybit" in js
+    assert "const CHUNK = 1200;" in js
+    assert "exhausted = true;" in js  # stops fetching at the start of history
+    assert "olderC.concat(allCandles)" in js  # prepends older chunk
+
+
+def test_chart_html_injects_history_loader():
+    html = _build_chart_html(history="HISTORY_STUB();")
+    assert "HISTORY_STUB();" in html
+    off = _build_chart_html()
+    assert "HISTORY_STUB" not in off
