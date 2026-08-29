@@ -2,6 +2,7 @@
 Data Repository layer for individual symbol tables in the 4 historical TimescaleDB databases.
 Supports table migration (move_table) and cleanup (drop_table, cleanup_invalid_bitget_tables).
 """
+import datetime
 import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -11,7 +12,12 @@ import pandas as pd
 from pytz import timezone as pytz_timezone
 
 from config.settings import settings
-from src.core.history_prefill import normalize_epoch_sec
+
+# NOTE: src.core.history_prefill is imported LAZILY inside find_table().
+# A module-level import creates a cycle: repository -> src.core/__init__
+# (eagerly imports src.core.updater) -> updater -> back to this module while
+# it is still half-initialized -> ImportError, whenever THIS package is the
+# first entry point. Importing inside the function breaks the cycle.
 
 logger = logging.getLogger("repository")
 MSK_TZ = pytz_timezone("Europe/Moscow")
@@ -98,6 +104,9 @@ class HistoricalMarketRepository:
                     )
                     raw_mx = int(row["mx"]) if row and row["mx"] else 0
                     raw_mn = int(row["mn"]) if row and row["mn"] else 0
+                    # lazy import — see NOTE at the top of this module (import cycle)
+                    from src.core.history_prefill import normalize_epoch_sec
+
                     mx = normalize_epoch_sec(raw_mx) or 0
                     mn = normalize_epoch_sec(raw_mn) or 0
                     if (raw_mx and raw_mx != mx) or (raw_mn and raw_mn != mn):
