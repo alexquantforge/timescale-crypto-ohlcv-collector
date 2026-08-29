@@ -51,6 +51,8 @@ from dashboard.helpers import (
     build_live_poller_js,
     build_history_loader_js,
     build_lightweight_chart_html,
+    build_metric_chart_html,
+    sanitize_metric_points,
     HIST_STATUS_HEIGHT,
     build_series_arrays,
     find_missing_bucket_ranges,
@@ -253,6 +255,34 @@ def load_candles_cached(db_host, db_port, db_user, db_pass, db_name: str, table_
     except Exception as e:
         st.warning(f"Could not load candles for {table_name}: {e}")
         return pd.DataFrame()
+
+
+async def _fetch_metric_points(db_name, table_name, column, db_host, db_port, db_user, db_pass) -> list:
+    conn = await asyncpg.connect(
+        host=db_host, port=db_port, user=db_user, password=db_pass,
+        database=db_name, timeout=15,
+    )
+    try:
+        rows = await conn.fetch(
+            f'SELECT "Timestamp" AS ts, "{column}" AS v FROM "{table_name}" '
+            f'WHERE "{column}" IS NOT NULL ORDER BY "Timestamp" ASC LIMIT 200000'
+        )
+    finally:
+        await conn.close()
+    return sanitize_metric_points(((r["ts"], r["v"]) for r in rows), int(time.time()))
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def metric_points_cached(db_host, db_port, db_user, db_pass, db_name, table_name, column):
+    """Full OI/funding history of a pair for the panels under the charts.
+    [] (not an error) while the table or column does not exist — the engines
+    add them lazily on first write."""
+    try:
+        return asyncio.run(
+            _fetch_metric_points(db_name, table_name, column, db_host, db_port, db_user, db_pass)
+        )
+    except Exception:
+        return []
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1816,6 +1846,71 @@ with tab_charts:
         with c1d:
             _slim_header("📅", "1D")
             render_chart(row_1d, "1D", limit_1d, "D", chart_height=430)
+
+    # --- Open Interest & Funding Rate history (perpetuals only) ------------
+    # Line panels under the two candle charts: OI points accumulate per engine
+    # cycle (dense, from the 15m table); the funding line is the realized
+    # event history backfilled once per table (deep, from the 1D table —
+    # day's last 8h event). Whatever the collectors managed to download shows.
+    if not demo_mode and ":" in sym_ticker and (row_15m is not None or row_1d is not None):
+        oi_points = []
+        fr_points = []
+        if row_15m is not None:
+            oi_points = metric_points_cached(
+                db_host, db_port, db_user, db_pass,
+                row_15m["db_name"], row_15m["table_name"], "open_interest",
+            )
+        if row_1d is not None:
+            fr_points = metric_points_cached(
+                db_host, db_port, db_user, db_pass,
+                row_1d["db_name"], row_1d["table_name"], "funding_rate",
+            )
+
+        def _span(points) -> str:
+            if not points:
+                return "точек пока нет"
+            f = time.strftime("%Y-%m-%d", time.localtime(points[0][0]))
+            t = time.strftime("%Y-%m-%d", time.localtime(points[-1][0]))
+            return f"{len(points)} точек · {f} → {t}"
+
+        st.markdown("---")
+        st.markdown("#### 📊 Open Interest & Funding Rate")
+        if not oi_points and not fr_points:
+            st.caption(
+                "Пока пусто — OI копится с каждого цикла 15m-движка, история "
+                "funding появляется после разового бэкфилла при его старте."
+            )
+        else:
+            _dumps = lambda x: json.dumps(x, separators=(",", ":"))
+            c_oi, c_fr = st.columns(2)
+            with c_oi:
+                st.markdown(
+                    f"<div style='font-size:12px;color:#808495;margin:0 0 2px 4px'>"
+                    f"🔵 Open Interest · {_span(oi_points)} · 15m table</div>",
+                    unsafe_allow_html=True,
+                )
+                if oi_points:
+                    _html_component(
+                        build_metric_chart_html(
+                            _dumps(oi_points), f"OI {sym_ticker} · {sym_ex}",
+                            "#4c9aff", 230, precision=2, min_move=0.01,
+                        ),
+                        240,
+                    )
+            with c_fr:
+                st.markdown(
+                    f"<div style='font-size:12px;color:#808495;margin:0 0 2px 4px'>"
+                    f"🟣 Funding Rate · {_span(fr_points)} · 1D (last 8h event of the day)</div>",
+                    unsafe_allow_html=True,
+                )
+                if fr_points:
+                    _html_component(
+                        build_metric_chart_html(
+                            _dumps(fr_points), f"Funding {sym_ticker} · {sym_ex}",
+                            "#a26bff", 230, precision=6, min_move=0.000001,
+                        ),
+                        240,
+                    )
 
     # --- Live market & orderbook metrics (below charts, never blocks them) ---
     st.markdown("---")

@@ -678,3 +678,42 @@ def test_hist_status_badge_sits_below_chart_not_on_time_axis():
     )
     assert f"height: {HIST_STATUS_HEIGHT}px" in html
     assert "position: absolute" not in html.split("#hist-status", 1)[1].split("}}", 1)[0]
+
+
+# ------------------------------------------------ metric panels (OI/funding)
+
+def test_sanitize_metric_points_normalizes_and_filters():
+    from dashboard.helpers import sanitize_metric_points
+
+    rows = [
+        (1_756_000_000_000, 1.5),          # ms epoch -> seconds
+        (946_684_799, 2.0),                # 1999 -> junk floor, dropped
+        (1_755_999_900, None),             # None value -> dropped
+        (None, 3.0),                       # None ts -> dropped
+        (1_800_000_000, 4.0),              # far future -> dropped
+        (1_755_999_000, 0.5),              # valid, sorts first
+    ]
+    got = sanitize_metric_points(rows, now_sec=1_756_000_000)
+    assert got == [[1_755_999_000, 0.5], [1_756_000_000, 1.5]]
+
+
+def test_build_metric_chart_html_renders_line_series():
+    from dashboard.helpers import build_metric_chart_html
+
+    html = build_metric_chart_html(
+        "[[1700000000,0.0001],[1700028800,-0.0003]]",
+        "Funding BTC/USDT:USDT · bybit", "#a26bff", 230,
+        precision=6, min_move=0.000001,
+    )
+    assert "addLineSeries" in html
+    assert "1700028800" in html
+    assert "#a26bff" in html
+    assert "precision: 6" in html
+    assert "Funding BTC/USDT:USDT" in html
+
+
+def test_build_metric_chart_html_empty_series_safe():
+    from dashboard.helpers import build_metric_chart_html
+
+    html = build_metric_chart_html("[]", "OI X", "#4c9aff", 230)
+    assert "addLineSeries" in html and "const points = [];" in html

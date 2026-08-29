@@ -1070,3 +1070,95 @@ def stitch_candle_gaps(
         .reset_index(drop=True)
     )
     return merged, len(add_df)
+
+
+def build_metric_chart_html(
+    points_json: str,
+    title: str,
+    color: str,
+    chart_height: int,
+    precision: int = 2,
+    min_move: float = 0.01,
+) -> str:
+    """Self-contained Lightweight-Charts LINE page for a scalar metric series
+    (open interest / funding rate) rendered under the main candle charts.
+
+    Pure string builder (unit-testable without streamlit). `points_json` is a
+    compact array of [epoch_sec, value] pairs — same transport shape as the
+    candle payloads. Shows the whole stored history of the metric ("as much as
+    was collected"); an empty series still renders a proper empty chart with
+    the title so panels never collapse visually.
+    """
+    import json as _json
+
+    safe_title = _json.dumps(str(title))
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+        <style>
+            body {{ margin: 0; padding: 0; background-color: #131722; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; }}
+            #metric-chart {{ width: 100%; height: {chart_height}px; position: relative; }}
+            #legend {{ position: absolute; top: 6px; left: 10px; z-index: 3; font-size: 12px;
+                       color: #d1d4dc; pointer-events: none; opacity: 0.9; }}
+        </style>
+    </head>
+    <body>
+        <div id="metric-chart"></div>
+        <div id="legend">{title}</div>
+        <script>
+            const points = {points_json};
+            const legendEl = document.getElementById('legend');
+            const baseTitle = {safe_title};
+            const chart = LightweightCharts.createChart(document.getElementById('metric-chart'), {{
+                height: {chart_height},
+                layout: {{ background: {{ color: '#131722' }}, textColor: '#d1d4dc' }},
+                grid: {{ vertLines: {{ color: '#1e222d' }}, horzLines: {{ color: '#1e222d' }} }},
+                timeScale: {{ borderColor: '#2a2e39', timeVisible: true, secondsVisible: false }},
+                rightPriceScale: {{ borderColor: '#2a2e39' }},
+                crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }},
+            }});
+            const series = chart.addLineSeries({{
+                color: '{color}',
+                lineWidth: 2,
+                priceFormat: {{ type: 'price', precision: {int(precision)}, minMove: {float(min_move)} }},
+            }});
+            const data = points.map(function(r) {{ return {{ time: r[0], value: r[1] }}; }});
+            series.setData(data);
+            chart.timeScale().fitContent();
+            function fmt(v) {{ return v.toLocaleString('en-US', {{ maximumFractionDigits: {int(precision)} }}); }}
+            if (data.length) {{
+                legendEl.textContent = baseTitle + ' · ' + fmt(data[data.length - 1].value);
+            }}
+            chart.subscribeCrosshairMove(function(param) {{
+                if (!param.time || !param.seriesData) {{ legendEl.textContent = baseTitle; return; }}
+                const d = param.seriesData.get(series);
+                if (d && d.value !== undefined) legendEl.textContent = baseTitle + ' · ' + fmt(d.value);
+            }});
+            new ResizeObserver(function() {{
+                chart.applyOptions({{ width: document.getElementById('metric-chart').clientWidth }});
+            }}).observe(document.getElementById('metric-chart'));
+        </script>
+    </body>
+    </html>
+    """
+
+
+def sanitize_metric_points(rows, now_sec: int) -> list:
+    """[epoch_sec, value] pairs from raw metric rows (OI / funding): ms→s
+    normalization, None filtering, and dropping of pre-2010 / future
+    timestamps — junk-min tables (the 1983 ZINC glitch) must not stretch the
+    panel's x-axis across decades."""
+    out = []
+    for ts, v in rows:
+        if ts is None or v is None:
+            continue
+        ts = int(ts)
+        if ts > 1e11:
+            ts //= 1000
+        if ts < 1262304000 or ts > now_sec + 900:  # 2010-01-01 .. now+15m
+            continue
+        out.append([ts, float(v)])
+    out.sort(key=lambda p: p[0])
+    return out
