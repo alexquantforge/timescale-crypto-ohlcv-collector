@@ -27,6 +27,12 @@ from src.core.history_prefill import (
     prefill_page_since_ms,
     should_attempt_prefill,
 )
+from src.core.oi_funding import (
+    backfill_funding_history,
+    fetch_oi_funding_snapshot,
+    warn_once as oi_funding_warn_once,
+    write_oi_funding_snapshot,
+)
 from src.exchanges.symbol_selector import get_exchange_url, get_swap_url
 from pytz import timezone as pytz_timezone
 
@@ -1246,6 +1252,27 @@ async def process_pair(exchange, symbol, ccxt_id):
                     )
                 elif DEBUG_ORDERBOOK:
                     log(f"    ⚠️ [OB] {symbol}: orderbook snapshot error: {e_ob}")
+
+        # --- Open Interest & Funding Rate (perpetuals only) ---
+        if settings.collect_oi_funding and current_db and ":" in symbol:
+            try:
+                snap = await fetch_oi_funding_snapshot(exchange, symbol, ccxt_id)
+                await write_oi_funding_snapshot(db_pools[current_db], tbl, snap)
+                if settings.funding_history_backfill:
+                    await backfill_funding_history(
+                        exchange,
+                        db_pools[current_db],
+                        tbl,
+                        symbol,
+                        ccxt_id,
+                        since_ts=download_min_ts,
+                        max_pages=settings.funding_history_max_pages,
+                    )
+            except Exception as e_oi:
+                oi_funding_warn_once(
+                    ccxt_id, symbol,
+                    f"OI/funding collect failed ({type(e_oi).__name__}: {e_oi})",
+                )
 
         return len(cs), total_bars, gaps_found, gaps_filled
     except (ccxt.BadSymbol, ccxt.SymbolNotFound) as e:

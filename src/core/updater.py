@@ -15,6 +15,12 @@ from config.settings import settings
 from src.analytics.atr_filtered import compute_atr_no_paranormal_bars
 from src.analytics.orderbook import fetch_orderbook_snapshot
 from src.core.progress import GlobalProgress
+from src.core.oi_funding import (
+    backfill_funding_history,
+    fetch_oi_funding_snapshot,
+    warn_once as oi_funding_warn_once,
+    write_oi_funding_snapshot,
+)
 from src.utils.timeouts import hard_wait_for
 from src.db.connection import get_db_pools, close_all_db_pools
 from src.core.history_prefill import (
@@ -54,6 +60,15 @@ def _lookback_floor_ms_1d(ccxt_id: str) -> Optional[int]:
     if not days:
         return None
     return (int(time.time()) - int(days) * 86400) * 1000
+
+
+def _funding_backfill_since_ts_1d() -> int:
+    """Epoch-sec start of the funding-history import window for 1D tables."""
+    return int(
+        datetime.datetime.strptime(settings.backfill_start_date, "%Y-%m-%d")
+        .replace(tzinfo=datetime.timezone.utc)
+        .timestamp()
+    )
 
 
 def _candles_df_from_rows(cs, symbol: str, ccxt_id: str) -> pd.DataFrame:
@@ -654,6 +669,29 @@ class MarketDataEngine:
                         )
                     else:
                         logger.debug(f"Orderbook snapshot error for {symbol}: {e}")
+
+            # --- Open Interest & Funding Rate (perpetuals only) ---
+            if settings.collect_oi_funding and current_db and ":" in symbol:
+                try:
+                    pool = (getattr(self.repository, "pools", None) or {}).get(current_db)
+                    if pool:
+                        snap = await fetch_oi_funding_snapshot(exchange, symbol, ccxt_id)
+                        await write_oi_funding_snapshot(pool, tbl_name, snap)
+                        if settings.funding_history_backfill:
+                            await backfill_funding_history(
+                                exchange,
+                                pool,
+                                tbl_name,
+                                symbol,
+                                ccxt_id,
+                                since_ts=_funding_backfill_since_ts_1d(),
+                                max_pages=settings.funding_history_max_pages,
+                            )
+                except Exception as e_oi:
+                    oi_funding_warn_once(
+                        ccxt_id, symbol,
+                        f"OI/funding collect failed ({type(e_oi).__name__}: {e_oi})",
+                    )
 
             return len(cs)
         except asyncio.TimeoutError:

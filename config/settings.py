@@ -163,6 +163,11 @@ class Settings(BaseSettings):
     check_and_fill_gaps: bool = Field(default=True, alias="CHECK_AND_FILL_GAPS")
     gap_tolerance_sec_15m: int = Field(default=1800, alias="GAP_TOLERANCE_SEC_15M")  # 30 min tolerance
 
+    # Open Interest & Funding Rate (perpetual contracts only — symbols with ':')
+    collect_oi_funding: bool = Field(default=True, alias="COLLECT_OI_FUNDING")
+    funding_history_backfill: bool = Field(default=True, alias="FUNDING_HISTORY_BACKFILL")
+    funding_history_max_pages: int = Field(default=100, alias="FUNDING_HISTORY_MAX_PAGES")  # 100 pages x 100 events ≈ 9y of 8h fundings
+
     # Orderbook Analytics
     collect_orderbook: bool = Field(default=True, alias="COLLECT_ORDERBOOK")
     debug_orderbook: bool = Field(default=False, alias="DEBUG_ORDERBOOK")
