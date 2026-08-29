@@ -255,3 +255,13 @@ def test_exchange_filter_defaults_include_gateio(app_test):
     ms = [m for m in app_test.multiselect if m.label == "🌐 Exchanges"]
     assert len(ms) == 1, "expected exactly one exchange multiselect in the sidebar"
     assert set(ms[0].value) >= {"bybit", "gateio", "okx", "mexc"}
+
+
+def test_spread_history_panel_wired():
+    """The under-charts metric section must include the orderbook spread line
+    (ob_spread_pct) for every pair, next to the perp-only OI/funding panels."""
+    with open(APP_FILE, encoding="utf-8") as fh:
+        src = fh.read()
+    assert '"ob_spread_pct"' in src
+    assert "Spread History" in src
+    assert "🟠 Spread %" in src

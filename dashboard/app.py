@@ -1847,24 +1847,34 @@ with tab_charts:
             _slim_header("📅", "1D")
             render_chart(row_1d, "1D", limit_1d, "D", chart_height=430)
 
-    # --- Open Interest & Funding Rate history (perpetuals only) ------------
-    # Line panels under the two candle charts: OI points accumulate per engine
-    # cycle (dense, from the 15m table); the funding line is the realized
-    # event history backfilled once per table (deep, from the 1D table —
-    # day's last 8h event). Whatever the collectors managed to download shows.
-    if not demo_mode and ":" in sym_ticker and (row_15m is not None or row_1d is not None):
+    # --- Open Interest, Funding Rate & Spread history ----------------------
+    # Line panels under the two candle charts. OI points accumulate per engine
+    # cycle (15m table); funding is the realized 8h-event history backfilled
+    # once per table (1D table, day's last event); spread comes from the
+    # per-cycle orderbook snapshots (ob_spread_pct) — collected for BOTH perps
+    # and spot, so the section works for spot pairs too (spread panel only).
+    if not demo_mode and (row_15m is not None or row_1d is not None):
+        _dense_row = row_15m or row_1d          # per-cycle snapshot history
+        _is_perp = ":" in sym_ticker
         oi_points = []
         fr_points = []
-        if row_15m is not None:
-            oi_points = metric_points_cached(
+        spread_points = []
+        if _dense_row is not None:
+            spread_points = metric_points_cached(
                 db_host, db_port, db_user, db_pass,
-                row_15m["db_name"], row_15m["table_name"], "open_interest",
+                _dense_row["db_name"], _dense_row["table_name"], "ob_spread_pct",
             )
-        if row_1d is not None:
-            fr_points = metric_points_cached(
-                db_host, db_port, db_user, db_pass,
-                row_1d["db_name"], row_1d["table_name"], "funding_rate",
-            )
+        if _is_perp:
+            if row_15m is not None:
+                oi_points = metric_points_cached(
+                    db_host, db_port, db_user, db_pass,
+                    row_15m["db_name"], row_15m["table_name"], "open_interest",
+                )
+            if row_1d is not None:
+                fr_points = metric_points_cached(
+                    db_host, db_port, db_user, db_pass,
+                    row_1d["db_name"], row_1d["table_name"], "funding_rate",
+                )
 
         def _span(points) -> str:
             if not points:
@@ -1873,44 +1883,47 @@ with tab_charts:
             t = time.strftime("%Y-%m-%d", time.localtime(points[-1][0]))
             return f"{len(points)} точек · {f} → {t}"
 
+        _panels = []
+        if _is_perp:
+            _panels.append(("🔵 Open Interest", oi_points, f"OI {sym_ticker} · {sym_ex}",
+                            "#4c9aff", 2, 0.01, "15m table"))
+            _panels.append(("🟣 Funding Rate", fr_points, f"Funding {sym_ticker} · {sym_ex}",
+                            "#a26bff", 6, 0.000001, "1D (last 8h event of the day)"))
+        _panels.append(("🟠 Spread %", spread_points, f"Spread % {sym_ticker} · {sym_ex}",
+                        "#ff9f43", 4, 0.0001, "orderbook snapshots"))
+        _have_data = any(p[1] for p in _panels)
+
         st.markdown("---")
-        st.markdown("#### 📊 Open Interest & Funding Rate")
-        if not oi_points and not fr_points:
+        st.markdown("#### 📊 Open Interest & Funding Rate" if _is_perp else "#### 📊 Spread History")
+        if not _have_data:
             st.caption(
                 "Пока пусто — OI копится с каждого цикла 15m-движка, история "
-                "funding появляется после разового бэкфилла при его старте."
+                "funding появляется после разового бэкфилла при его старте, "
+                "спред — из периодических снапшотов стакана (обе записи — "
+                "несколько циклов после рестарта движков)."
+                if _is_perp else
+                "Пока пусто — спред копится из снапшотов стакана в первые "
+                "циклы после рестарта движков."
             )
         else:
             _dumps = lambda x: json.dumps(x, separators=(",", ":"))
-            c_oi, c_fr = st.columns(2)
-            with c_oi:
-                st.markdown(
-                    f"<div style='font-size:12px;color:#808495;margin:0 0 2px 4px'>"
-                    f"🔵 Open Interest · {_span(oi_points)} · 15m table</div>",
-                    unsafe_allow_html=True,
-                )
-                if oi_points:
-                    _html_component(
-                        build_metric_chart_html(
-                            _dumps(oi_points), f"OI {sym_ticker} · {sym_ex}",
-                            "#4c9aff", 230, precision=2, min_move=0.01,
-                        ),
-                        240,
+            for _col, (_label, _pts, _title, _color, _prec, _mm, _src) in zip(
+                st.columns(len(_panels)), _panels
+            ):
+                with _col:
+                    st.markdown(
+                        f"<div style='font-size:12px;color:#808495;margin:0 0 2px 4px'>"
+                        f"{_label} · {_span(_pts)} · {_src}</div>",
+                        unsafe_allow_html=True,
                     )
-            with c_fr:
-                st.markdown(
-                    f"<div style='font-size:12px;color:#808495;margin:0 0 2px 4px'>"
-                    f"🟣 Funding Rate · {_span(fr_points)} · 1D (last 8h event of the day)</div>",
-                    unsafe_allow_html=True,
-                )
-                if fr_points:
-                    _html_component(
-                        build_metric_chart_html(
-                            _dumps(fr_points), f"Funding {sym_ticker} · {sym_ex}",
-                            "#a26bff", 230, precision=6, min_move=0.000001,
-                        ),
-                        240,
-                    )
+                    if _pts:
+                        _html_component(
+                            build_metric_chart_html(
+                                _dumps(_pts), _title, _color, 230,
+                                precision=_prec, min_move=_mm,
+                            ),
+                            240,
+                        )
 
     # --- Live market & orderbook metrics (below charts, never blocks them) ---
     st.markdown("---")
