@@ -254,7 +254,9 @@ async def init_db_pools():
             password=settings.db_password,
             database=db,
             min_size=2,
-            max_size=10,
+            # Respect the global low-resource knob (DB_MAX_POOL_SIZE); floor of
+            # 2 keeps min_size <= max_size valid.
+            max_size=max(2, settings.db_max_pool_size),
         )
     log("✓ DB pools initialized for 15M")
 
@@ -322,7 +324,9 @@ async def move_table(table_name, from_db, to_db):
         await fc2.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')
 
 
-async def delete_old_data_from_db(pool: asyncpg.Pool, db_name: str) -> int:
+async def delete_old_data_from_db(pool: asyncpg.Pool, db_name: str) -> Tuple[int, List[str]]:
+    """Deletes rows older than the retention window; returns (rows_deleted,
+    names of tables that actually lost rows)."""
     cutoff_ts = get_cutoff_timestamp()
     cutoff_date = datetime.datetime.now(
         datetime.timezone.utc
@@ -334,6 +338,7 @@ async def delete_old_data_from_db(pool: asyncpg.Pool, db_name: str) -> int:
     )
 
     total_deleted = 0
+    affected: List[str] = []
     async with pool.acquire() as conn:
         tables = await conn.fetch(
             "SELECT table_name FROM information_schema.tables "
@@ -350,34 +355,70 @@ async def delete_old_data_from_db(pool: asyncpg.Pool, db_name: str) -> int:
                 if deleted and deleted != "DELETE 0":
                     try:
                         deleted_count = int(deleted.split()[1])
-                        total_deleted += deleted_count
+                        if deleted_count > 0:
+                            total_deleted += deleted_count
+                            affected.append(tbl)
                     except (IndexError, ValueError):
                         pass
             except asyncpg.PostgresError as e:
                 logger.warning(f"  ⚠️  [{db_name}] {tbl}: error during delete — {e}")
 
     logger.info(f"  ✅ [{db_name}] Deletion finished: {total_deleted} old records removed")
-    return total_deleted
+    return total_deleted, affected
+
+
+# Wall-clock latch limiting retention maintenance to the configured cadence.
+_LAST_MAINTENANCE_AT = 0.0
 
 
 async def run_maintenance() -> None:
+    global _LAST_MAINTENANCE_AT
+    interval_sec = settings.maintenance_interval_hours * 3600
+    now = time.time()
+    if _LAST_MAINTENANCE_AT and now - _LAST_MAINTENANCE_AT < interval_sec:
+        logger.debug(
+            f"⏭️  [15M] maintenance skipped — last run "
+            f"{(now - _LAST_MAINTENANCE_AT) / 3600:.1f}h ago "
+            f"(< {settings.maintenance_interval_hours}h)"
+        )
+        return
+    # Latch BEFORE the work: an interrupted/killed maintenance retries next
+    # day instead of re-running full scans in a hot every-cycle loop.
+    _LAST_MAINTENANCE_AT = now
+
     logger.info("=" * 60)
-    logger.info("🔧 RUNNING DATABASE MAINTENANCE (15M)")
+    logger.info(
+        f"🔧 RUNNING DATABASE MAINTENANCE (15M) — cadence "
+        f"{settings.maintenance_interval_hours}h"
+    )
     logger.info("=" * 60)
 
     total_deleted = 0
+    affected_per_db: Dict[str, List[str]] = {}
     for db_name, pool in db_pools.items():
         try:
-            deleted = await delete_old_data_from_db(pool, db_name)
+            deleted, affected = await delete_old_data_from_db(pool, db_name)
             total_deleted += deleted
+            affected_per_db[db_name] = affected
         except Exception as e:
             logger.warning(f"  ⚠️  [{db_name}] Error deleting old data: {e}")
+            affected_per_db[db_name] = []
 
     for db_name, pool in db_pools.items():
+        affected = affected_per_db.get(db_name) or []
+        if not affected:
+            # Steady state deletes nothing → no manual VACUUM at all; the
+            # stock autovacuum daemon owns routine cleanup. A whole-database
+            # `VACUUM;` here ran after EVERY 5-minute cycle, scanned all
+            # hypertables and saturated disk 24/7 (single backend observed at
+            # 4.3 GB RSS, state D — that was the laptop stutter).
+            logger.info(f"  ⏭️  [{db_name}] VACUUM skipped — no old rows deleted")
+            continue
         try:
             async with pool.acquire() as conn:
-                await conn.execute("VACUUM;")
-                logger.info(f"  ✅ [{db_name}] VACUUM completed")
+                for tbl in affected:
+                    await conn.execute(f'VACUUM "{tbl}";')
+            logger.info(f"  ✅ [{db_name}] VACUUM completed ({len(affected)} tables)")
         except Exception as e:
             logger.warning(f"  ⚠️  [{db_name}] VACUUM skipped: {e}")
 

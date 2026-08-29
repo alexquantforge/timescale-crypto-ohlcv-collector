@@ -65,6 +65,10 @@ class Settings(BaseSettings):
     timeframe: str = Field(default="1d", alias="TIMEFRAME")  # "1d" or "15m"
     data_retention_days: int = Field(default=180, alias="DATA_RETENTION_DAYS")  # 180 days retention for 15m
     update_days: int = Field(default=10, alias="UPDATE_DAYS")  # how many days back to fetch per update
+    # 15m retention cleanup cadence: a full-database VACUUM after every 5-minute
+    # cycle kept the disk saturated 24/7 — maintenance now runs at most this
+    # often, and VACUUM touches only tables that actually had rows deleted.
+    maintenance_interval_hours: int = Field(default=24, alias="MAINTENANCE_INTERVAL_HOURS")
 
     # Exchange Mapping for 1D (all 9 exchanges)
     exchange_map_1d: Dict[str, str] = {
