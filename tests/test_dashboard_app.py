@@ -247,3 +247,11 @@ def test_history_loader_url_roundtrips_colon_table():
     qs = parse_qs(urlparse(url).query)
     assert qs["table"] == ["pixel_usdt:usdt_on_bybit"]
     assert qs["db"] == ["db1"]
+
+
+def test_exchange_filter_defaults_include_gateio(app_test):
+    """The sidebar 🌐 Exchanges filter must default to Bybit + Gate.io + OKX + MEXC
+    (gateio added by user request — previously the default trio dropped it)."""
+    ms = [m for m in app_test.multiselect if m.label == "🌐 Exchanges"]
+    assert len(ms) == 1, "expected exactly one exchange multiselect in the sidebar"
+    assert set(ms[0].value) >= {"bybit", "gateio", "okx", "mexc"}

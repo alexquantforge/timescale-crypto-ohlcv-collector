@@ -1371,12 +1371,12 @@ _allowed_exs = settings.allowed_exchanges
 _exchange_options = (
     [e for e in _all_configured_exs if e in _allowed_exs] if _allowed_exs else _all_configured_exs
 )
-_default_exs = [e for e in ("bybit", "okx", "mexc") if e in _exchange_options]
+_default_exs = [e for e in ("bybit", "gateio", "okx", "mexc") if e in _exchange_options]
 enabled_exs = st.sidebar.multiselect(
     "🌐 Exchanges",
     options=_exchange_options,
     default=_default_exs,
-    help="Which exchanges the dashboard shows (charts, health strip, liquidity table). Default: Bybit / OKX / MEXC.",
+    help="Which exchanges the dashboard shows (charts, health strip, liquidity table). Default: Bybit / Gate.io / OKX / MEXC.",
 )
 
 st.sidebar.markdown("---")
