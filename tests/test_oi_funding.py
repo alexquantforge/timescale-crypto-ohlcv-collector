@@ -71,7 +71,7 @@ class FakeConn:
         self.executemany_calls = []  # (sql, rows)
 
     async def fetch(self, sql, *args):
-        return [{"column_name": c} for c in self._columns]
+        return [{"column_name": c, "data_type": "double precision"} for c in self._columns]
 
     async def fetchval(self, sql, *args):
         return self._max_funding_ts

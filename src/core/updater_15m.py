@@ -33,6 +33,11 @@ from src.core.oi_funding import (
     warn_once as oi_funding_warn_once,
     write_oi_funding_snapshot,
 )
+from src.db.repository import (
+    fetch_column_types,
+    pg_ddl_type,
+    repair_text_typed_columns,
+)
 from src.exchanges.symbol_selector import get_exchange_url, get_swap_url
 from pytz import timezone as pytz_timezone
 
@@ -309,9 +314,14 @@ async def move_table(table_name, from_db, to_db):
         rows = await fc.fetch(f'SELECT * FROM "{table_name}"')
         if not rows:
             return
+        # Real types from information_schema: the ALL_COLUMNS_SQL.get(k, "TEXT")
+        # fallback used to TEXT-ify every ob_*/oi column of a moved table, and
+        # numeric snapshot writes then died on `DataError: expected str, got
+        # float` (see ZINC/ZK @mexc in the logs) until repaired on next ensure.
+        col_types = await fetch_column_types(fc, table_name)
     async with db_pools[to_db].acquire() as tc:
         cols_sql = ", ".join(
-            [f'"{k}" {ALL_COLUMNS_SQL.get(k, "TEXT")}' for k in rows[0].keys()]
+            [f'"{k}" {pg_ddl_type(col_types.get(k))}' for k in rows[0].keys()]
         )
         await tc.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')
         await tc.execute(f'CREATE TABLE "{table_name}" ({cols_sql})')
@@ -677,16 +687,12 @@ async def fetch_orderbook_snapshot(
 
 
 async def ensure_orderbook_columns(conn, tbl: str) -> None:
-    existing = {
-        r["column_name"]
-        for r in await conn.fetch(
-            "SELECT column_name FROM information_schema.columns WHERE table_name=$1",
-            tbl,
-        )
-    }
+    col_types = await fetch_column_types(conn, tbl)
     for col, typ in ORDERBOOK_COLUMNS_SQL.items():
-        if col not in existing:
+        if col not in col_types:
             await conn.execute(f'ALTER TABLE "{tbl}" ADD COLUMN "{col}" {typ}')
+    # Self-heal tables TEXT-ified by an old HIGH↔LOW move (DataError storms).
+    await repair_text_typed_columns(conn, tbl, col_types, ORDERBOOK_COLUMNS_SQL, log=logger)
 
 
 async def save_orderbook_snapshot(

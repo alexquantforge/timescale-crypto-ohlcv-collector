@@ -45,21 +45,21 @@ _BF_DONE: Set[str] = set()   # funding-history backfill latch per table per run
 
 
 async def ensure_oi_funding_columns(conn: asyncpg.Connection, table_name: str) -> None:
-    """Adds the OI/funding columns once per table per process."""
+    """Adds the OI/funding columns once per table per process; also casts them
+    back from TEXT when an old HIGH↔LOW move garbled the types."""
     if table_name in _ENSURED:
         return
-    existing = {
-        r["column_name"]
-        for r in await conn.fetch(
-            "SELECT column_name FROM information_schema.columns WHERE table_name=$1",
-            table_name,
-        )
-    }
+    from src.db.repository import fetch_column_types, repair_text_typed_columns
+
+    col_types = await fetch_column_types(conn, table_name)
     for col, typ in OI_FUNDING_COLUMNS_SQL.items():
-        if col not in existing:
+        if col not in col_types:
             await conn.execute(
                 f'ALTER TABLE "{table_name}" ADD COLUMN "{col}" {typ}'
             )
+    await repair_text_typed_columns(
+        conn, table_name, col_types, OI_FUNDING_COLUMNS_SQL, log=logger
+    )
     _ENSURED.add(table_name)
 
 

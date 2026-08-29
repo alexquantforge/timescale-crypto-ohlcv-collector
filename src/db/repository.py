@@ -28,6 +28,94 @@ MSK_TZ = pytz_timezone("Europe/Moscow")
 # timeouts cannot help — and silently freezes the whole collector cycle.
 _ACQUIRE_TIMEOUT = 30.0
 
+# --------------------------------------------------------------------------
+# Column typing helpers (shared by move_table and the *_ensure_columns paths)
+# --------------------------------------------------------------------------
+# information_schema data_type -> DDL keyword used when (re)creating tables.
+_PG_TO_DDL = {
+    "bigint": "BIGINT",
+    "integer": "INTEGER",
+    "double precision": "DOUBLE PRECISION",
+    "real": "DOUBLE PRECISION",
+    "numeric": "NUMERIC",
+    "text": "TEXT",
+    "character varying": "TEXT",
+    "boolean": "BOOLEAN",
+    "timestamp without time zone": "TIMESTAMP",
+    "timestamp with time zone": "TIMESTAMPTZ",
+}
+
+# DDL types we can safely cast a TEXT column back to.
+_DDL_TO_CAST = {
+    "BIGINT": "bigint",
+    "INTEGER": "integer",
+    "DOUBLE PRECISION": "double precision",
+    "NUMERIC": "numeric",
+    # bool->text values are 'true'/'false' strings — cast back is lossless
+    "BOOLEAN": "boolean",
+}
+
+
+def pg_ddl_type(data_type: Optional[str]) -> str:
+    """information_schema data_type -> DDL keyword (TEXT if unknown)."""
+    return _PG_TO_DDL.get((data_type or "").lower(), "TEXT")
+
+
+async def fetch_column_types(conn: asyncpg.Connection, table_name: str) -> Dict[str, str]:
+    """column_name -> DDL type for an existing table (information_schema is the
+    source of truth — dict-driven fallbacks are what TEXT-ified ob_* columns)."""
+    out: Dict[str, str] = {}
+    for r in await conn.fetch(
+        "SELECT column_name, data_type FROM information_schema.columns WHERE table_name=$1",
+        table_name,
+    ):
+        out[r["column_name"]] = r["data_type"]
+    return out
+
+
+async def repair_text_typed_columns(
+    conn: asyncpg.Connection,
+    table_name: str,
+    existing_types: Dict[str, str],
+    columns_sql: Dict[str, str],
+    log: Optional[logging.Logger] = None,
+) -> List[str]:
+    """Casts known numeric columns back from TEXT.
+
+    The HIGH<->LOW move_table used to rebuild tables with types looked up only
+    in ALL_COLUMNS_SQL and defaulting to TEXT — so every ob_*/oi_* column of a
+    moved table silently became TEXT, and each numeric snapshot write then died
+    on `DataError: invalid input for query argument $1: ... (expected str, got
+    float)`. Values under TEXT are still the pre-move numbers (writes after the
+    move failed, not corrupted), so a plain cast heals the table. ``log`` lets
+    engine modules report through their own logger; the repair is loud by
+    design.
+    """
+    lg = log or logger
+    repaired: List[str] = []
+    for col, typ in columns_sql.items():
+        pg_cast = _DDL_TO_CAST.get(typ)
+        if not pg_cast:
+            continue
+        if (existing_types.get(col) or "").lower() != "text":
+            continue
+        try:
+            await conn.execute(
+                f'ALTER TABLE "{table_name}" ALTER COLUMN "{col}" TYPE {typ} '
+                f"USING NULLIF(\"{col}\", '')::{pg_cast}"
+            )
+            repaired.append(col)
+            lg.warning(
+                f'🔧 [REPAIR] {table_name}: column "{col}" was TEXT after a '
+                f"HIGH↔LOW move — cast back to {typ}"
+            )
+        except Exception as e:
+            lg.warning(
+                f'⚠️ [REPAIR] {table_name}: column "{col}" left as TEXT — cast '
+                f"to {typ} failed ({type(e).__name__}: {e})"
+            )
+    return repaired
+
 ALL_COLUMNS_SQL = {
     "Timestamp": "BIGINT",
     "open": "DOUBLE PRECISION",
@@ -176,10 +264,15 @@ class HistoricalMarketRepository:
             rows = await fc.fetch(f'SELECT * FROM "{table_name}"')
             if not rows:
                 return
+            # Real column types from information_schema. The previous
+            # ALL_COLUMNS_SQL.get(k, "TEXT") fallback TEXT-ified every ob_*/oi
+            # column of a moved table — subsequent numeric writes then failed
+            # with `DataError: expected str, got float` until repaired.
+            col_types = await fetch_column_types(fc, table_name)
 
         async with to_pool.acquire(timeout=_ACQUIRE_TIMEOUT) as tc:
             cols_sql = ", ".join(
-                [f'"{k}" {ALL_COLUMNS_SQL.get(k, "TEXT")}' for k in rows[0].keys()]
+                [f'"{k}" {pg_ddl_type(col_types.get(k))}' for k in rows[0].keys()]
             )
             await tc.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')
             await tc.execute(f'CREATE TABLE "{table_name}" ({cols_sql})')
@@ -224,23 +317,21 @@ class HistoricalMarketRepository:
     async def _ensure_columns_on(
         self, conn: asyncpg.Connection, table_name: str
     ) -> None:
-        existing = {
-            r["column_name"]
-            for r in await conn.fetch(
-                "SELECT column_name FROM information_schema.columns WHERE table_name=$1",
-                table_name,
-            )
-        }
+        col_types = await fetch_column_types(conn, table_name)
         for col, typ in ALL_COLUMNS_SQL.items():
-            if col not in existing:
+            if col not in col_types:
                 await conn.execute(
                     f'ALTER TABLE "{table_name}" ADD COLUMN "{col}" {typ}'
                 )
         for col, typ in ORDERBOOK_COLUMNS_SQL.items():
-            if col not in existing:
+            if col not in col_types:
                 await conn.execute(
                     f'ALTER TABLE "{table_name}" ADD COLUMN "{col}" {typ}'
                 )
+        await repair_text_typed_columns(
+            conn, table_name, col_types,
+            {**ALL_COLUMNS_SQL, **ORDERBOOK_COLUMNS_SQL},
+        )
 
     async def create_table_if_not_exists(self, db_name: str, table_name: str) -> None:
         """Creates table_name in db_name with standard schema and TimescaleDB hypertable."""
