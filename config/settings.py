@@ -114,6 +114,11 @@ class Settings(BaseSettings):
     hard_floor_usd_15m: float = Field(default=125000.0, alias="HARD_FLOOR_USD_15M")  # $125k USD for 15m
     min_days_volume_check: int = Field(default=7, alias="MIN_DAYS_VOLUME_CHECK")
     concurrent_per_exchange: int = Field(default=5, alias="CONCURRENT_PER_EXCHANGE")
+    # Dashboard: how many neighbours EACH SIDE of the current pair get
+    # pre-warmed (candle loads + chart prebuilds) in background threads.
+    # On low-RAM machines (16 GB, local Postgres) these bursts stutter the
+    # whole desktop — set DASH_WARM_NEIGHBORS=0..2 to tame them. 5 = legacy.
+    dash_warm_neighbors: int = Field(default=5, alias="DASH_WARM_NEIGHBORS")
     update_interval_seconds_1d: int = Field(default=3600, alias="UPDATE_INTERVAL_SECONDS_1D")
     update_interval_seconds_15m: int = Field(default=300, alias="UPDATE_INTERVAL_SECONDS_15M")  # 5 minutes for 15m
 

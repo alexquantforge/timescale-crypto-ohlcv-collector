@@ -17,3 +17,10 @@ def test_allowed_exchanges_json():
 def test_allowed_exchanges_empty():
     st = Settings(ALLOWED_EXCHANGES="")
     assert st.allowed_exchanges == []
+
+
+def test_dash_warm_neighbors_default_and_alias():
+    st = Settings()
+    assert st.dash_warm_neighbors == 5
+    st2 = Settings(DASH_WARM_NEIGHBORS="0")
+    assert st2.dash_warm_neighbors == 0

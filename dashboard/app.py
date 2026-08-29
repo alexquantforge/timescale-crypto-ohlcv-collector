@@ -1920,6 +1920,8 @@ with tab_charts:
                 })
                 if delta == 0:
                     continue
+                if abs(delta) > settings.dash_warm_neighbors:
+                    continue  # low-resource mode: fewer background warm bursts
                 _bg(
                     ("pair", nb_ticker, sym_ex),
                     lambda t=nb_ticker, r15=nb_15, r1=nb_1d, fl=abs(delta) <= 2, ctx=_chart_ctx:
