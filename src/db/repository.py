@@ -542,8 +542,19 @@ class HistoricalMarketRepository:
 
             if not set_parts:
                 return
-            values.append(int(last_ts))
-            sql = f'UPDATE "{table_name}" SET {", ".join(set_parts)} WHERE "Timestamp" = ${idx}'
+            # Write to the latest TWO rows, not just one: every cycle's
+            # incremental refetch does `DELETE ... >= min_new_ts` + COPY, which
+            # recreates the freshest rows with NULL metrics — a snapshot on
+            # the max row alone is destroyed next cycle (that is why the OI /
+            # spread dashboards showed exactly 1 point forever). The
+            # second-newest (just-closed) row is outside the next cycle's
+            # refetch window and becomes the persisted history point.
+            sql = (
+                f'UPDATE "{table_name}" SET {", ".join(set_parts)} '
+                f'WHERE "Timestamp" IN ('
+                f'SELECT "Timestamp" FROM "{table_name}" '
+                f'ORDER BY "Timestamp" DESC LIMIT 2)'
+            )
             await conn.execute(sql, *values)
 
     async def check_volume_floor_and_move(

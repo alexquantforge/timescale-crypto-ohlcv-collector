@@ -74,6 +74,9 @@ def test_save_orderbook_snapshot_writes_msk_time_without_nameerror():
     assert updates, f"expected an UPDATE setting ob_snapshot_time_msk, got: {executed}"
     assert "ob_min_7d_volume_usd" in updates[0]
     assert "ob_extra_ignored" not in updates[0]
+    # history-persistence: snapshot must land on the two latest rows — the
+    # per-cycle DELETE+COPY refetch re-creates the max row with NULL metrics
+    assert 'ORDER BY "Timestamp" DESC LIMIT 2' in updates[0]
 
 
 def test_save_orderbook_snapshot_without_snap_still_ok():

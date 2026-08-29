@@ -1877,11 +1877,17 @@ with tab_charts:
                 )
 
         def _span(points) -> str:
-            if not points:
+            n = len(points)
+            if not n:
                 return "точек пока нет"
+            word = (
+                "точка" if n % 10 == 1 and n % 100 != 11
+                else "точки" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14
+                else "точек"
+            )
             f = time.strftime("%Y-%m-%d", time.localtime(points[0][0]))
             t = time.strftime("%Y-%m-%d", time.localtime(points[-1][0]))
-            return f"{len(points)} точек · {f} → {t}"
+            return f"{n} {word} · {f} → {t}"
 
         _panels = []
         if _is_perp:

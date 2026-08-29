@@ -748,8 +748,15 @@ async def save_orderbook_snapshot(
 
         if not set_parts:
             return
-        values.append(int(last_ts))
-        sql = f'UPDATE "{tbl}" SET {", ".join(set_parts)} WHERE "Timestamp" = ${idx}'
+        # Latest TWO rows (see repository.save_orderbook_snapshot): the
+        # per-cycle refetch wipes the freshest row's metrics, so the
+        # second-newest closed row is what actually persists as history.
+        sql = (
+            f'UPDATE "{tbl}" SET {", ".join(set_parts)} '
+            f'WHERE "Timestamp" IN ('
+            f'SELECT "Timestamp" FROM "{tbl}" '
+            f'ORDER BY "Timestamp" DESC LIMIT 2)'
+        )
         await conn.execute(sql, *values)
 
 

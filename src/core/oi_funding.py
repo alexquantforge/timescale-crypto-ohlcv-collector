@@ -119,9 +119,14 @@ async def write_oi_funding_snapshot(
     async with pool.acquire(timeout=ACQUIRE_TIMEOUT) as conn:
         await ensure_oi_funding_columns(conn, table_name)
         sets = ", ".join(f'"{col}" = ${i + 1}' for i, col in enumerate(snap))
+        # Latest TWO rows: the next cycle's refetch (DELETE+COPY of the fresh
+        # tail) re-creates the max row with NULLs, erasing a max-row-only
+        # snapshot — the just-closed second row is what survives as history.
         await conn.execute(
             f'UPDATE "{table_name}" SET {sets} '
-            f'WHERE "Timestamp" = (SELECT MAX("Timestamp") FROM "{table_name}")',
+            f'WHERE "Timestamp" IN ('
+            f'SELECT "Timestamp" FROM "{table_name}" '
+            f'ORDER BY "Timestamp" DESC LIMIT 2)',
             *snap.values(),
         )
 

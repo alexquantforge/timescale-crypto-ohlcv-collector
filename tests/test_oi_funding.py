@@ -141,7 +141,9 @@ def test_write_snapshot_alters_columns_once_and_updates_latest_row():
     assert len(alters) == 4  # second call latched by _ENSURED — no new DDL
     updates = [s for s, _ in conn.executed if s.startswith("UPDATE")]
     assert len(updates) == 2
-    assert 'SELECT MAX("Timestamp")' in updates[0]
+    # history-persistence: writes must cover the two latest rows, so the
+    # just-closed row keeps the metric after the next refetch wipes the max row
+    assert 'ORDER BY "Timestamp" DESC LIMIT 2' in updates[0]
 
 
 def test_ensure_columns_adds_only_missing():
