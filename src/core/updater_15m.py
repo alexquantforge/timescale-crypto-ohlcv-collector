@@ -41,7 +41,7 @@ from src.db.repository import (
 from src.exchanges.symbol_selector import get_exchange_url, get_swap_url
 from pytz import timezone as pytz_timezone
 
-from config.settings import settings
+from config.settings import Settings, settings
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -55,7 +55,23 @@ def log(msg: str):
 DB_HIGH = settings.db_high_15m
 DB_LOW = settings.db_low_15m
 
-ALLOWED_EXCHANGES = {"bybit", "gateio", "mexc", "okx", "bingx"}
+
+def _compute_allowed_15m_exchanges(
+    supported, allowed_raw: str, excluded_raw: str
+) -> set:
+    """
+    Which ccxt exchange ids the 15m engine may serve / may keep tables for:
+    start from the engine's supported set, keep only entries named by
+    ALLOWED_EXCHANGES (empty = keep all), then drop EXCLUDED_EXCHANGES.
+    Unknown entries in ALLOWED_EXCHANGES (e.g. bitget, kucoin — 1D-only) are
+    ignored here: the 1D engine still covers them.
+    """
+    supported = set(supported)
+    allowed = Settings._parse_exchange_list(allowed_raw)
+    excluded = Settings._parse_exchange_list(excluded_raw)
+    keep = {e for e in supported if not allowed or e in allowed}
+    return keep - {e for e in excluded if e in supported}
+
 
 EXCHANGE_MAP = {
     "bybit": "bybit",
@@ -64,6 +80,11 @@ EXCHANGE_MAP = {
     "okx": "okx",
     "bingx": "bingx",
 }
+
+# Derived from the maps above, so it must be defined after them.
+ALLOWED_EXCHANGES = _compute_allowed_15m_exchanges(
+    EXCHANGE_MAP.keys(), settings.allowed_exchanges_raw, settings.excluded_exchanges_raw
+)
 
 DELETE_NOT_ALLOWED_EXCHANGES_ON_START = settings.delete_not_allowed_exchange_tables_on_start
 HARD_FLOOR_USD = settings.hard_floor_usd_15m
@@ -296,7 +317,7 @@ async def find_table_in_dbs(table_name: str) -> Tuple[Optional[str], int, int]:
                 last_ts = normalize_epoch_sec(raw_max) if raw_max else None
                 min_ts = normalize_epoch_sec(raw_min) if raw_min else None
                 if (raw_max and raw_max != last_ts) or (raw_min and raw_min != min_ts):
-                    # Legacy epoch-ms rows poison catch-up ("+0 свечей вечно")
+                    # Legacy epoch-ms rows poison catch-up ("+0 candles forever")
                     # and history-prefill (absurd `since`) — repair the cursors.
                     log(
                         f"  [15M] ⚠️ [EPOCH-FIX] '{table_name}' in '{db}' stores Timestamp "
@@ -473,12 +494,30 @@ def get_exchange_from_table_name(table_name: str) -> str:
 
 
 async def drop_not_allowed_exchange_tables() -> None:
+    """
+    Startup cleanup for the 15m databases: tables of exchanges the engine will
+    NOT serve are dropped, because nothing will ever update them again and a
+    stale perp table silently poisons dashboard/delist logic.
+
+    The keep-set comes from ALLOWED_EXCHANGES / EXCLUDED_EXCHANGES (see
+    _compute_allowed_15m_exchanges), NOT from a hardcoded list — and an
+    unconfigured allow-list means "all supported exchanges are kept", so a
+    default .env can never drop anything.
+    """
     if not DELETE_NOT_ALLOWED_EXCHANGES_ON_START:
+        return
+
+    allowed = set(ALLOWED_EXCHANGES)
+    if not allowed:
+        log(
+            "🧹 [15M] table cleanup skipped: ALLOWED_EXCHANGES/EXCLUDED_EXCHANGES "
+            "leave no 15m exchange to serve — nothing to compare against."
+        )
         return
 
     logger.info("=" * 60)
     logger.info("🧹 DROPPING TABLES FOR NON-ALLOWED EXCHANGES (15M)")
-    logger.info(f"   Allowed exchanges: {', '.join(sorted(ALLOWED_EXCHANGES))}")
+    logger.info(f"   Allowed exchanges: {', '.join(sorted(allowed))}")
     logger.info("=" * 60)
 
     total_dropped = 0
@@ -494,7 +533,7 @@ async def drop_not_allowed_exchange_tables() -> None:
             for r in rows:
                 tbl = r["table_name"]
                 exch = get_exchange_from_table_name(tbl)
-                if not exch or exch in ALLOWED_EXCHANGES:
+                if not exch or exch in allowed:
                     kept += 1
                     continue
                 try:
@@ -1671,20 +1710,19 @@ async def main_15m_loop():
         f"Expect 🔧 (start), 📜 (progress), ✅/⛔ (stop), ⚠️ (fetch error) lines."
     )
 
-    # Respect ALLOWED_EXCHANGES from .env. Empty/unset = all 5 supported
-    # exchanges. Whitelist entries the 15m engine cannot serve (e.g. bitget)
-    # are skipped — the 1d engine still covers them.
-    allowed = set(settings.allowed_exchanges)
-    active_exchanges = [
-        eid for eid in EXCHANGE_MAP.keys() if not allowed or eid in allowed
-    ]
+    # Respect ALLOWED_EXCHANGES / EXCLUDED_EXCHANGES from .env. Empty include
+    # list = all 5 supported exchanges. Entries the 15m engine cannot serve
+    # (e.g. bitget) are skipped — the 1d engine still covers them.
+    active_exchanges = [e for e in EXCHANGE_MAP.keys() if e in ALLOWED_EXCHANGES]
 
     global GLOBAL_PROGRESS
     while True:
         if not active_exchanges:
             log(
-                f"⚠️  [15M] ALLOWED_EXCHANGES does not include any of the "
-                f"exchanges supported by the 15m engine "
+                f"⚠️  [15M] no exchange to serve: ALLOWED_EXCHANGES="
+                f"[{','.join(settings.allowed_exchanges) or 'all'}] minus "
+                f"EXCLUDED_EXCHANGES=[{','.join(settings.excluded_exchanges) or 'none'}] "
+                f"leaves none of the exchanges the 15m engine supports "
                 f"({', '.join(sorted(EXCHANGE_MAP.keys()))}) — engine idle "
                 f"until .env is fixed."
             )

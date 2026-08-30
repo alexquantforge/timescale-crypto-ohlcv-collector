@@ -508,14 +508,14 @@ _HISTORY_LOADER_TEMPLATE = """
     inflight = true;
     try {
       const first = allCandles[0].time;
-      showStatus('… загружаю старую историю');
+      showStatus('… loading older history');
       const r = await fetch(SVC + BASE + '&to=' + first + '&limit=' + CHUNK, { cache: 'no-store' });
       const j = await r.json();
       if (j && j.err) {
         // Server-side error (SQL/pool) — reported, never mistaken for the
         // start of history; details are in the dashboard console.
         console.warn('[hist] /candles server error:', j.err);
-        showStatus('⚠ история: ошибка БД — смотри консоль дашборда', '#ef5350');
+        showStatus('⚠ history: DB error — see the dashboard console', '#ef5350');
         return;
       }
       if (!j || !Array.isArray(j.c)) {
@@ -523,15 +523,15 @@ _HISTORY_LOADER_TEMPLATE = """
         // before git pull) is still serving this port without /candles.
         // NOT the start of history: do not set `exhausted`.
         console.warn('[hist] unexpected /candles response', j);
-        showStatus('⚠ история: на порту старый процесс — перезапусти дашборд', '#ef5350');
+        showStatus('⚠ history: an old process owns this port — restart the dashboard', '#ef5350');
         return;
       }
       const rows = j.c;
       if (rows.length === 0) {
         exhausted = true;
         showStatus(j.mn
-          ? ('⇤ таблица начинается ' + j.mn + ' — раньше данных в ней нет')
-          : '⇤ начало истории — раньше данных нет');
+          ? ('⇤ table starts at ' + j.mn + ' — nothing older is stored')
+          : '⇤ start of history — nothing older is stored');
         return;
       }
       const olderC = [];
@@ -545,8 +545,8 @@ _HISTORY_LOADER_TEMPLATE = """
       if (olderC.length === 0) {
         exhausted = true;
         showStatus(j.mn
-          ? ('⇤ таблица начинается ' + j.mn + ' — раньше данных в ней нет')
-          : '⇤ начало истории — раньше данных нет');
+          ? ('⇤ table starts at ' + j.mn + ' — nothing older is stored')
+          : '⇤ start of history — nothing older is stored');
         return;
       }
       allCandles = olderC.concat(allCandles);
@@ -556,16 +556,16 @@ _HISTORY_LOADER_TEMPLATE = """
         volumeSeries.setData(allVolume);
       }
       const dt = new Date(allCandles[0].time * 1000).toISOString().slice(0, 10);
-      showStatus('⇤ +' + olderC.length + ' баров, теперь с ' + dt, '#66bb6a');
+      showStatus('⇤ +' + olderC.length + ' bars, now from ' + dt, '#66bb6a');
       if (rows.length < CHUNK * 0.95) { exhausted = true; }   // short page = start of history
     } catch (e) {
       // transient endpoint failure — the next left-pan retries automatically
       console.warn('[hist] /candles fetch failed:', e);
-      showStatus('⚠ история: /candles недоступен (retry при скролле)', '#ef5350');
+      showStatus('⚠ history: /candles unavailable (retried on scroll)', '#ef5350');
     } finally { inflight = false; }
   }
 
-  showStatus('⇤ история: ищу сервер /tick…');   // synchronous: badge proves the loader JS ran
+  showStatus('⇤ history: looking for the /tick server…');   // sync: badge proves the loader JS ran
   (async function(){
     let sawAny = false;
     for (const b of CANDS) {
@@ -578,13 +578,13 @@ _HISTORY_LOADER_TEMPLATE = """
     }
     if (!SVC) {
       showStatus(
-        sawAny ? '⚠ история: на порту старый процесс — перезапусти дашборд'
-               : '⚠ история: сервер /tick недоступен из браузера',
+        sawAny ? '⚠ history: an old process owns this port — restart the dashboard'
+               : '⚠ history: the /tick server is unreachable from the browser',
         '#ef5350'
       );
       return;
     }
-    showStatus('⇤ скролл влево — подгружу старую историю');
+    showStatus('⇤ scroll left — older history loads on demand');
     try {
       const lr = chart.timeScale().getVisibleLogicalRange();
       if (lr && lr.from < 10) { loadOlder(); }   // already parked at the left edge
@@ -698,7 +698,7 @@ def build_lightweight_chart_html(
             #tv-chart {{ width: 100%; height: {chart_height}px; position: relative; }}
             /* History-loader badge lives BELOW the chart, under the time/date
                axis line: absolutely positioned inside #tv-chart it overlapped
-               the axis labels ('⇤ таблица начинается…' vs the dates) and was
+               the axis labels (the "table starts at …" note vs the dates) was
                unreadable. Static block with a fixed height = HIST_STATUS_HEIGHT. */
             #hist-status {{ height: {HIST_STATUS_HEIGHT}px; line-height: {HIST_STATUS_HEIGHT}px; padding-left: 8px; font-size: 11px; color: #808495; pointer-events: none; opacity: 0.85; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
         </style>

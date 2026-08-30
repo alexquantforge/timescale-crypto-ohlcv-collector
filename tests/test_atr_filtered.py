@@ -1,5 +1,5 @@
 """
-Unit tests for ATR без паранормальных баров (Filtered Robust ATR).
+Unit tests for ATR without paranormal bars (Filtered Robust ATR).
 """
 import pytest
 from src.analytics.atr_filtered import compute_atr_no_paranormal_bars

@@ -1394,13 +1394,12 @@ else:
     db_pass = st.sidebar.text_input("DB Password", value=os.getenv("DB_PASSWORD", settings.db_password), type="password")
 
 # --- Exchange filter (which exchanges the dashboard is wired to) -------------
-# Options respect the collector's ALLOWED_EXCHANGES whitelist (empty = all).
-# Filtering happens on the cached summary frames, so toggling is instant.
+# Options respect the collector's ALLOWED_EXCHANGES / EXCLUDED_EXCHANGES
+# (empty include-list = all) so the picker never offers a pair the engines
+# deliberately stopped collecting. Filtering happens on the cached summary
+# frames, so toggling is instant.
 _all_configured_exs = sorted(settings.exchange_map_1d.keys())
-_allowed_exs = settings.allowed_exchanges
-_exchange_options = (
-    [e for e in _all_configured_exs if e in _allowed_exs] if _allowed_exs else _all_configured_exs
-)
+_exchange_options = settings.filter_exchange_ids(_all_configured_exs) or _all_configured_exs
 _default_exs = [e for e in ("bybit", "gateio", "okx", "mexc") if e in _exchange_options]
 enabled_exs = st.sidebar.multiselect(
     "🌐 Exchanges",
@@ -1879,15 +1878,10 @@ with tab_charts:
         def _span(points) -> str:
             n = len(points)
             if not n:
-                return "точек пока нет"
-            word = (
-                "точка" if n % 10 == 1 and n % 100 != 11
-                else "точки" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14
-                else "точек"
-            )
+                return "no data points yet"
             f = time.strftime("%Y-%m-%d", time.localtime(points[0][0]))
             t = time.strftime("%Y-%m-%d", time.localtime(points[-1][0]))
-            return f"{n} {word} · {f} → {t}"
+            return f"{n} pts · {f} → {t}"
 
         _panels = []
         if _is_perp:
@@ -1903,13 +1897,13 @@ with tab_charts:
         st.markdown("#### 📊 Open Interest & Funding Rate" if _is_perp else "#### 📊 Spread History")
         if not _have_data:
             st.caption(
-                "Пока пусто — OI копится с каждого цикла 15m-движка, история "
-                "funding появляется после разового бэкфилла при его старте, "
-                "спред — из периодических снапшотов стакана (обе записи — "
-                "несколько циклов после рестарта движков)."
+                "Empty for now — OI accumulates from every 15m engine cycle, "
+                "funding history appears after the one-off backfill run at "
+                "engine start, and spread comes from periodic orderbook "
+                "snapshots (both need a few cycles after an engine restart)."
                 if _is_perp else
-                "Пока пусто — спред копится из снапшотов стакана в первые "
-                "циклы после рестарта движков."
+                "Empty for now — spread accumulates from orderbook snapshots "
+                "during the first cycles after an engine restart."
             )
         else:
             _dumps = lambda x: json.dumps(x, separators=(",", ":"))
