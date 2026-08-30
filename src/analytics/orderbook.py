@@ -5,6 +5,7 @@ import asyncio
 import time
 from typing import Any, Dict, Optional
 from src.analytics.vitality import compute_vitality_score
+from src.utils.timeouts import hard_wait_for
 
 
 async def fetch_orderbook_snapshot(
@@ -31,9 +32,10 @@ async def fetch_orderbook_snapshot(
     limits_to_try = [fetch_limit] + [fb for fb in fallback_limits if fb != fetch_limit]
     for l in limits_to_try:
         try:
-            ob = await asyncio.wait_for(
+            ob = await hard_wait_for(
                 exchange.fetch_order_book(symbol, limit=l),
-                timeout=timeout_sec,
+                timeout_sec,
+                label=f"{symbol} orderbook(limit={l})",
             )
             if ob and ob.get("bids") and ob.get("asks"):
                 break
@@ -100,9 +102,10 @@ async def fetch_orderbook_snapshot(
     trades = []
 
     try:
-        trades = await asyncio.wait_for(
+        trades = await hard_wait_for(
             exchange.fetch_trades(symbol, limit=trades_limit),
-            timeout=timeout_sec,
+            timeout_sec,
+            label=f"{symbol} trades",
         ) or []
     except Exception:
         trades = []

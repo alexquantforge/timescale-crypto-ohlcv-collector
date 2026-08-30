@@ -12,3 +12,158 @@ def test_contiguous_gap_range_grouping():
 
     # Missing days should be 103, 104, 107, 108, 109
     assert list(missing) == [103, 104, 107, 108, 109]
+
+
+def _mk_repo(buckets):
+    class FakeRepo:
+        def __init__(self):
+            self.buckets = buckets
+            self.inserted_df = None
+        async def get_stored_days(self, symbol, ccxt_id, timeframe="1d"):
+            return list(self.buckets)
+        async def upsert_ohlcv_batch(self, df, timeframe="1d"):
+            self.inserted_df = df
+            return len(df)
+    return FakeRepo()
+
+
+class FakeExchange:
+    def __init__(self, candles):
+        self.candles = candles  # [ts_ms, o, h, l, c, v]
+    async def fetch_ohlcv(self, symbol, timeframe="1d", since=None, limit=None):
+        out = [c for c in self.candles if c[0] >= since]
+        return out[:limit] if limit else out
+
+
+def test_fill_history_gaps_daily_fills_missing_days():
+    import asyncio
+    from src.exchanges.gap_filler import fill_history_gaps
+
+    step_ms = 86400_000
+    # stored days 0,1,2 and 5,6 -> missing 3,4
+    candles = [[i * step_ms, 1.0, 2.0, 0.5, 1.5, 10.0] for i in range(7)]
+    repo = _mk_repo([0, 1, 2, 5, 6])
+    ex = FakeExchange(candles)
+
+    inserted = asyncio.run(
+        fill_history_gaps(ex, "BTC/USDT:USDT", "bybit", repo, bf_limit=100, max_pages=5, timeframe="1d")
+    )
+    assert inserted == 2
+    df = repo.inserted_df
+    assert len(df) == 2
+    assert sorted(df["ts"] // step_ms) == [3, 4]
+    assert "url_trading" in df.columns  # repository maps these to url_of_*
+
+
+def test_fill_history_gaps_15m_uses_900s_buckets():
+    import asyncio
+    from src.exchanges.gap_filler import fill_history_gaps
+
+    step_ms = 900_000
+    # stored 15m buckets 100..103 and 106 -> missing 104,105
+    candles = [[i * step_ms, 1.0, 2.0, 0.5, 1.5, 3.0] for i in range(100, 107)]
+    repo = _mk_repo([100, 101, 102, 103, 106])
+    ex = FakeExchange(candles)
+
+    inserted = asyncio.run(
+        fill_history_gaps(ex, "BTC/USDT:USDT", "bybit", repo, bf_limit=100, max_pages=5, timeframe="15m")
+    )
+    assert inserted == 2
+    assert sorted(repo.inserted_df["ts"] // step_ms) == [104, 105]
+
+
+def test_fill_history_gaps_no_gaps_noop():
+    import asyncio
+    from src.exchanges.gap_filler import fill_history_gaps
+
+    repo = _mk_repo([1, 2, 3, 4])
+    ex = FakeExchange([])
+    inserted = asyncio.run(
+        fill_history_gaps(ex, "BTC/USDT:USDT", "bybit", repo, timeframe="1d")
+    )
+    assert inserted == 0 and repo.inserted_df is None
+
+
+def test_fetch_ohlcv_catch_up_pages_until_now():
+    import asyncio
+    from src.exchanges.gap_filler import fetch_ohlcv_catch_up
+
+    step_ms = 86400_000
+    start_bucket = 18000  # ~2020-05
+    n_days = 173           # needs 4 pages of 50
+    candles = [[(start_bucket + i) * step_ms, 1.0, 2.0, 0.5, 1.5, 10.0] for i in range(n_days)]
+
+    class PagingEx:
+        calls = 0
+        async def fetch_ohlcv(self, symbol, timeframe="1d", since=None, limit=50):
+            PagingEx.calls += 1
+            return [c for c in candles if c[0] >= since][:limit]
+
+    out = asyncio.run(
+        fetch_ohlcv_catch_up(PagingEx(), "BTC/USDT:USDT", "1d",
+                             since_sec=(start_bucket) * 86400, page_limit=50, max_pages=40)
+    )
+    assert len(out) == n_days
+    assert [c[0] for c in out] == sorted(c[0] for c in out)
+    assert PagingEx.calls == 4  # 50 + 50 + 50 + 23
+
+
+def test_fetch_ohlcv_catch_up_future_since_clamped():
+    import asyncio, time
+    from src.exchanges.gap_filler import fetch_ohlcv_catch_up
+
+    class FutEx:
+        async def fetch_ohlcv(self, symbol, timeframe="1d", since=None, limit=50):
+            FutEx.got_since = since
+            return []
+    asyncio.run(
+        fetch_ohlcv_catch_up(FutEx(), "BTC/USDT:USDT", "1d",
+                             since_sec=int(time.time()) + 10 * 365 * 86400)
+    )
+    assert FutEx.got_since <= int(time.time() * 1000)  # clamped to now
+
+
+def test_fetch_ohlcv_catch_up_reraises_badsymbol():
+    import asyncio
+    import ccxt
+    from src.exchanges.gap_filler import fetch_ohlcv_catch_up
+
+    class DeadEx:
+        async def fetch_ohlcv(self, symbol, timeframe="1d", since=None, limit=50):
+            raise ccxt.BadSymbol("bogus symbol")
+
+    try:
+        asyncio.run(
+            fetch_ohlcv_catch_up(DeadEx(), "XXX/USDT:USDT", "1d", since_sec=1_786_000_000)
+        )
+    except ccxt.BadSymbol:
+        passed = True
+    else:
+        passed = False
+    assert passed, "BadSymbol must propagate so the engine drops delisted tables"
+
+
+def test_engine_throttles_backfill_and_gap_checks():
+    from src.core.updater import MarketDataEngine
+    from config.settings import settings
+
+    eng = MarketDataEngine(timeframe="1d")
+
+    # Empty-symbol backfill: first attempt allowed, second blocked until cooldown
+    assert eng._should_attempt_backfill("a_on_bybit") is True
+    assert eng._should_attempt_backfill("a_on_bybit") is False
+    # another table independent
+    assert eng._should_attempt_backfill("b_on_bybit") is True
+
+    # Cooldown expiry simulated
+    eng._empty_since["a_on_bybit"] -= settings.empty_symbol_retry_sec + 1
+    assert eng._should_attempt_backfill("a_on_bybit") is True
+
+    # Gap budget: with budget available -> checks allowed but once per table
+    eng._gap_budget_until = __import__("time").time() + 3600
+    assert eng._should_gap_check("a_on_bybit") is True
+    assert eng._should_gap_check("a_on_bybit") is False
+
+    # Budget exhausted -> blocked for everyone
+    eng._gap_budget_until = 0.0
+    assert eng._should_gap_check("c_on_bybit") is False

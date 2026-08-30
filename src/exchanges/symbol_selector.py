@@ -28,6 +28,16 @@ def should_skip_pair(symbol: str, exchange: str = "") -> bool:
     if SKIP_PATTERNS.search(spot_like):
         return True
 
+    # Skip synthetic *STOCK* tokens (MEXC stock perps like CXMTSTOCK): their
+    # klines carry garbage timestamps that poison tables and charts.
+    if base.endswith("STOCK"):
+        return True
+
+    # Skip withdrawn/delisted listings still present in some exchanges'
+    # markets (BingX): '$'-prefixed and '*_OLD'-suffixed tickers never trade.
+    if base.startswith("$") or base.endswith("_OLD"):
+        return True
+
     # Bitget: Skip R* tokenized stock symbols (e.g. RAAPL, RGOOGL, RSAM, RSNOW, etc.)
     # These tokenized equity contracts fail parameter validation on Bitget API.
     if exchange.lower() in ("bitget", "bg") and base.startswith("R"):
@@ -55,15 +65,15 @@ def get_exchange_url(exchange_id: str, symbol: str) -> str:
     b_up, q_up = base.upper(), quote.upper()
     b_lo, q_lo = base.lower(), quote.lower()
     urls = {
-        "bybit": f"https://www.bybit.com/ru-RU/trade/spot/{b_up}/{q_up}",
-        "bitget": f"https://www.bitget.com/ru/spot/{b_up}{q_up}_SPBL?type=spot",
+        "bybit": f"https://www.bybit.com/trade/spot/{b_up}/{q_up}",
+        "bitget": f"https://www.bitget.com/en/spot/{b_up}{q_up}_SPBL?type=spot",
         "mexc": f"https://www.mexc.com/exchange/{b_up}_{q_up}",
         "kucoin": f"https://trade.kucoin.com/{b_up}-{q_up}",
         "gateio": f"https://www.gate.io/trade/{b_up}_{q_up}",
         "bingx": f"https://bingx.com/en-us/spot/{b_up}{q_up}/",
         "htx": f"https://www.htx.com/trade/{b_lo}_{q_lo}/",
         "coinex": f"https://www.coinex.com/exchange/{b_lo}-{q_lo}",
-        "okx": f"https://www.okx.com/ru/trade-spot/{b_lo}-{q_lo}",
+        "okx": f"https://www.okx.com/en/trade-spot/{b_lo}-{q_lo}",
     }
     return urls.get((exchange_id or "").lower(), "")
 
@@ -75,14 +85,14 @@ def get_swap_url(exchange_id: str, symbol: str) -> str:
     b_lo, q_lo = base.lower(), quote.lower()
     urls = {
         "bybit": f"https://www.bybit.com/trade/usdt/{b_up}{q_up}",
-        "bitget": f"https://www.bitget.com/ru/futures/usdt/{b_up}{q_up}",
+        "bitget": f"https://www.bitget.com/en/futures/usdt/{b_up}{q_up}",
         "mexc": f"https://futures.mexc.com/exchange/{b_up}_{q_up}",
         "kucoin": f"https://www.kucoin.com/futures/trade/{b_up}{q_up}M",
         "gateio": f"https://www.gate.com/futures/USDT/{b_up}_{q_up}",
         "bingx": f"https://bingx.com/en-us/perpetual/{b_up}{q_up}/",
         "htx": f"https://www.htx.com/futures/linear_swap/exchange/{b_lo}-{q_lo}/",
         "coinex": f"https://www.coinex.com/futures/{b_lo}-{q_lo}",
-        "okx": f"https://www.okx.com/ru/trade-swap/{b_lo}-{q_lo}-swap",
+        "okx": f"https://www.okx.com/en/trade-swap/{b_lo}-{q_lo}-swap",
     }
     return urls.get((exchange_id or "").lower(), "")
 

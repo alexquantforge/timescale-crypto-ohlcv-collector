@@ -1,6 +1,7 @@
 """
 Settings and configuration management using Pydantic Settings and db_config.py fallback.
 """
+import json
 import os
 import sys
 from typing import Dict, List, Optional
@@ -64,6 +65,16 @@ class Settings(BaseSettings):
     timeframe: str = Field(default="1d", alias="TIMEFRAME")  # "1d" or "15m"
     data_retention_days: int = Field(default=180, alias="DATA_RETENTION_DAYS")  # 180 days retention for 15m
     update_days: int = Field(default=10, alias="UPDATE_DAYS")  # how many days back to fetch per update
+    # 15m retention cleanup cadence: a full-database VACUUM after every 5-minute
+    # cycle kept the disk saturated 24/7 — maintenance now runs at most this
+    # often, and VACUUM touches only tables that actually had rows deleted.
+    maintenance_interval_hours: int = Field(default=24, alias="MAINTENANCE_INTERVAL_HOURS")
+
+    # 15m engine: on startup, DROP tables of exchanges that are not in
+    # ALLOWED_EXCHANGES. Destructive — set to false to keep such tables.
+    delete_not_allowed_exchange_tables_on_start: bool = Field(
+        default=True, alias="DELETE_NOT_ALLOWED_EXCHANGE_TABLES_ON_START"
+    )
 
     # Exchange Mapping for 1D (all 9 exchanges)
     exchange_map_1d: Dict[str, str] = {
@@ -88,13 +99,68 @@ class Settings(BaseSettings):
     }
 
     # Optional whitelist of exchanges to run (empty = all exchanges from the map)
-    allowed_exchanges: List[str] = Field(default_factory=list, alias="ALLOWED_EXCHANGES")
+    allowed_exchanges_raw: str = Field(default="", alias="ALLOWED_EXCHANGES")
+    # Optional blacklist — applied AFTER the whitelist, so it wins on conflicts.
+    # Handy when one exchange is banned/slow but you still want the rest,
+    # without retyping the whole include-list.
+    excluded_exchanges_raw: str = Field(default="", alias="EXCLUDED_EXCHANGES")
+
+    @staticmethod
+    def _parse_exchange_list(raw: str) -> List[str]:
+        """
+        Exchange list from .env. Accepts BOTH formats:
+          bybit,okx,bitget              (comma-separated)
+          ["bybit","okx","bitget"]      (JSON list)
+        Empty/unset/garbage -> [] (i.e. "no filter").
+        """
+        raw = (raw or "").strip()
+        if not raw:
+            return []
+        if raw.startswith("["):
+            try:
+                return [str(x).strip().lower() for x in json.loads(raw) if str(x).strip()]
+            except (ValueError, TypeError):
+                return []
+        return [x.strip().lower() for x in raw.split(",") if x.strip()]
+
+    @property
+    def allowed_exchanges(self) -> List[str]:
+        """Exchange allow-list; empty/unset = all configured exchanges allowed."""
+        return self._parse_exchange_list(self.allowed_exchanges_raw)
+
+    @property
+    def excluded_exchanges(self) -> List[str]:
+        """Exchange deny-list; empty/unset = nothing excluded."""
+        return self._parse_exchange_list(self.excluded_exchanges_raw)
+
+    def filter_exchange_ids(self, candidates) -> List[str]:
+        """
+        Apply ALLOWED_EXCHANGES / EXCLUDED_EXCHANGES to a list of ccxt ids,
+        PRESERVING the input order (the maps carry per-exchange tuning order,
+        e.g. EXCHANGE_MAX_LOOKBACK_DAYS_1D). Returns [] when the filters leave
+        nothing — callers decide whether that means "idle" or "programmer error".
+        """
+        allowed = set(self.allowed_exchanges)
+        denied = set(self.excluded_exchanges)
+        out = []
+        for eid in candidates:
+            if allowed and eid not in allowed:
+                continue
+            if eid in denied:
+                continue
+            out.append(eid)
+        return out
 
     # Volume & Liquidity Tiering Thresholds
     hard_floor_usd_1d: float = Field(default=500000.0, alias="HARD_FLOOR_USD_1D")  # $500k USD for 1d
     hard_floor_usd_15m: float = Field(default=125000.0, alias="HARD_FLOOR_USD_15M")  # $125k USD for 15m
     min_days_volume_check: int = Field(default=7, alias="MIN_DAYS_VOLUME_CHECK")
     concurrent_per_exchange: int = Field(default=5, alias="CONCURRENT_PER_EXCHANGE")
+    # Dashboard: how many neighbours EACH SIDE of the current pair get
+    # pre-warmed (candle loads + chart prebuilds) in background threads.
+    # On low-RAM machines (16 GB, local Postgres) these bursts stutter the
+    # whole desktop — set DASH_WARM_NEIGHBORS=0..2 to tame them. 5 = legacy.
+    dash_warm_neighbors: int = Field(default=5, alias="DASH_WARM_NEIGHBORS")
     update_interval_seconds_1d: int = Field(default=3600, alias="UPDATE_INTERVAL_SECONDS_1D")
     update_interval_seconds_15m: int = Field(default=300, alias="UPDATE_INTERVAL_SECONDS_15M")  # 5 minutes for 15m
 
@@ -104,6 +170,15 @@ class Settings(BaseSettings):
     backfill_start_date: str = Field(default="2018-01-01", alias="BACKFILL_START_DATE")
     backfill_max_iterations: int = Field(default=400, alias="BACKFILL_MAX_ITERATIONS")
     backfill_request_limit: int = Field(default=1000, alias="BACKFILL_REQUEST_LIMIT")
+    # Backward history prefill (repair of truncated table starts — e.g. perp
+    # tables whose initial import never paginated): pages of older candles
+    # fetched per pair per cycle; resumable across cycles until
+    # backfill_start_date / the retention floor is reached.
+    history_prefill_max_pages: int = Field(default=10, alias="HISTORY_PREFILL_MAX_PAGES")
+    # How long a terminal/failed prefill attempt suppresses retries for the
+    # same unchanged table start (a failed fetch must NOT mute the pair for
+    # the whole process run — that was the silent "nothing ever downloaded").
+    history_prefill_retry_sec: int = Field(default=4 * 3600, alias="HISTORY_PREFILL_RETRY_SEC")
 
     backfill_request_limit_per_exchange: Dict[str, int] = {
         "bybit": 1000,
@@ -119,9 +194,17 @@ class Settings(BaseSettings):
     }
 
     gap_max_pages_per_range: int = Field(default=50, alias="GAP_MAX_PAGES_PER_RANGE")  # max OHLCV pages per gap fill
+    gap_filler_budget_sec: int = Field(default=600, alias="GAP_FILLER_BUDGET_SEC")  # max seconds of gap filling per engine cycle
+    gap_recheck_sec: int = Field(default=21600, alias="GAP_RECHECK_SEC")  # min seconds between gap checks of the same table (6h)
+    empty_symbol_retry_sec: int = Field(default=86400, alias="EMPTY_SYMBOL_RETRY_SEC")  # retry backfill of empty symbols at most once/day
 
     check_and_fill_gaps: bool = Field(default=True, alias="CHECK_AND_FILL_GAPS")
     gap_tolerance_sec_15m: int = Field(default=1800, alias="GAP_TOLERANCE_SEC_15M")  # 30 min tolerance
+
+    # Open Interest & Funding Rate (perpetual contracts only — symbols with ':')
+    collect_oi_funding: bool = Field(default=True, alias="COLLECT_OI_FUNDING")
+    funding_history_backfill: bool = Field(default=True, alias="FUNDING_HISTORY_BACKFILL")
+    funding_history_max_pages: int = Field(default=100, alias="FUNDING_HISTORY_MAX_PAGES")  # 100 pages x 100 events ≈ 9y of 8h fundings
 
     # Orderbook Analytics
     collect_orderbook: bool = Field(default=True, alias="COLLECT_ORDERBOOK")

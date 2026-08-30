@@ -25,6 +25,18 @@ async def get_db_pools(timeframe: str = "1d") -> Dict[str, asyncpg.Pool]:
         high_db = settings.db_high_1d
         low_db = settings.db_low_1d
 
+    async def _init_session(conn):
+        """
+        Hard session timeouts so a stuck query or a lock wait can NEVER hang
+        the whole engine (asyncpg has no timeouts by default; a blocked
+        DELETE/DROP holds its pool slot forever and every worker freezes).
+        """
+        await conn.execute(
+            "SET statement_timeout = '120000'; "      # 120s per statement
+            "SET lock_timeout = '15000'; "            # 15s to acquire a lock
+            "SET idle_in_transaction_session_timeout = '300000';"
+        )
+
     for db_name in [high_db, low_db]:
         if db_name not in _db_pools or _db_pools[db_name]._closed:
             logger.info(f"Initializing connection pool for database: {db_name}")
@@ -36,6 +48,8 @@ async def get_db_pools(timeframe: str = "1d") -> Dict[str, asyncpg.Pool]:
                 database=db_name,
                 min_size=settings.db_min_pool_size,
                 max_size=settings.db_max_pool_size,
+                command_timeout=150,
+                init=_init_session,
             )
 
     return {

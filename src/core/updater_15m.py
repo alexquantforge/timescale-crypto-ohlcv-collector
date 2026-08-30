@@ -15,10 +15,33 @@ from typing import Optional, Dict, Any, List, Set, Tuple
 import asyncpg
 import pandas as pd
 import numpy as np
+import ccxt  # FIX: ccxt.BadSymbol / ccxt.ExchangeError are referenced in exception handlers
 import ccxt.async_support as ccxt_async
+
+from src.core.history_prefill import (
+    extract_older_rows,
+    is_transient_fetch_error,
+    normalize_epoch_sec,
+    prefill_empty_action,
+    prefill_needed,
+    prefill_page_since_ms,
+    should_attempt_prefill,
+)
+from src.core.oi_funding import (
+    backfill_funding_history,
+    fetch_oi_funding_snapshot,
+    warn_once as oi_funding_warn_once,
+    write_oi_funding_snapshot,
+)
+from src.db.repository import (
+    fetch_column_types,
+    pg_ddl_type,
+    repair_text_typed_columns,
+)
+from src.exchanges.symbol_selector import get_exchange_url, get_swap_url
 from pytz import timezone as pytz_timezone
 
-from config.settings import settings
+from config.settings import Settings, settings
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -32,7 +55,23 @@ def log(msg: str):
 DB_HIGH = settings.db_high_15m
 DB_LOW = settings.db_low_15m
 
-ALLOWED_EXCHANGES = {"bybit", "gateio", "mexc", "okx", "bingx"}
+
+def _compute_allowed_15m_exchanges(
+    supported, allowed_raw: str, excluded_raw: str
+) -> set:
+    """
+    Which ccxt exchange ids the 15m engine may serve / may keep tables for:
+    start from the engine's supported set, keep only entries named by
+    ALLOWED_EXCHANGES (empty = keep all), then drop EXCLUDED_EXCHANGES.
+    Unknown entries in ALLOWED_EXCHANGES (e.g. bitget, kucoin — 1D-only) are
+    ignored here: the 1D engine still covers them.
+    """
+    supported = set(supported)
+    allowed = Settings._parse_exchange_list(allowed_raw)
+    excluded = Settings._parse_exchange_list(excluded_raw)
+    keep = {e for e in supported if not allowed or e in allowed}
+    return keep - {e for e in excluded if e in supported}
+
 
 EXCHANGE_MAP = {
     "bybit": "bybit",
@@ -42,19 +81,24 @@ EXCHANGE_MAP = {
     "bingx": "bingx",
 }
 
-DELETE_NOT_ALLOWED_EXCHANGES_ON_START = True
-HARD_FLOOR_USD = 125000
-MIN_INTERVALS_VOLUME_CHECK = 672  # 7 days = 672 15-minute bars
+# Derived from the maps above, so it must be defined after them.
+ALLOWED_EXCHANGES = _compute_allowed_15m_exchanges(
+    EXCHANGE_MAP.keys(), settings.allowed_exchanges_raw, settings.excluded_exchanges_raw
+)
+
+DELETE_NOT_ALLOWED_EXCHANGES_ON_START = settings.delete_not_allowed_exchange_tables_on_start
+HARD_FLOOR_USD = settings.hard_floor_usd_15m
+MIN_INTERVALS_VOLUME_CHECK = settings.min_days_volume_check * 96  # N days = N * 96 15-minute bars
 CONCURRENT_PER_EXCHANGE = settings.concurrent_per_exchange
 MSK_TZ = pytz_timezone("Europe/Moscow")
 ALMATY_TZ = pytz_timezone("Asia/Almaty")
-UPDATE_INTERVAL_SECONDS = 300  # 5 minutes
+UPDATE_INTERVAL_SECONDS = settings.update_interval_seconds_15m
 
-FETCH_LIMIT = 1000
+FETCH_LIMIT = settings.backfill_request_limit
 MAX_PAGES = 10
 
-DATA_RETENTION_DAYS = 180
-SKIP_DOWNLOAD_OLDER_DAYS = 180
+DATA_RETENTION_DAYS = settings.data_retention_days
+SKIP_DOWNLOAD_OLDER_DAYS = settings.data_retention_days
 
 
 def get_cutoff_timestamp() -> int:
@@ -71,8 +115,66 @@ def get_download_min_timestamp() -> int:
     return int(min_date.timestamp())
 
 
-GAP_TOLERANCE_SEC = 900 * 2
+GAP_TOLERANCE_SEC = settings.gap_tolerance_sec_15m
 GAP_MAX_LOOKBACK_DAYS = DATA_RETENTION_DAYS
+# Gap checks read every Timestamp of the retention window per table — do that
+# at most once per settings.gap_recheck_sec per table (6h default), not on
+# every 5-minute cycle.
+_GAP_CHECKED_AT: Dict[str, float] = {}
+
+# Gate.io rejects kline queries whose `from` is older than ~10000 recent
+# points ("Candlestick too long ago. Maximum 10000 points recently are
+# allowed"). Pairs hitting that were skipped every cycle forever. Clamp any
+# fetch start for these exchanges into their allowed window (with a margin).
+EXCHANGE_MAX_LOOKBACK_CANDLES_15M: Dict[str, int] = {
+    "gateio": 9900,  # of 10000 allowed
+    "gate": 9900,
+}
+
+
+def clamp_ohlcv_since_ms(exchange_name: str, since_ms: int) -> int:
+    """Clamps the OHLCV 'since' cursor into the exchange's allowed lookback
+    window (Gate.io: ~10000 recent candles). No-op for other exchanges."""
+    max_candles = EXCHANGE_MAX_LOOKBACK_CANDLES_15M.get(exchange_name)
+    if not max_candles:
+        return int(since_ms)
+    return max(int(since_ms), int(time.time() * 1000) - max_candles * 900 * 1000)
+
+
+def ohlcv_since_floor_ms(exchange_name: str):
+    """Absolute oldest 'since' the exchange accepts right now, or None when unlimited."""
+    max_candles = EXCHANGE_MAX_LOOKBACK_CANDLES_15M.get(exchange_name)
+    if not max_candles:
+        return None
+    return int(time.time() * 1000) - max_candles * 900 * 1000
+
+
+# Symbols the exchange itself reports as NOT FOUND (e.g. BingX code 100204 —
+# typically delisted spot tokens still present in load_markets). Retrying them
+# on every 5-minute cycle is pure noise and pure rate-limit burn: they are
+# skipped for the rest of the process run (a restart re-tries them once).
+_DEAD_SYMBOLS: set = set()  # {(ccxt_name, symbol)}
+_OB_WARNED: set = set()  # {(ccxt_name, symbol)} — orderbook warning printed once per process
+
+# Backward history prefill (repair of truncated table starts): pages fetched
+# per pair per cycle, and pairs for which the exchange could not deliver
+# anything older than the current table start (empty/lose-progress attempt) —
+# skipped until their table start actually improves.
+PREFILL_MAX_PAGES = 10
+_PREFILL_DONE: dict = {}  # {(ccxt_id, symbol): (min_ts_at_latch, attempt_ts)} — see should_attempt_prefill
+
+
+def _is_symbol_not_found_error(e: Exception) -> bool:
+    """Delisted/unknown market — permanent until the next engine restart."""
+    if isinstance(e, ccxt.BadSymbol):
+        return True
+    msg = str(e).lower()
+    return "symbol is not found" in msg or '"code":100204' in msg.replace(" ", "")
+
+
+def _mark_dead_symbol_if_gone(e: Exception, ccxt_name: str, symbol: str) -> None:
+    if _is_symbol_not_found_error(e):
+        _DEAD_SYMBOLS.add((ccxt_name, symbol))
 GAP_FETCH_DELAY = 0.1
 
 SKIP_PATTERNS = re.compile(
@@ -119,27 +221,30 @@ ORDERBOOK_COLUMNS_SQL: Dict[str, str] = {
     "ob_min_7d_volume_usd": "DOUBLE PRECISION",
 }
 
-COLLECT_ORDERBOOK: bool = True
-DEBUG_ORDERBOOK: bool = False
+COLLECT_ORDERBOOK: bool = settings.collect_orderbook
+DEBUG_ORDERBOOK: bool = settings.debug_orderbook
 
-OB_FETCH_LIMIT: int = 50
-OB_TRADES_LIMIT: int = 100
-OB_TRADES_WINDOW_SEC: int = 300
-OB_DEPTH_PCT: float = 1.0
-OB_FALLBACK_LIMITS: List[int] = [20, 10, 5]
+OB_FETCH_LIMIT: int = settings.ob_fetch_limit
+OB_TRADES_LIMIT: int = settings.ob_trades_limit
+OB_TRADES_WINDOW_SEC: int = settings.ob_trades_window_sec
+OB_DEPTH_PCT: float = settings.ob_depth_pct
+OB_FALLBACK_LIMITS: List[int] = settings.ob_fallback_limits
 
-GC_ATR_PERIOD: int = 5
-GC_BAR_SMALL_THRESHOLD: float = 0.5
-GC_BAR_LARGE_THRESHOLD: float = 1.8
+GC_ATR_PERIOD: int = settings.atr_period
+GC_BAR_SMALL_THRESHOLD: float = settings.atr_small_threshold
+GC_BAR_LARGE_THRESHOLD: float = settings.atr_large_threshold
+
+# FIX: vitality score thresholds used by the orderbook scoring block below
+# (were referenced but never defined -> NameError, silently swallowed by try/except)
+OB_TRADES_MIN_SLOW: float = 3.0
+OB_TRADES_MIN_OK: float = 15.0
+OB_TRADES_MIN_GOOD: float = 45.0
+OB_TRADES_MIN_BLAZING: float = 120.0
+OB_DEPTH_MIN_THIN: float = 1000.0
+OB_DEPTH_MIN_OK: float = 10000.0
+OB_DEPTH_MIN_GOOD: float = 50000.0
 
 db_pools: Dict[str, asyncpg.Pool] = {}
-
-PER_PAGE_LIMIT: Dict[str, int] = {
-    "bitget": 200,
-    "coinex": 1000,
-    "htx": 2000,
-}
-DEFAULT_PER_PAGE = 1000
 
 
 def should_skip_pair(symbol: str, exchange: str = "") -> bool:
@@ -153,6 +258,19 @@ def should_skip_pair(symbol: str, exchange: str = "") -> bool:
         return True
 
     if SKIP_PATTERNS.search(symbol):
+        return True
+
+    # MEXC-style synthetic *STOCK* tokens (CXMTSTOCK, AAOISTOCK, DXCMSTOCK...):
+    # their klines carry garbage timestamps (28 years of "history"), poison
+    # tables and charts. Never collect them.
+    if base.endswith("STOCK"):
+        return True
+
+    # Withdrawn/delisted listings still present in some exchanges' markets
+    # (BingX): '$'-prefixed and '*_OLD'-suffixed tickers never trade — their
+    # kline endpoint just 404s. Digit-leading tickers (1CAT, 10SET...) stay
+    # untouched: e.g. 1INCH is legit, and the graveyard covers the rest.
+    if base.startswith("$") or base.endswith("_OLD"):
         return True
 
     if exchange == "bitget" and base.startswith("R"):
@@ -172,12 +290,16 @@ async def init_db_pools():
             password=settings.db_password,
             database=db,
             min_size=2,
-            max_size=10,
+            # Respect the global low-resource knob (DB_MAX_POOL_SIZE); floor of
+            # 2 keeps min_size <= max_size valid.
+            max_size=max(2, settings.db_max_pool_size),
         )
     log("✓ DB pools initialized for 15M")
 
 
-async def find_table_in_dbs(table_name: str) -> Tuple[Optional[str], int]:
+async def find_table_in_dbs(table_name: str) -> Tuple[Optional[str], int, int]:
+    """Returns (db_name, max_ts, min_ts); max_ts=1 / min_ts=0 marks an existing
+    but EMPTY table (legacy convention, keeps process_pair on the initial path)."""
     for db in [DB_HIGH, DB_LOW]:
         if db not in db_pools:
             continue
@@ -187,11 +309,27 @@ async def find_table_in_dbs(table_name: str) -> Tuple[Optional[str], int]:
                 table_name,
             )
             if exists:
-                last_ts = await conn.fetchval(
-                    f'SELECT MAX("Timestamp") FROM "{table_name}"'
+                row = await conn.fetchrow(
+                    f'SELECT MAX("Timestamp") AS mx, MIN("Timestamp") AS mn FROM "{table_name}"'
                 )
-                return db, int(last_ts) if last_ts else 1  # 1 indicates table exists even if empty
-    return None, 0
+                raw_max = int(row["mx"]) if row and row["mx"] else None
+                raw_min = int(row["mn"]) if row and row["mn"] else None
+                last_ts = normalize_epoch_sec(raw_max) if raw_max else None
+                min_ts = normalize_epoch_sec(raw_min) if raw_min else None
+                if (raw_max and raw_max != last_ts) or (raw_min and raw_min != min_ts):
+                    # Legacy epoch-ms rows poison catch-up ("+0 candles forever")
+                    # and history-prefill (absurd `since`) — repair the cursors.
+                    log(
+                        f"  [15M] ⚠️ [EPOCH-FIX] '{table_name}' in '{db}' stores Timestamp "
+                        f"in epoch-ms (MIN={raw_min}, MAX={raw_max}) — cursors normalized "
+                        f"to seconds; next save rewrites the table in seconds."
+                    )
+                return (
+                    db,
+                    int(last_ts) if last_ts else 1,  # 1 indicates table exists even if empty
+                    int(min_ts) if min_ts else 0,
+                )
+    return None, 0, 0
 
 
 async def move_table(table_name, from_db, to_db):
@@ -201,9 +339,14 @@ async def move_table(table_name, from_db, to_db):
         rows = await fc.fetch(f'SELECT * FROM "{table_name}"')
         if not rows:
             return
+        # Real types from information_schema: the ALL_COLUMNS_SQL.get(k, "TEXT")
+        # fallback used to TEXT-ify every ob_*/oi column of a moved table, and
+        # numeric snapshot writes then died on `DataError: expected str, got
+        # float` (see ZINC/ZK @mexc in the logs) until repaired on next ensure.
+        col_types = await fetch_column_types(fc, table_name)
     async with db_pools[to_db].acquire() as tc:
         cols_sql = ", ".join(
-            [f'"{k}" {ALL_COLUMNS_SQL.get(k, "TEXT")}' for k in rows[0].keys()]
+            [f'"{k}" {pg_ddl_type(col_types.get(k))}' for k in rows[0].keys()]
         )
         await tc.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')
         await tc.execute(f'CREATE TABLE "{table_name}" ({cols_sql})')
@@ -222,7 +365,14 @@ async def move_table(table_name, from_db, to_db):
         await fc2.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')
 
 
-async def delete_old_data_from_db(pool: asyncpg.Pool, db_name: str) -> int:
+async def delete_old_data_from_db(pool: asyncpg.Pool, db_name: str) -> Tuple[int, List[str]]:
+    """Drops data older than the retention window; returns (rows_deleted,
+    names of tables that actually lost data).
+
+    Fast path: TimescaleDB drop_chunks() removes whole chunks instantly with
+    almost no WAL and leaves nothing for VACUUM to clean. Falls back to a
+    row-by-row DELETE for tables that are not hypertables (e.g. no
+    timescaledb extension installed)."""
     cutoff_ts = get_cutoff_timestamp()
     cutoff_date = datetime.datetime.now(
         datetime.timezone.utc
@@ -234,6 +384,7 @@ async def delete_old_data_from_db(pool: asyncpg.Pool, db_name: str) -> int:
     )
 
     total_deleted = 0
+    affected: List[str] = []
     async with pool.acquire() as conn:
         tables = await conn.fetch(
             "SELECT table_name FROM information_schema.tables "
@@ -243,41 +394,88 @@ async def delete_old_data_from_db(pool: asyncpg.Pool, db_name: str) -> int:
         for r in tables:
             tbl = r["table_name"]
             try:
-                deleted = await conn.execute(
-                    f'DELETE FROM "{tbl}" WHERE "Timestamp" < $1',
-                    cutoff_ts,
+                chunks = await conn.fetchval(
+                    "SELECT count(*) FROM drop_chunks($1::regclass, older_than => $2::interval)",
+                    tbl,
+                    f"{DATA_RETENTION_DAYS} days",
                 )
-                if deleted and deleted != "DELETE 0":
-                    try:
-                        deleted_count = int(deleted.split()[1])
-                        total_deleted += deleted_count
-                    except (IndexError, ValueError):
-                        pass
-            except asyncpg.PostgresError as e:
-                logger.warning(f"  ⚠️  [{db_name}] {tbl}: error during delete — {e}")
+                if chunks:
+                    total_deleted += int(chunks)
+                    affected.append(tbl)
+            except Exception:
+                # Not a hypertable (or timescaledb missing) → row-by-row DELETE.
+                try:
+                    deleted = await conn.execute(
+                        f'DELETE FROM "{tbl}" WHERE "Timestamp" < $1',
+                        cutoff_ts,
+                    )
+                    if deleted and deleted != "DELETE 0":
+                        try:
+                            deleted_count = int(deleted.split()[1])
+                            if deleted_count > 0:
+                                total_deleted += deleted_count
+                                affected.append(tbl)
+                        except (IndexError, ValueError):
+                            pass
+                except asyncpg.PostgresError as e:
+                    logger.warning(f"  ⚠️  [{db_name}] {tbl}: error during delete — {e}")
 
     logger.info(f"  ✅ [{db_name}] Deletion finished: {total_deleted} old records removed")
-    return total_deleted
+    return total_deleted, affected
+
+
+# Wall-clock latch limiting retention maintenance to the configured cadence.
+_LAST_MAINTENANCE_AT = 0.0
 
 
 async def run_maintenance() -> None:
+    global _LAST_MAINTENANCE_AT
+    interval_sec = settings.maintenance_interval_hours * 3600
+    now = time.time()
+    if _LAST_MAINTENANCE_AT and now - _LAST_MAINTENANCE_AT < interval_sec:
+        logger.debug(
+            f"⏭️  [15M] maintenance skipped — last run "
+            f"{(now - _LAST_MAINTENANCE_AT) / 3600:.1f}h ago "
+            f"(< {settings.maintenance_interval_hours}h)"
+        )
+        return
+    # Latch BEFORE the work: an interrupted/killed maintenance retries next
+    # day instead of re-running full scans in a hot every-cycle loop.
+    _LAST_MAINTENANCE_AT = now
+
     logger.info("=" * 60)
-    logger.info("🔧 RUNNING DATABASE MAINTENANCE (15M)")
+    logger.info(
+        f"🔧 RUNNING DATABASE MAINTENANCE (15M) — cadence "
+        f"{settings.maintenance_interval_hours}h"
+    )
     logger.info("=" * 60)
 
     total_deleted = 0
+    affected_per_db: Dict[str, List[str]] = {}
     for db_name, pool in db_pools.items():
         try:
-            deleted = await delete_old_data_from_db(pool, db_name)
+            deleted, affected = await delete_old_data_from_db(pool, db_name)
             total_deleted += deleted
+            affected_per_db[db_name] = affected
         except Exception as e:
             logger.warning(f"  ⚠️  [{db_name}] Error deleting old data: {e}")
+            affected_per_db[db_name] = []
 
     for db_name, pool in db_pools.items():
+        affected = affected_per_db.get(db_name) or []
+        if not affected:
+            # Steady state deletes nothing → no manual VACUUM at all; the
+            # stock autovacuum daemon owns routine cleanup. A whole-database
+            # `VACUUM;` here ran after EVERY 5-minute cycle, scanned all
+            # hypertables and saturated disk 24/7 (single backend observed at
+            # 4.3 GB RSS, state D — that was the laptop stutter).
+            logger.info(f"  ⏭️  [{db_name}] VACUUM skipped — no old rows deleted")
+            continue
         try:
             async with pool.acquire() as conn:
-                await conn.execute("VACUUM;")
-                logger.info(f"  ✅ [{db_name}] VACUUM completed")
+                for tbl in affected:
+                    await conn.execute(f'VACUUM "{tbl}";')
+            logger.info(f"  ✅ [{db_name}] VACUUM completed ({len(affected)} tables)")
         except Exception as e:
             logger.warning(f"  ⚠️  [{db_name}] VACUUM skipped: {e}")
 
@@ -296,12 +494,30 @@ def get_exchange_from_table_name(table_name: str) -> str:
 
 
 async def drop_not_allowed_exchange_tables() -> None:
+    """
+    Startup cleanup for the 15m databases: tables of exchanges the engine will
+    NOT serve are dropped, because nothing will ever update them again and a
+    stale perp table silently poisons dashboard/delist logic.
+
+    The keep-set comes from ALLOWED_EXCHANGES / EXCLUDED_EXCHANGES (see
+    _compute_allowed_15m_exchanges), NOT from a hardcoded list — and an
+    unconfigured allow-list means "all supported exchanges are kept", so a
+    default .env can never drop anything.
+    """
     if not DELETE_NOT_ALLOWED_EXCHANGES_ON_START:
+        return
+
+    allowed = set(ALLOWED_EXCHANGES)
+    if not allowed:
+        log(
+            "🧹 [15M] table cleanup skipped: ALLOWED_EXCHANGES/EXCLUDED_EXCHANGES "
+            "leave no 15m exchange to serve — nothing to compare against."
+        )
         return
 
     logger.info("=" * 60)
     logger.info("🧹 DROPPING TABLES FOR NON-ALLOWED EXCHANGES (15M)")
-    logger.info(f"   Allowed exchanges: {', '.join(sorted(ALLOWED_EXCHANGES))}")
+    logger.info(f"   Allowed exchanges: {', '.join(sorted(allowed))}")
     logger.info("=" * 60)
 
     total_dropped = 0
@@ -317,7 +533,7 @@ async def drop_not_allowed_exchange_tables() -> None:
             for r in rows:
                 tbl = r["table_name"]
                 exch = get_exchange_from_table_name(tbl)
-                if not exch or exch in ALLOWED_EXCHANGES:
+                if not exch or exch in allowed:
                     kept += 1
                     continue
                 try:
@@ -530,16 +746,12 @@ async def fetch_orderbook_snapshot(
 
 
 async def ensure_orderbook_columns(conn, tbl: str) -> None:
-    existing = {
-        r["column_name"]
-        for r in await conn.fetch(
-            "SELECT column_name FROM information_schema.columns WHERE table_name=$1",
-            tbl,
-        )
-    }
+    col_types = await fetch_column_types(conn, tbl)
     for col, typ in ORDERBOOK_COLUMNS_SQL.items():
-        if col not in existing:
+        if col not in col_types:
             await conn.execute(f'ALTER TABLE "{tbl}" ADD COLUMN "{col}" {typ}')
+    # Self-heal tables TEXT-ified by an old HIGH↔LOW move (DataError storms).
+    await repair_text_typed_columns(conn, tbl, col_types, ORDERBOOK_COLUMNS_SQL, log=logger)
 
 
 async def save_orderbook_snapshot(
@@ -595,14 +807,33 @@ async def save_orderbook_snapshot(
 
         if not set_parts:
             return
-        values.append(int(last_ts))
-        sql = f'UPDATE "{tbl}" SET {", ".join(set_parts)} WHERE "Timestamp" = ${idx}'
+        # Latest TWO rows (see repository.save_orderbook_snapshot): the
+        # per-cycle refetch wipes the freshest row's metrics, so the
+        # second-newest closed row is what actually persists as history.
+        sql = (
+            f'UPDATE "{tbl}" SET {", ".join(set_parts)} '
+            f'WHERE "Timestamp" IN ('
+            f'SELECT "Timestamp" FROM "{tbl}" '
+            f'ORDER BY "Timestamp" DESC LIMIT 2)'
+        )
         await conn.execute(sql, *values)
 
 
 async def check_and_fill_table_gaps(
-    exchange, symbol: str, tbl: str, db: str
+    exchange, symbol: str, tbl: str, db: str, ccxt_name: str = ""
 ) -> Tuple[int, int, int]:
+    if not settings.check_and_fill_gaps:
+        return (0, 0, 0)
+
+    # Full retention-window Timestamp scan per table — at most once per
+    # settings.gap_recheck_sec (6h default) per table, not every cycle.
+    now = time.time()
+    gap_key = f"{db}:{tbl}"
+    last_check = _GAP_CHECKED_AT.get(gap_key, 0.0)
+    if now - last_check < settings.gap_recheck_sec:
+        return (0, 0, 0)
+    _GAP_CHECKED_AT[gap_key] = now
+
     download_min_ts = get_download_min_timestamp()
 
     async with db_pools[db].acquire() as conn:
@@ -621,6 +852,19 @@ async def check_and_fill_table_gaps(
         diff = timestamps[i + 1] - timestamps[i]
         if diff > GAP_TOLERANCE_SEC:
             gaps.append((timestamps[i], timestamps[i + 1]))
+
+    # Gate.io & co. reject 'from' older than their recent-candle window —
+    # gaps lying (even partly) behind it can never be fetched there. Clamp or
+    # drop them so the engine does not retry (and re-log) the impossible
+    # fetch on every 5-minute cycle.
+    floor_ms = ohlcv_since_floor_ms(ccxt_name)
+    if floor_ms is not None:
+        clamped: List[Tuple[int, int]] = []
+        for gap_start, gap_end in gaps:
+            if gap_end * 1000 < floor_ms:
+                continue  # wholly behind the window — permanently out of reach
+            clamped.append((max(gap_start, floor_ms // 1000), gap_end))
+        gaps = clamped
 
     if not gaps:
         return (len(timestamps), 0, 0)
@@ -654,7 +898,12 @@ async def check_and_fill_table_gaps(
                         ),
                         timeout=6.0,
                     )
-                except Exception:
+                except Exception as e:
+                    _mark_dead_symbol_if_gone(e, ccxt_name, symbol)
+                    log(
+                        f"  [15M] ⚠️ {symbol} @{tbl.rsplit('_on_', 1)[-1]}: gap-fill fetch_ohlcv failed "
+                        f"({type(e).__name__}: {e}) — gap left open"
+                    )
                     break
                 if not cs:
                     break
@@ -682,6 +931,11 @@ async def check_and_fill_table_gaps(
         df["volume_x_low"] = df["volume"] * df["low"]
         df["volume_x_close"] = df["volume"] * df["close"]
         df["asset_type"] = "swap" if ":" in symbol else "spot"
+        gap_ccxt_id = tbl.rsplit("_on_", 1)[-1]
+        gap_spot_url = get_exchange_url(gap_ccxt_id, symbol)
+        gap_swap_url = get_swap_url(gap_ccxt_id, symbol)
+        df["url_of_trading_pair"] = gap_swap_url if ":" in symbol else gap_spot_url
+        df["url_of_swap_contract_if_it_exists"] = None if ":" in symbol else gap_swap_url
         dt_utc = pd.to_datetime(df["Timestamp"], unit="s", utc=True)
         df["open_time_msk"] = dt_utc.dt.tz_convert(MSK_TZ).dt.strftime(
             "%Y-%m-%d %H:%M:%S"
@@ -731,102 +985,216 @@ async def create_empty_symbol_table(db_name: str, tbl_name: str) -> None:
 
 async def process_pair(exchange, symbol, ccxt_id):
     tbl = f"{symbol.replace('/', '_').replace('-', '_')}_on_{ccxt_id}".lower()
-    current_db, last_ts = await find_table_in_dbs(tbl)
+    current_db, last_ts, min_ts = await find_table_in_dbs(tbl)
 
     download_min_ts = get_download_min_timestamp()
+    floor_ms_ex = ohlcv_since_floor_ms(ccxt_id)
+    target_floor_ts = max(
+        download_min_ts,
+        floor_ms_ex // 1000 if floor_ms_ex is not None else 0,
+    )
 
     try:
         all_candles: List[list] = []
+        seen_ts: Set[int] = set()
+        live_edge_ms = (int(time.time()) - 900) * 1000  # forming bar excluded
 
-        if last_ts > 0:
-            if last_ts * 1000 < download_min_ts * 1000:
-                last_ts = download_min_ts
-
-            per_page = PER_PAGE_LIMIT.get(ccxt_id, DEFAULT_PER_PAGE)
-            cursor_ms = last_ts * 1000
-            pages = 0
-            while pages < 20:
+        def _append_new(cs) -> Tuple[int, int]:
+            """Dedupe-merge a fetched page; returns (added_count, newest_ts_ms)."""
+            added = 0
+            newest = 0
+            for c in cs:
                 try:
-                    cs = await asyncio.wait_for(
-                        exchange.fetch_ohlcv(
-                            symbol, "15m", since=cursor_ms, limit=FETCH_LIMIT
-                        ),
-                        timeout=6.0,
+                    t = int(c[0])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                newest = max(newest, t)
+                if t in seen_ts:
+                    continue
+                seen_ts.add(t)
+                all_candles.append(c)
+                added += 1
+            return added, newest
+
+        async def _fetch_page(since_ms, phase: str, timeout: float = 12.0):
+            """One OHLCV page -> (rows, transient). rows=None on failure
+            (already logged + dead-marked); transient=True means rate-limit /
+            network flakiness — retry next cycle, never a cooldown latch.
+            12s default: MEXC under repair load answers plain downloads
+            slower than 6s and whole pairs used to lose their cycle."""
+            try:
+                return await asyncio.wait_for(
+                    exchange.fetch_ohlcv(symbol, "15m", since=since_ms, limit=FETCH_LIMIT),
+                    timeout=timeout,
+                ), False
+            except Exception as e:
+                _mark_dead_symbol_if_gone(e, ccxt_id, symbol)
+                transient = is_transient_fetch_error(e)
+                if phase == "history-prefill":
+                    hint = (
+                        " — transient (rate limit/network), retries NEXT cycle"
+                        if transient
+                        else f" — history-prefill retries after {settings.history_prefill_retry_sec // 3600}h or on restart"
                     )
-                except Exception:
-                    break
+                else:
+                    hint = ""
+                log(
+                    f"  [15M] ⚠️ {symbol} @{ccxt_id}: {phase} fetch_ohlcv failed "
+                    f"({type(e).__name__}: {e}); since={pd.to_datetime(int(since_ms), unit='ms')}{hint}"
+                )
+                return None, transient
+
+        async def _paged_forward_fill(start_ms: int, max_pages: int) -> None:
+            """
+            Progress-based FORWARD pagination (start -> now). The NEXT page is
+            keyed off the newest timestamp actually received, and the loop stops
+            when a page adds nothing new or reaches the live edge — never off
+            `len(page) == limit`, which silently broke on exchanges whose kline
+            page cap is smaller than FETCH_LIMIT (that is how perp tables ended
+            up with only the latest few days).
+            """
+            cursor_ms = start_ms
+            for _ in range(max_pages):
+                cs, _transient = await _fetch_page(cursor_ms, "download")
                 if not cs:
                     break
-                all_candles.extend(cs)
-                if len(cs) < per_page:
+                added, newest = _append_new(cs)
+                if added == 0 or newest >= live_edge_ms:
                     break
-                cursor_ms = cs[-1][0] + 900 * 1000
-                pages += 1
+                cursor_ms = newest + 900 * 1000
                 await asyncio.sleep(0.05)
-            if not all_candles:
-                return 0, 0, 0, 0
+
+        if last_ts > 0:
+            # Catch-up: from the last stored candle forward to now.
+            if last_ts < download_min_ts:
+                last_ts = download_min_ts
+            cursor_ms = clamp_ohlcv_since_ms(ccxt_id, last_ts * 1000)
+            await _paged_forward_fill(cursor_ms, max_pages=40)
         else:
-            # Auto-discover new symbol and download initial history
+            # New symbol: full initial history FORWARD from the retention floor
+            # (same unified path as catch-up — spot and perp behave identically).
+            if not settings.backfill_new_tables:
+                # .env: BACKFILL_NEW_TABLES=false → register the symbol only,
+                # don't download its initial history.
+                await create_empty_symbol_table(DB_LOW, tbl)
+                return 0, 0, 0, 0
             log(f"  [15M] 🚀 New symbol detected: {symbol} ({ccxt_id}) -> Downloading initial history...")
-            per_page = PER_PAGE_LIMIT.get(ccxt_id, DEFAULT_PER_PAGE)
-            start_since = download_min_ts * 1000
-
-            try:
-                cs = await asyncio.wait_for(
-                    exchange.fetch_ohlcv(
-                        symbol, "15m", since=start_since, limit=FETCH_LIMIT
-                    ),
-                    timeout=6.0,
+            start_since = clamp_ohlcv_since_ms(ccxt_id, target_floor_ts * 1000)
+            if start_since > download_min_ts * 1000:
+                log(
+                    f"  [15M] ℹ️ {symbol} @{ccxt_id}: exchange kline window — "
+                    f"initial history limited to the latest "
+                    f"{EXCHANGE_MAX_LOOKBACK_CANDLES_15M.get(ccxt_id)} candles"
                 )
-            except Exception as e:
-                cs = []
+            await _paged_forward_fill(start_since, max_pages=40)
+            if all_candles:
+                log(
+                    f"  [15M] 📥 {symbol} @{ccxt_id}: initial history downloaded "
+                    f"{len(all_candles)} candles (from "
+                    f"{pd.to_datetime(min(seen_ts) // 1000, unit='s')})"
+                )
 
-            if cs:
-                all_candles.extend(cs)
-                seen_ts = {c[0] for c in cs}
-                oldest_ts = cs[0][0]
-
-                page = 1
-                while page < MAX_PAGES:
-                    since_ms = oldest_ts - per_page * 900 * 1000
-                    if since_ms < start_since:
-                        since_ms = start_since
-
-                    try:
-                        prev_cs = await asyncio.wait_for(
-                            exchange.fetch_ohlcv(
-                                symbol, "15m", since=since_ms, limit=FETCH_LIMIT
-                            ),
-                            timeout=6.0,
-                        )
-                    except Exception:
+        # --- Backward history prefill (repair of truncated table starts) ----
+        # A table whose first candle sits notably LATER than the 180d floor is
+        # missing its old history (e.g. perp initial imports that never
+        # paginated). Resumable: each cycle pages further left until the floor.
+        if current_db and prefill_needed(min_ts, target_floor_ts, GAP_TOLERANCE_SEC):
+            key = (ccxt_id, symbol)
+            # Cooldown-gated retry: a failed/terminal attempt latches the pair
+            # only for history_prefill_retry_sec (not for the whole run), and
+            # any table-start improvement re-arms an attempt immediately.
+            if should_attempt_prefill(
+                _PREFILL_DONE.get(key), min_ts,
+                retry_after_sec=settings.history_prefill_retry_sec,
+            ):
+                log(
+                    f"  [15M] 🔧 {symbol} @{ccxt_id}: history repair — "
+                    f"table starts {pd.to_datetime(int(min_ts), unit='s')}, "
+                    f"filling back to {pd.to_datetime(target_floor_ts, unit='s')}"
+                )
+                oldest = min_ts
+                prefilled = 0
+                terminal_at = None   # (reason, oldest_at_latch)
+                failed = False
+                retry_next_cycle = False  # transient fetch error — leave unlatched
+                span = FETCH_LIMIT  # window in candles; shrinks geometrically
+                # when the exchange answers an out-of-range `since` with an
+                # EMPTY page instead of clamping to the listing (mexc/bingx
+                # style) — one empty big page proves nothing.
+                for _ in range(PREFILL_MAX_PAGES):
+                    since_ms = prefill_page_since_ms(
+                        oldest, 900, span,
+                        exchange_floor_ms=floor_ms_ex,
+                        target_floor_sec=target_floor_ts,
+                    )
+                    if since_ms is None:
+                        terminal_at = ("floor / exchange window reached — history complete", oldest)
                         break
-
-                    if not prev_cs:
+                    cs, transient = await _fetch_page(since_ms, "history-prefill")
+                    if cs is None:                      # fetch error (already logged)
+                        if transient:
+                            # Rate limit / network flake: do NOT cooldown-latch
+                            # for hours — the next cycle retries right away.
+                            retry_next_cycle = True
+                        else:
+                            failed = True
                         break
-
-                    new_prev_cs = [c for c in prev_cs if c[0] not in seen_ts]
-                    if not new_prev_cs:
+                    older = extract_older_rows(cs, oldest, target_floor_ts) if cs else []
+                    if not older:
+                        action, payload = prefill_empty_action(cs, oldest, 900, span)
+                        if action == "shrink":
+                            span = payload
+                            continue
+                        terminal_at = (payload, oldest)
                         break
-
-                    all_candles.extend(new_prev_cs)
-                    for c in new_prev_cs:
-                        seen_ts.add(c[0])
-
-                    new_prev_cs.sort(key=lambda x: x[0])
-                    oldest_ts = new_prev_cs[0][0]
-
-                    if since_ms <= start_since:
-                        break
-
-                    page += 1
+                    for c in older:
+                        if int(c[0]) not in seen_ts:
+                            seen_ts.add(int(c[0]))
+                            all_candles.append(c)
+                    prefilled += len(older)
+                    oldest = int(older[0][0]) // 1000
+                    # AIMD: grow the window back gradually (an exchange that
+                    # empties on out-of-range `since` would otherwise cost
+                    # log2 probes before EVERY successful page).
+                    span = min(span * 2, FETCH_LIMIT)
                     await asyncio.sleep(0.05)
-
-                all_candles.sort(key=lambda x: x[0])
+                    if oldest <= target_floor_ts:
+                        terminal_at = ("floor / exchange window reached — history complete", oldest)
+                        break
+                if failed:
+                    _PREFILL_DONE[key] = (int(min_ts), time.time())  # retry after cooldown
+                elif retry_next_cycle:
+                    # UNLATCHED on purpose: rate limits clear in minutes, and
+                    # the next cycle continues the repair from the same (or
+                    # improved) table start. Any prefilled rows were saved.
+                    log(
+                        f"  [15M] ⏳ {symbol} @{ccxt_id}: history repair paused "
+                        f"by rate limit/network — continues next cycle"
+                        + (f" (+{prefilled} older candles so far)" if prefilled else "")
+                    )
+                elif terminal_at is not None:
+                    reason, latch_min = terminal_at
+                    _PREFILL_DONE[key] = (int(latch_min), time.time())
+                    mark = "✅" if "complete" in reason else "⛔"
+                    log(
+                        f"  [15M] {mark} {symbol} @{ccxt_id}: history repair stop — "
+                        f"{reason} at {pd.to_datetime(int(latch_min), unit='s')}"
+                        + (f" (+{prefilled} older candles this round)" if prefilled else "")
+                    )
+                # Progress without a terminal state: stay UNLATCHED so the next
+                # cycle keeps walking left immediately.
+                if prefilled:
+                    log(
+                        f"  [15M] 📜 {symbol} @{ccxt_id}: history repair "
+                        f"+{prefilled} older candles (table now from "
+                        f"{pd.to_datetime(oldest, unit='s')}, floor "
+                        f"{pd.to_datetime(target_floor_ts, unit='s')})"
+                    )
 
         if not all_candles:
             # Create empty table for 0-candle symbol so find_table_in_dbs finds it next time
-            if last_ts == 0:
+            # (but not for symbols the exchange itself reports as non-existent)
+            if last_ts == 0 and (ccxt_id, symbol) not in _DEAD_SYMBOLS:
                 await create_empty_symbol_table(DB_LOW, tbl)
             return 0, 0, 0, 0
 
@@ -890,6 +1258,9 @@ async def process_pair(exchange, symbol, ccxt_id):
                     tbl, records=tuples, columns=actual_cols
                 )
 
+                # Dedup window is scoped to the freshly written range: the
+                # un-scoped variant scanned the whole 180-day table per pair
+                # per cycle.
                 await conn.execute(
                     f"""
                     WITH dups AS (
@@ -899,16 +1270,18 @@ async def process_pair(exchange, symbol, ccxt_id):
                                    ORDER BY COALESCE(volume, 0) DESC, "Timestamp" DESC
                                ) AS rn
                         FROM "{tbl}"
+                        WHERE "Timestamp" >= $1
                     )
                     DELETE FROM "{tbl}" 
                     WHERE "Timestamp" IN (
                         SELECT "Timestamp" FROM dups WHERE rn > 1
                     )
-                """
+                """,
+                    min_new_ts,
                 )
 
         total_bars, gaps_found, gaps_filled = await check_and_fill_table_gaps(
-            exchange, symbol, tbl, current_db
+            exchange, symbol, tbl, current_db, ccxt_name=ccxt_id
         )
 
         try:
@@ -959,8 +1332,41 @@ async def process_pair(exchange, symbol, ccxt_id):
                     snap = await fetch_orderbook_snapshot(exchange, symbol, g_atr)
                     await save_orderbook_snapshot(current_db, tbl, full_df, snap)
             except Exception as e_ob:
-                if DEBUG_ORDERBOOK:
+                # Once per pair per process (was: only behind DEBUG_ORDERBOOK —
+                # invisible). A table missing ob_* columns also vanished from
+                # the dashboard scan until SELECT * replaced the fixed column
+                # list, so this warning is the engine-side trace of that bug.
+                ob_key = (ccxt_id, symbol)
+                if ob_key not in _OB_WARNED:
+                    _OB_WARNED.add(ob_key)
+                    log(
+                        f"    ⚠️ [OB] {symbol} @{ccxt_id}: orderbook snapshot failed "
+                        f"({type(e_ob).__name__}: {e_ob}) — ob_* metrics will stay empty "
+                        f"for this pair (repeat errors for it are logged only in debug)"
+                    )
+                elif DEBUG_ORDERBOOK:
                     log(f"    ⚠️ [OB] {symbol}: orderbook snapshot error: {e_ob}")
+
+        # --- Open Interest & Funding Rate (perpetuals only) ---
+        if settings.collect_oi_funding and current_db and ":" in symbol:
+            try:
+                snap = await fetch_oi_funding_snapshot(exchange, symbol, ccxt_id)
+                await write_oi_funding_snapshot(db_pools[current_db], tbl, snap)
+                if settings.funding_history_backfill:
+                    await backfill_funding_history(
+                        exchange,
+                        db_pools[current_db],
+                        tbl,
+                        symbol,
+                        ccxt_id,
+                        since_ts=download_min_ts,
+                        max_pages=settings.funding_history_max_pages,
+                    )
+            except Exception as e_oi:
+                oi_funding_warn_once(
+                    ccxt_id, symbol,
+                    f"OI/funding collect failed ({type(e_oi).__name__}: {e_oi})",
+                )
 
         return len(cs), total_bars, gaps_found, gaps_filled
     except (ccxt.BadSymbol, ccxt.SymbolNotFound) as e:
@@ -987,11 +1393,16 @@ async def process_pair(exchange, symbol, ccxt_id):
                 log(f"  🗑️ [DROP DELISTED] Dropped table {tbl} from {current_db}")
         return 0, 0, 0, 0
     except Exception as e:
+        # NEVER silent: an uncaught error here used to return +0 with zero log
+        # output — exactly how a crashing history-prefill would stay invisible.
+        log(
+            f"  [15M] ⚠️ UNCAUGHT {symbol} @{ccxt_id}: {type(e).__name__}: {e}"
+        )
         return 0, 0, 0, 0
 
 
-PROGRESS_LOG_EVERY: int = 5
-PRECOUNT_PAIRS: bool = True
+PROGRESS_LOG_EVERY: int = settings.progress_log_every
+PRECOUNT_PAIRS: bool = settings.precount_pairs
 
 
 def _fmt_eta(seconds: float) -> str:
@@ -1137,33 +1548,101 @@ def _make_exchange(ccxt_id: str):
     return getattr(ccxt_async, ccxt_id)(config)
 
 
-async def count_pairs_for_exchange(ccxt_name: str) -> int:
-    ccxt_id = EXCHANGE_MAP.get(ccxt_name, ccxt_name)
-    exchange = _make_exchange(ccxt_id)
+# --- Persistent exchange instances (memory fix) ----------------------------
+# Previously each 5-minute cycle created a fresh ccxt instance per exchange
+# (and count_pairs_for_exchange created a SECOND one), re-downloaded the full
+# markets JSON (tens of MB on gate/mexc/bingx) and threw everything away.
+# The create/close churn plus Python allocator fragmentation ratcheted the
+# process RSS up until the machine hit swap. Now: one long-lived instance
+# per exchange; markets reloaded at most every MARKETS_TTL_SECONDS; instance
+# recreated at most every EXCHANGE_MAX_AGE_SECONDS.
+MARKETS_TTL_SECONDS = 1800.0           # reload market lists at most every 30 min
+EXCHANGE_MAX_AGE_SECONDS = 6 * 3600.0  # recreate each ccxt instance every 6 h
+_EXCHANGES: Dict[str, dict] = {}       # ccxt_name -> {ex, born_at, markets_at}
+
+
+async def get_persistent_exchange(ccxt_name: str):
+    """One long-lived ccxt instance per exchange. None on hard failure
+    (markets not loadable AND nothing cached)."""
+    now = time.time()
+    entry = _EXCHANGES.get(ccxt_name)
+    if entry and now - entry["born_at"] > EXCHANGE_MAX_AGE_SECONDS:
+        await close_exchange_safely(entry["ex"], ccxt_name)
+        _EXCHANGES.pop(ccxt_name, None)
+        entry = None
+    if entry is None:
+        entry = {"ex": _make_exchange(EXCHANGE_MAP.get(ccxt_name, ccxt_name)),
+                 "born_at": now, "markets_at": 0.0}
+        _EXCHANGES[ccxt_name] = entry
+    ex = entry["ex"]
+    if now - entry["markets_at"] > MARKETS_TTL_SECONDS or not getattr(ex, "markets", None):
+        ok = await load_markets_retries(ex, ccxt_name, reload=True)
+        if ok:
+            entry["markets_at"] = time.time()
+        elif not getattr(ex, "markets", None):
+            await close_exchange_safely(ex, ccxt_name)  # never loaded — drop, retry next cycle
+            _EXCHANGES.pop(ccxt_name, None)
+            return None
+    return ex
+
+
+def release_memory() -> None:
+    """Return freed heap arenas to the OS after a cycle. Python's allocator
+    ratchets RSS to the cycle peak and NEVER hands it back on its own — that
+    ratchet is what filled RAM + swap over hours. gc + malloc_trim(0) gives
+    it back on Linux; a harmless no-op elsewhere."""
     try:
-        await asyncio.wait_for(exchange.load_markets(), timeout=12.0)
+        import gc
+
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+async def load_markets_retries(exchange, ccxt_name, attempts: int = 3, timeout: float = 30.0, reload: bool = False) -> bool:
+    """Load markets with retries — gateio/htx occasionally time out on flaky networks."""
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            await asyncio.wait_for(exchange.load_markets(reload), timeout=timeout)
+            return True
+        except Exception as e:
+            last_err = e
+            if attempt < attempts:
+                log(f"  [MARKETS] {ccxt_name} attempt {attempt}/{attempts} failed: {e!r} — retrying...")
+                await asyncio.sleep(2.0)
+    log(f"  ⚠️ Failed loading markets for {ccxt_name} after {attempts} attempts: {last_err!r}")
+    return False
+
+
+async def count_pairs_for_exchange(ccxt_name: str) -> int:
+    exchange = await get_persistent_exchange(ccxt_name)  # shared instance, no per-cycle churn
+    if exchange is None:
+        return 0
+    try:
         syms = select_symbols_for_exchange(
             exchange.symbols, exchange.markets, ccxt_name
         )
         return len(syms)
     except Exception as e:
-        log(f"  [PRECOUNT] {ccxt_name}: failed counting pairs: {e}")
+        log(f"  [PRECOUNT] {ccxt_name}: failed counting pairs: {e!r}")
         return 0
-    finally:
-        await close_exchange_safely(exchange, ccxt_name)
 
 
 async def process_exchange(ccxt_name):
     ccxt_id = EXCHANGE_MAP.get(ccxt_name, ccxt_name)
     log(f"--- Exchange: {ccxt_name} ---")
 
-    exchange = _make_exchange(ccxt_id)
+    exchange = await get_persistent_exchange(ccxt_name)  # persistent instance, no per-cycle churn
 
     try:
-        try:
-            await asyncio.wait_for(exchange.load_markets(), timeout=12.0)
-        except Exception as e:
-            log(f"  ⚠️ Failed loading markets for {ccxt_name}: {e}")
+        if exchange is None:
             if GLOBAL_PROGRESS is not None:
                 GLOBAL_PROGRESS.subtract_from_total(2000)
             return
@@ -1171,6 +1650,13 @@ async def process_exchange(ccxt_name):
         syms = select_symbols_for_exchange(
             exchange.symbols, exchange.markets, ccxt_name
         )
+        live_syms = [s for s in syms if (ccxt_name, s) not in _DEAD_SYMBOLS]
+        if len(live_syms) < len(syms):
+            log(
+                f"  [15M] 🪦 {ccxt_name}: skipping {len(syms) - len(live_syms)} symbol(s) "
+                f"the exchange reports as not found (delisted) until restart"
+            )
+        syms = live_syms
         total = len(syms)
         sem = asyncio.Semaphore(CONCURRENT_PER_EXCHANGE)
 
@@ -1209,26 +1695,51 @@ async def process_exchange(ccxt_name):
 
         await asyncio.gather(*[worker(s) for s in syms])
     finally:
-        await close_exchange_safely(exchange, ccxt_name)
+        # instance stays alive across cycles — the registry rotates it by age
+        pass
 
 
 async def main_15m_loop():
     await init_db_pools()
     await drop_not_allowed_exchange_tables()
 
+    log(
+        f"[15M] ⚙️ BUILD 2026-08-26-history-repair-v2 ACTIVE: backward prefill "
+        f"floor=now-{settings.data_retention_days}d, ≤{PREFILL_MAX_PAGES} pages/pair/cycle, "
+        f"retry={settings.history_prefill_retry_sec // 3600}h. "
+        f"Expect 🔧 (start), 📜 (progress), ✅/⛔ (stop), ⚠️ (fetch error) lines."
+    )
+
+    # Respect ALLOWED_EXCHANGES / EXCLUDED_EXCHANGES from .env. Empty include
+    # list = all 5 supported exchanges. Entries the 15m engine cannot serve
+    # (e.g. bitget) are skipped — the 1d engine still covers them.
+    active_exchanges = [e for e in EXCHANGE_MAP.keys() if e in ALLOWED_EXCHANGES]
+
     global GLOBAL_PROGRESS
     while True:
+        if not active_exchanges:
+            log(
+                f"⚠️  [15M] no exchange to serve: ALLOWED_EXCHANGES="
+                f"[{','.join(settings.allowed_exchanges) or 'all'}] minus "
+                f"EXCLUDED_EXCHANGES=[{','.join(settings.excluded_exchanges) or 'none'}] "
+                f"leaves none of the exchanges the 15m engine supports "
+                f"({', '.join(sorted(EXCHANGE_MAP.keys()))}) — engine idle "
+                f"until .env is fixed."
+            )
+            await asyncio.sleep(UPDATE_INTERVAL_SECONDS)
+            continue
+
         GLOBAL_PROGRESS = GlobalProgress()
 
         if PRECOUNT_PAIRS:
-            log("Pre-counting 15M trading pairs...")
+            log(f"Pre-counting 15M trading pairs ({', '.join(active_exchanges)})...")
             counts = await asyncio.gather(
-                *[count_pairs_for_exchange(eid) for eid in EXCHANGE_MAP.keys()],
+                *[count_pairs_for_exchange(eid) for eid in active_exchanges],
                 return_exceptions=True,
             )
             grand_total = sum(c for c in counts if isinstance(c, int))
             GLOBAL_PROGRESS.reset(grand_total)
-            log(f"Total 15M symbols to process (5 exchanges): {grand_total}")
+            log(f"Total 15M symbols to process: {grand_total}")
         else:
             GLOBAL_PROGRESS.reset(0)
 
@@ -1244,7 +1755,7 @@ async def main_15m_loop():
                 log(f"  [CRITICAL] {eid} failed: {e}")
 
         await asyncio.gather(
-            *[_safe_process_exchange(eid) for eid in EXCHANGE_MAP.keys()]
+            *[_safe_process_exchange(eid) for eid in active_exchanges]
         )
 
         elapsed = time.time() - cycle_start
@@ -1254,6 +1765,8 @@ async def main_15m_loop():
         )
 
         await run_maintenance()
+
+        release_memory()  # hand freed arenas back to the OS before the sleep
 
         log(f"Sleeping {UPDATE_INTERVAL_SECONDS // 60} minutes until next 15M cycle.")
         await asyncio.sleep(UPDATE_INTERVAL_SECONDS)

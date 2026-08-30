@@ -17,7 +17,8 @@ Async Crypto Market Data Collector (**Perpetual Swaps & Spot Markets**) with Fil
 * 🛡️ **Gap-Filling & Backfill:** Automatic detection and backfilling of missing daily candle ranges, combined with deep historical backfill from 2018.
 * 📈 **L2/L3 Orderbook & Trade Tape Snapshots:** Computes spread tightness (% relative to ATR without paranormal bars), orderbook depth (Bid/Ask/Total USD), Cumulative Volume Delta (CVD & 5m CVD), and liquidity grade (**Vitality Score A–F**).
 * 🔀 **Dynamic Liquidity Tiering:** Classifies coins into `HIGH` ($\ge \$500,000$ USD/day) and `LOW` volume tiers.
-* 🌐 **Interactive Web Dashboard:** Streamlit dashboard featuring Plotly & **TradingView Lightweight Charts** (OHLCV Bars & Candlesticks) with volatility channels, metric tables, and multi-exchange filters.
+* 🌐 **Interactive Web Dashboard:** Streamlit dashboard featuring Plotly & **TradingView Lightweight Charts** (OHLCV Bars & Candlesticks) with ATR & liquidity metrics and multi-exchange filters.
+* ⚡ **Fast Dual-Timeframe Charts:** the Charts tab shows the **15m chart on top and the 1D chart below** with **⏪ Prev / Next ⏭** buttons flanking every chart. Table summaries are cached 10 min, candle frames 60 s, and each chart loads only the last N candles — pair switching is effectively instant. Volume bars are hidden by default and can be toggled with the **Show volume bars** switch. A compact **health strip** above the charts shows green→red chips for trade-tape activity (trades/min), orderbook depth, spread vs 5% of daily ATR, and min(vol×low) 7-day dollar volume. Next to it: direct **Spot/Swap exchange links** and a **shortability badge** (shortable when a perp exists). Chart price axes use compact trimmed formatting (1.10 → 1.1, 4250000 → 4.25M), and candle timestamps are sanitized (garbage future rows dropped, ms-tables auto-converted). Charts are **live**: a background daemon writes the live price / orderbook top / spread / trade-tape stats of the current pair and its ±5 neighbours into a `dashboard_live_ticks` table every second, and every live widget — the server-side LIVE chips, the health strip, and even the in-chart poller (through the dashboard's own `/tick` JSON endpoint on port 8511+) — reads those rows. The chart poller never gives up on errors and falls back to the exchange public REST directly (supported on all 9 exchanges: Bybit/OKX/Gate/KuCoin/MEXC/BingX/Bitget/HTX/CoinEx), the daily chart aggregates fresher 15m candles of the running day, DB data auto-reloads every 60 s, and the ±5 neighbouring pairs are prefetched so Prev/Next flipping is instant. By default the 15m and 1D charts render **side by side** (smaller); a **⬓ Large stacked** toggle switches to 15m-top / 1D-bottom full-width charts.
 
 ---
 
@@ -50,6 +51,8 @@ timescale-crypto-ohlcv-collector/
 │   └── core/                   # Orchestration engine
 │       ├── progress.py         # Unified progress & ETA calculation
 │       └── updater.py          # Main market data engine loop
+│   └── utils/                  # Dependency-free shared utilities
+│       └── timeouts.py         # hard_wait_for: strictly bounded network timeouts
 ├── dashboard/                  # Web Dashboard
 │   └── app.py                  # Streamlit dashboard app
 ├── tests/                      # Unit test suite (Pytest)
