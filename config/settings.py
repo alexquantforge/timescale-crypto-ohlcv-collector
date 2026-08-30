@@ -70,6 +70,12 @@ class Settings(BaseSettings):
     # often, and VACUUM touches only tables that actually had rows deleted.
     maintenance_interval_hours: int = Field(default=24, alias="MAINTENANCE_INTERVAL_HOURS")
 
+    # 15m engine: on startup, DROP tables of exchanges that are not in
+    # ALLOWED_EXCHANGES. Destructive — set to false to keep such tables.
+    delete_not_allowed_exchange_tables_on_start: bool = Field(
+        default=True, alias="DELETE_NOT_ALLOWED_EXCHANGE_TABLES_ON_START"
+    )
+
     # Exchange Mapping for 1D (all 9 exchanges)
     exchange_map_1d: Dict[str, str] = {
         "bybit": "bybit",
