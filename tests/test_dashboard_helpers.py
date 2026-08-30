@@ -663,7 +663,7 @@ def test_chart_html_has_history_status_badge():
 def test_hist_status_badge_sits_below_chart_not_on_time_axis():
     """Regression: the history-loader badge used to be absolutely positioned
     INSIDE #tv-chart (bottom-left), overlapping the time/date axis line —
-    '⇤ таблица начинается…' and the axis labels painted over each other.
+    the 'table starts at …' note and the axis labels painted over each other.
     The badge must be a static block rendered AFTER (below) the chart div,
     with a fixed height matched by HIST_STATUS_HEIGHT (reserved in the
     iframe height by app.py)."""

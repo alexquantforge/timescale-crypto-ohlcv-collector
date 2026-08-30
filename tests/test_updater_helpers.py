@@ -45,3 +45,32 @@ def test_load_markets_with_retry_gives_up_cleanly():
     ok = asyncio.run(load_markets_with_retry(ex, "gateio", attempts=2, timeout=2.0))
     assert ok is False
     assert ex.calls == 2
+
+
+def test_allowed_15m_exchanges_follows_env_not_a_hardcoded_list():
+    """
+    The 15m startup table cleanup must compare against the .env allow/deny
+    lists. Empty lists = "everything supported is kept" (so a default .env can
+    never DROP tables); 1D-only names in ALLOWED_EXCHANGES are ignored instead
+    of being subtracted from the keep-set.
+    """
+    from src.core.updater_15m import _compute_allowed_15m_exchanges
+
+    supported = ["bybit", "gateio", "mexc", "okx", "bingx"]
+    assert _compute_allowed_15m_exchanges(supported, "", "") == set(supported)
+    # bitget is not servable by the 15m engine -> ignored, the other 4 survive
+    assert _compute_allowed_15m_exchanges(
+        supported, "bybit,bitget,mexc", ""
+    ) == {"bybit", "mexc"}
+    assert _compute_allowed_15m_exchanges(
+        supported, "", "mexc,htx"
+    ) == {"bybit", "gateio", "okx", "bingx"}
+    assert _compute_allowed_15m_exchanges(supported, "okx", "okx") == set()
+
+
+def test_allowed_15m_exchanges_accepts_json_list():
+    from src.core.updater_15m import _compute_allowed_15m_exchanges
+
+    assert _compute_allowed_15m_exchanges(
+        ["bybit", "gateio", "mexc", "okx", "bingx"], '["bybit","gateio"]', ""
+    ) == {"bybit", "gateio"}

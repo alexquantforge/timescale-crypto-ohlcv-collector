@@ -100,24 +100,56 @@ class Settings(BaseSettings):
 
     # Optional whitelist of exchanges to run (empty = all exchanges from the map)
     allowed_exchanges_raw: str = Field(default="", alias="ALLOWED_EXCHANGES")
+    # Optional blacklist — applied AFTER the whitelist, so it wins on conflicts.
+    # Handy when one exchange is banned/slow but you still want the rest,
+    # without retyping the whole include-list.
+    excluded_exchanges_raw: str = Field(default="", alias="EXCLUDED_EXCHANGES")
 
-    @property
-    def allowed_exchanges(self) -> List[str]:
+    @staticmethod
+    def _parse_exchange_list(raw: str) -> List[str]:
         """
-        Exchange allow-list. Accepts BOTH formats in .env:
-          ALLOWED_EXCHANGES=bybit,okx,bitget                      (comma-separated)
-          ALLOWED_EXCHANGES=["bybit","okx","bitget"]              (JSON list)
-        Empty/unset = all configured exchanges are allowed.
+        Exchange list from .env. Accepts BOTH formats:
+          bybit,okx,bitget              (comma-separated)
+          ["bybit","okx","bitget"]      (JSON list)
+        Empty/unset/garbage -> [] (i.e. "no filter").
         """
-        raw = (self.allowed_exchanges_raw or "").strip()
+        raw = (raw or "").strip()
         if not raw:
             return []
         if raw.startswith("["):
             try:
-                return [str(x).strip() for x in json.loads(raw) if str(x).strip()]
+                return [str(x).strip().lower() for x in json.loads(raw) if str(x).strip()]
             except (ValueError, TypeError):
                 return []
-        return [x.strip() for x in raw.split(",") if x.strip()]
+        return [x.strip().lower() for x in raw.split(",") if x.strip()]
+
+    @property
+    def allowed_exchanges(self) -> List[str]:
+        """Exchange allow-list; empty/unset = all configured exchanges allowed."""
+        return self._parse_exchange_list(self.allowed_exchanges_raw)
+
+    @property
+    def excluded_exchanges(self) -> List[str]:
+        """Exchange deny-list; empty/unset = nothing excluded."""
+        return self._parse_exchange_list(self.excluded_exchanges_raw)
+
+    def filter_exchange_ids(self, candidates) -> List[str]:
+        """
+        Apply ALLOWED_EXCHANGES / EXCLUDED_EXCHANGES to a list of ccxt ids,
+        PRESERVING the input order (the maps carry per-exchange tuning order,
+        e.g. EXCHANGE_MAX_LOOKBACK_DAYS_1D). Returns [] when the filters leave
+        nothing — callers decide whether that means "idle" or "programmer error".
+        """
+        allowed = set(self.allowed_exchanges)
+        denied = set(self.excluded_exchanges)
+        out = []
+        for eid in candidates:
+            if allowed and eid not in allowed:
+                continue
+            if eid in denied:
+                continue
+            out.append(eid)
+        return out
 
     # Volume & Liquidity Tiering Thresholds
     hard_floor_usd_1d: float = Field(default=500000.0, alias="HARD_FLOOR_USD_1D")  # $500k USD for 1d
@@ -145,7 +177,7 @@ class Settings(BaseSettings):
     history_prefill_max_pages: int = Field(default=10, alias="HISTORY_PREFILL_MAX_PAGES")
     # How long a terminal/failed prefill attempt suppresses retries for the
     # same unchanged table start (a failed fetch must NOT mute the pair for
-    # the whole process run — that was the silent "ничего не докачалось").
+    # the whole process run — that was the silent "nothing ever downloaded").
     history_prefill_retry_sec: int = Field(default=4 * 3600, alias="HISTORY_PREFILL_RETRY_SEC")
 
     backfill_request_limit_per_exchange: Dict[str, int] = {

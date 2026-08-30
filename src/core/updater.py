@@ -320,13 +320,20 @@ class MarketDataEngine:
         await self.repository.cleanup_invalid_bitget_tables()
 
     def get_configured_exchanges(self) -> List[str]:
-        """Returns list of allowed exchanges filtered by ALLOWED_EXCHANGES setting."""
+        """
+        Exchanges this engine will run, filtered by ALLOWED_EXCHANGES (include)
+        and EXCLUDED_EXCHANGES (deny, wins on conflicts). Empty include-list =
+        all exchanges of the timeframe map; order of the map is preserved.
+        """
         exchange_map = settings.exchange_map_15m if self.timeframe == "15m" else settings.exchange_map_1d
-        ex_keys = list(exchange_map.keys())
-        if settings.allowed_exchanges:
-            allowed = set(settings.allowed_exchanges)
-            ex_keys = [k for k in ex_keys if k in allowed]
-        return ex_keys
+        filtered = settings.filter_exchange_ids(exchange_map.keys())
+        if filtered:
+            return filtered
+        # No filters configured at all -> every exchange of the map. A filter
+        # that excludes everything yields [] on purpose (engine goes idle).
+        if not settings.allowed_exchanges and not settings.excluded_exchanges:
+            return list(exchange_map.keys())
+        return []
 
     async def handle_delisted_pair_cleanup(self, current_db: Optional[str], tbl_name: str, symbol: str, ccxt_id: str):
         """Drops table from database if symbol is delisted or not found on exchange."""
@@ -505,7 +512,8 @@ class MarketDataEngine:
                         except Exception as e:
                             # NEVER silent: a failed page used to latch the pair
                             # for the whole process run with zero log output —
-                            # that is how "везде +1 свеча, история не качается".
+                            # this is how "everywhere +1 candle, history never
+                            # downloads" used to happen.
                             transient = is_transient_fetch_error(e)
                             logger.warning(
                                 f"  [{self.timeframe.upper()}] ⚠️ {symbol} @{ccxt_id}: "
@@ -617,7 +625,7 @@ class MarketDataEngine:
                     min_days_check=settings.min_days_volume_check,
                 )
 
-            # --- Compute ATR без паранормальных баров & Orderbook Snapshot ---
+            # --- Compute ATR without paranormal bars & Orderbook Snapshot ---
             if settings.collect_orderbook and current_db:
                 try:
                     pool = self.repository.pools.get(current_db)
