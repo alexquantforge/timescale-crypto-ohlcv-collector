@@ -65,19 +65,19 @@ EXCHANGE_MAP = {
     "bingx": "bingx",
 }
 
-DELETE_NOT_ALLOWED_EXCHANGES_ON_START = True
-HARD_FLOOR_USD = 125000
-MIN_INTERVALS_VOLUME_CHECK = 672  # 7 days = 672 15-minute bars
+DELETE_NOT_ALLOWED_EXCHANGES_ON_START = settings.delete_not_allowed_exchange_tables_on_start
+HARD_FLOOR_USD = settings.hard_floor_usd_15m
+MIN_INTERVALS_VOLUME_CHECK = settings.min_days_volume_check * 96  # N days = N * 96 15-minute bars
 CONCURRENT_PER_EXCHANGE = settings.concurrent_per_exchange
 MSK_TZ = pytz_timezone("Europe/Moscow")
 ALMATY_TZ = pytz_timezone("Asia/Almaty")
-UPDATE_INTERVAL_SECONDS = 300  # 5 minutes
+UPDATE_INTERVAL_SECONDS = settings.update_interval_seconds_15m
 
-FETCH_LIMIT = 1000
+FETCH_LIMIT = settings.backfill_request_limit
 MAX_PAGES = 10
 
-DATA_RETENTION_DAYS = 180
-SKIP_DOWNLOAD_OLDER_DAYS = 180
+DATA_RETENTION_DAYS = settings.data_retention_days
+SKIP_DOWNLOAD_OLDER_DAYS = settings.data_retention_days
 
 
 def get_cutoff_timestamp() -> int:
@@ -94,8 +94,12 @@ def get_download_min_timestamp() -> int:
     return int(min_date.timestamp())
 
 
-GAP_TOLERANCE_SEC = 900 * 2
+GAP_TOLERANCE_SEC = settings.gap_tolerance_sec_15m
 GAP_MAX_LOOKBACK_DAYS = DATA_RETENTION_DAYS
+# Gap checks read every Timestamp of the retention window per table — do that
+# at most once per settings.gap_recheck_sec per table (6h default), not on
+# every 5-minute cycle.
+_GAP_CHECKED_AT: Dict[str, float] = {}
 
 # Gate.io rejects kline queries whose `from` is older than ~10000 recent
 # points ("Candlestick too long ago. Maximum 10000 points recently are
@@ -196,18 +200,18 @@ ORDERBOOK_COLUMNS_SQL: Dict[str, str] = {
     "ob_min_7d_volume_usd": "DOUBLE PRECISION",
 }
 
-COLLECT_ORDERBOOK: bool = True
-DEBUG_ORDERBOOK: bool = False
+COLLECT_ORDERBOOK: bool = settings.collect_orderbook
+DEBUG_ORDERBOOK: bool = settings.debug_orderbook
 
-OB_FETCH_LIMIT: int = 50
-OB_TRADES_LIMIT: int = 100
-OB_TRADES_WINDOW_SEC: int = 300
-OB_DEPTH_PCT: float = 1.0
-OB_FALLBACK_LIMITS: List[int] = [20, 10, 5]
+OB_FETCH_LIMIT: int = settings.ob_fetch_limit
+OB_TRADES_LIMIT: int = settings.ob_trades_limit
+OB_TRADES_WINDOW_SEC: int = settings.ob_trades_window_sec
+OB_DEPTH_PCT: float = settings.ob_depth_pct
+OB_FALLBACK_LIMITS: List[int] = settings.ob_fallback_limits
 
-GC_ATR_PERIOD: int = 5
-GC_BAR_SMALL_THRESHOLD: float = 0.5
-GC_BAR_LARGE_THRESHOLD: float = 1.8
+GC_ATR_PERIOD: int = settings.atr_period
+GC_BAR_SMALL_THRESHOLD: float = settings.atr_small_threshold
+GC_BAR_LARGE_THRESHOLD: float = settings.atr_large_threshold
 
 # FIX: vitality score thresholds used by the orderbook scoring block below
 # (were referenced but never defined -> NameError, silently swallowed by try/except)
@@ -341,8 +345,13 @@ async def move_table(table_name, from_db, to_db):
 
 
 async def delete_old_data_from_db(pool: asyncpg.Pool, db_name: str) -> Tuple[int, List[str]]:
-    """Deletes rows older than the retention window; returns (rows_deleted,
-    names of tables that actually lost rows)."""
+    """Drops data older than the retention window; returns (rows_deleted,
+    names of tables that actually lost data).
+
+    Fast path: TimescaleDB drop_chunks() removes whole chunks instantly with
+    almost no WAL and leaves nothing for VACUUM to clean. Falls back to a
+    row-by-row DELETE for tables that are not hypertables (e.g. no
+    timescaledb extension installed)."""
     cutoff_ts = get_cutoff_timestamp()
     cutoff_date = datetime.datetime.now(
         datetime.timezone.utc
@@ -364,20 +373,31 @@ async def delete_old_data_from_db(pool: asyncpg.Pool, db_name: str) -> Tuple[int
         for r in tables:
             tbl = r["table_name"]
             try:
-                deleted = await conn.execute(
-                    f'DELETE FROM "{tbl}" WHERE "Timestamp" < $1',
-                    cutoff_ts,
+                chunks = await conn.fetchval(
+                    "SELECT count(*) FROM drop_chunks($1::regclass, older_than => $2::interval)",
+                    tbl,
+                    f"{DATA_RETENTION_DAYS} days",
                 )
-                if deleted and deleted != "DELETE 0":
-                    try:
-                        deleted_count = int(deleted.split()[1])
-                        if deleted_count > 0:
-                            total_deleted += deleted_count
-                            affected.append(tbl)
-                    except (IndexError, ValueError):
-                        pass
-            except asyncpg.PostgresError as e:
-                logger.warning(f"  ⚠️  [{db_name}] {tbl}: error during delete — {e}")
+                if chunks:
+                    total_deleted += int(chunks)
+                    affected.append(tbl)
+            except Exception:
+                # Not a hypertable (or timescaledb missing) → row-by-row DELETE.
+                try:
+                    deleted = await conn.execute(
+                        f'DELETE FROM "{tbl}" WHERE "Timestamp" < $1',
+                        cutoff_ts,
+                    )
+                    if deleted and deleted != "DELETE 0":
+                        try:
+                            deleted_count = int(deleted.split()[1])
+                            if deleted_count > 0:
+                                total_deleted += deleted_count
+                                affected.append(tbl)
+                        except (IndexError, ValueError):
+                            pass
+                except asyncpg.PostgresError as e:
+                    logger.warning(f"  ⚠️  [{db_name}] {tbl}: error during delete — {e}")
 
     logger.info(f"  ✅ [{db_name}] Deletion finished: {total_deleted} old records removed")
     return total_deleted, affected
@@ -763,6 +783,18 @@ async def save_orderbook_snapshot(
 async def check_and_fill_table_gaps(
     exchange, symbol: str, tbl: str, db: str, ccxt_name: str = ""
 ) -> Tuple[int, int, int]:
+    if not settings.check_and_fill_gaps:
+        return (0, 0, 0)
+
+    # Full retention-window Timestamp scan per table — at most once per
+    # settings.gap_recheck_sec (6h default) per table, not every cycle.
+    now = time.time()
+    gap_key = f"{db}:{tbl}"
+    last_check = _GAP_CHECKED_AT.get(gap_key, 0.0)
+    if now - last_check < settings.gap_recheck_sec:
+        return (0, 0, 0)
+    _GAP_CHECKED_AT[gap_key] = now
+
     download_min_ts = get_download_min_timestamp()
 
     async with db_pools[db].acquire() as conn:
@@ -1002,6 +1034,11 @@ async def process_pair(exchange, symbol, ccxt_id):
         else:
             # New symbol: full initial history FORWARD from the retention floor
             # (same unified path as catch-up — spot and perp behave identically).
+            if not settings.backfill_new_tables:
+                # .env: BACKFILL_NEW_TABLES=false → register the symbol only,
+                # don't download its initial history.
+                await create_empty_symbol_table(DB_LOW, tbl)
+                return 0, 0, 0, 0
             log(f"  [15M] 🚀 New symbol detected: {symbol} ({ccxt_id}) -> Downloading initial history...")
             start_since = clamp_ohlcv_since_ms(ccxt_id, target_floor_ts * 1000)
             if start_since > download_min_ts * 1000:
@@ -1182,6 +1219,9 @@ async def process_pair(exchange, symbol, ccxt_id):
                     tbl, records=tuples, columns=actual_cols
                 )
 
+                # Dedup window is scoped to the freshly written range: the
+                # un-scoped variant scanned the whole 180-day table per pair
+                # per cycle.
                 await conn.execute(
                     f"""
                     WITH dups AS (
@@ -1191,12 +1231,14 @@ async def process_pair(exchange, symbol, ccxt_id):
                                    ORDER BY COALESCE(volume, 0) DESC, "Timestamp" DESC
                                ) AS rn
                         FROM "{tbl}"
+                        WHERE "Timestamp" >= $1
                     )
                     DELETE FROM "{tbl}" 
                     WHERE "Timestamp" IN (
                         SELECT "Timestamp" FROM dups WHERE rn > 1
                     )
-                """
+                """,
+                    min_new_ts,
                 )
 
         total_bars, gaps_found, gaps_filled = await check_and_fill_table_gaps(
@@ -1320,8 +1362,8 @@ async def process_pair(exchange, symbol, ccxt_id):
         return 0, 0, 0, 0
 
 
-PROGRESS_LOG_EVERY: int = 5
-PRECOUNT_PAIRS: bool = True
+PROGRESS_LOG_EVERY: int = settings.progress_log_every
+PRECOUNT_PAIRS: bool = settings.precount_pairs
 
 
 def _fmt_eta(seconds: float) -> str:
@@ -1629,19 +1671,37 @@ async def main_15m_loop():
         f"Expect 🔧 (start), 📜 (progress), ✅/⛔ (stop), ⚠️ (fetch error) lines."
     )
 
+    # Respect ALLOWED_EXCHANGES from .env. Empty/unset = all 5 supported
+    # exchanges. Whitelist entries the 15m engine cannot serve (e.g. bitget)
+    # are skipped — the 1d engine still covers them.
+    allowed = set(settings.allowed_exchanges)
+    active_exchanges = [
+        eid for eid in EXCHANGE_MAP.keys() if not allowed or eid in allowed
+    ]
+
     global GLOBAL_PROGRESS
     while True:
+        if not active_exchanges:
+            log(
+                f"⚠️  [15M] ALLOWED_EXCHANGES does not include any of the "
+                f"exchanges supported by the 15m engine "
+                f"({', '.join(sorted(EXCHANGE_MAP.keys()))}) — engine idle "
+                f"until .env is fixed."
+            )
+            await asyncio.sleep(UPDATE_INTERVAL_SECONDS)
+            continue
+
         GLOBAL_PROGRESS = GlobalProgress()
 
         if PRECOUNT_PAIRS:
-            log("Pre-counting 15M trading pairs...")
+            log(f"Pre-counting 15M trading pairs ({', '.join(active_exchanges)})...")
             counts = await asyncio.gather(
-                *[count_pairs_for_exchange(eid) for eid in EXCHANGE_MAP.keys()],
+                *[count_pairs_for_exchange(eid) for eid in active_exchanges],
                 return_exceptions=True,
             )
             grand_total = sum(c for c in counts if isinstance(c, int))
             GLOBAL_PROGRESS.reset(grand_total)
-            log(f"Total 15M symbols to process (5 exchanges): {grand_total}")
+            log(f"Total 15M symbols to process: {grand_total}")
         else:
             GLOBAL_PROGRESS.reset(0)
 
@@ -1657,7 +1717,7 @@ async def main_15m_loop():
                 log(f"  [CRITICAL] {eid} failed: {e}")
 
         await asyncio.gather(
-            *[_safe_process_exchange(eid) for eid in EXCHANGE_MAP.keys()]
+            *[_safe_process_exchange(eid) for eid in active_exchanges]
         )
 
         elapsed = time.time() - cycle_start
