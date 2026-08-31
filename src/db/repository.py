@@ -366,14 +366,20 @@ class HistoricalMarketRepository:
             tuple(None if pd.isna(x) else x for x in row)
             for row in df[actual_cols].to_numpy()
         ]
-        min_new_ts = int(df["Timestamp"].min())
-
         divisor = 900 if timeframe == "15m" else 86400
+        # Replace only the buckets carried by this page: a blanket
+        # `DELETE >= min_ts` destroyed stored bars the exchange omitted from
+        # the response (illiquid pairs return no candle for intervals without
+        # trades), punching one-bar holes into charts that the exchange itself
+        # renders as continuous.
+        new_buckets = sorted({int(t) // divisor for t in df["Timestamp"]})
 
         async with pool.acquire(timeout=_ACQUIRE_TIMEOUT) as conn:
             async with conn.transaction():
                 await conn.execute(
-                    f'DELETE FROM "{table_name}" WHERE "Timestamp" >= $1', min_new_ts
+                    f'DELETE FROM "{table_name}" '
+                    f'WHERE ("Timestamp" / {divisor}) = ANY($1::bigint[])',
+                    new_buckets,
                 )
                 await conn.copy_records_to_table(
                     table_name, records=tuples, columns=actual_cols

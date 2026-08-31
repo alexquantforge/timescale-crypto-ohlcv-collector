@@ -1051,9 +1051,20 @@ async def save_candles_to_table(current_db, tbl: str, symbol: str, ccxt_id: str,
         ]
 
         min_new_ts = int(df["Timestamp"].min())
+        # Replace ONLY the buckets this page actually carries.
+        #
+        # A blanket `DELETE >= min_new_ts` also wiped stored bars the exchange
+        # did NOT return this time — and illiquid pairs (JUSUNG/USDT:USDT
+        # @gateio) legitimately come back without the intervals that had no
+        # trades. The bar was deleted, nothing was inserted in its place, and
+        # the chart grew a one-candle hole that the exchange's own chart does
+        # not show. Bucket-scoped deletion keeps the rewrite (forming bar,
+        # corrected values) while never destroying data by omission.
+        new_buckets = sorted({int(t) // 900 for t in df["Timestamp"]})
         async with conn.transaction():
             await conn.execute(
-                f'DELETE FROM "{tbl}" WHERE "Timestamp" >= $1', min_new_ts
+                f'DELETE FROM "{tbl}" WHERE ("Timestamp" / 900) = ANY($1::bigint[])',
+                new_buckets,
             )
             await conn.copy_records_to_table(
                 tbl, records=tuples, columns=actual_cols

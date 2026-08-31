@@ -313,3 +313,79 @@ async def test_1d_lane_refetches_the_forming_daily_bar(monkeypatch):
 
     assert seen["since"] <= (last_ts - 86400) * 1000
     assert seen["min_ts"] <= last_ts
+
+
+# ---------------------------------------------------------------------------
+# The writer must never delete bars the exchange omitted from its response
+# ---------------------------------------------------------------------------
+
+class _RecordingConn:
+    def __init__(self):
+        self.statements = []
+        self.copied = None
+
+    async def fetch(self, sql, *args):
+        # information_schema.columns lookup -> pretend every column exists
+        import src.core.updater_15m as u
+        return [{"column_name": c} for c in u.ALL_COLUMNS_SQL]
+
+    async def execute(self, sql, *args):
+        self.statements.append((" ".join(sql.split()), args))
+
+    async def copy_records_to_table(self, tbl, records=None, columns=None):
+        self.copied = (tbl, len(records or []), list(columns or []))
+
+    def transaction(self):
+        conn = self
+
+        class _Tx:
+            async def __aenter__(self_inner):
+                return conn
+
+            async def __aexit__(self_inner, *a):
+                return False
+
+        return _Tx()
+
+
+class _RecordingPool:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def acquire(self, *a, **k):
+        conn = self._conn
+
+        class _Acq:
+            async def __aenter__(self_inner):
+                return conn
+
+            async def __aexit__(self_inner, *a):
+                return False
+
+        return _Acq()
+
+
+@pytest.mark.asyncio
+async def test_writer_deletes_only_the_buckets_it_rewrites(monkeypatch):
+    """Illiquid pairs come back without the intervals that had no trades. The
+    old blanket `DELETE >= min_ts` wiped those stored bars and punched a
+    one-candle hole into the chart (JUSUNG/USDT:USDT @gateio)."""
+    import src.core.updater_15m as u
+
+    conn = _RecordingConn()
+    monkeypatch.setitem(u.db_pools, "db_low_15m", _RecordingPool(conn))
+
+    t0 = 1_790_000_000 // 900 * 900
+    # exchange returned bar 0 and bar 2 — bar 1 had no trades
+    cs = [
+        [t0 * 1000, 1, 2, 0.5, 1.5, 10],
+        [(t0 + 1800) * 1000, 1, 2, 0.5, 1.5, 10],
+    ]
+    await u.save_candles_to_table("db_low_15m", "x_on_bybit", "X/USDT", "bybit", cs)
+
+    deletes = [(sql, args) for sql, args in conn.statements if sql.startswith("DELETE FROM")]
+    assert deletes, "the rewrite must still delete the buckets it re-inserts"
+    sql, args = deletes[0]
+    assert '("Timestamp" / 900) = ANY($1::bigint[])' in sql
+    assert args[0] == [t0 // 900, (t0 + 1800) // 900]   # the skipped bucket is untouched
+    assert conn.copied[1] == 2

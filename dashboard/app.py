@@ -60,6 +60,7 @@ from dashboard.helpers import (
     find_missing_bucket_ranges,
     rows_to_compact_candles,
     stitch_candle_gaps,
+    fill_missing_bars,
 )
 
 st.set_page_config(
@@ -1285,7 +1286,7 @@ def _warm_pair_caches(
                 ccxt_id, ticker, exchange_name,
                 chart_ctx["style"], chart_ctx["height"],
                 chart_ctx["volume"], chart_ctx["stitch"],
-                poller, hist,
+                poller, hist, chart_ctx.get("flat_fill", True),
             )
 
 
@@ -1299,6 +1300,7 @@ def _render_chart_html_cached(
     chart_style: str, chart_height: int,
     show_volume: bool, stitch_enabled: bool,
     live_poller_js: str, history_loader_js: str,
+    flat_fill: bool = True,
 ):
     """
     Fully-built chart page (candles → stitch → daily merge → compact JSON →
@@ -1355,6 +1357,16 @@ def _render_chart_html_cached(
         )
     else:
         stitch_txt = "&nbsp;"
+
+    if flat_fill:
+        # Intervals without trades: draw them flat like the exchange chart
+        # does instead of leaving a hole (illiquid pairs).
+        frame, filled = fill_missing_bars(frame, step)
+        if filled and not stitched:
+            stitch_txt = (
+                f"🕳 {filled} empty {tf_label} interval(s) drawn flat "
+                f"(no trades on the exchange)"
+            )
 
     candles_arr, volume_arr = build_series_arrays(frame, with_volume=show_volume)
     dumps = lambda x: json.dumps(x, separators=(",", ":"))
@@ -1701,6 +1713,12 @@ with tab_charts:
         auto_reload = opt6.checkbox("Auto-reload DB (60s)", value=True, key="auto_reload")
         stitch_gaps = opt7.checkbox("🩹 Stitch gaps", value=True, key="stitch_gaps",
                                     help="Fetch missing candles from the exchange into the chart (in-memory).")
+        flat_fill = opt7.checkbox(
+            "🕳 Flat-fill empty bars", value=True, key="flat_fill",
+            help="Intervals in which nothing traded have no candle on the exchange API. "
+                 "Draw them flat at the previous close (like the exchange's own chart) "
+                 "instead of leaving a hole.",
+        )
         opt8.checkbox(
             "⏱ Only pairs with 15m data", value=False, key="only_with_15m",
             help="Pair list and Prev/Next skip tickers that only have a 1D table "
@@ -1820,7 +1838,7 @@ with tab_charts:
                 tf_label, limit, m_db, m_tbl, m_lim,
                 ccxt_id, sym_ticker, sym_ex,
                 chart_style, chart_height, bool(show_volume), bool(stitch_gaps),
-                poller_js, hist_js,
+                poller_js, hist_js, bool(flat_fill),
             )
             if res is None:
                 st.info(f"No {tf_label} candles available for {sym_ticker} ({sym_ex}).")
@@ -1875,6 +1893,11 @@ with tab_charts:
             df15 = get_candles("15m", row_15m, max(limit_15m, 200), demo_mode)
             df15, _ = _stitch(df15, "15m")
             hist_df = merge_intraday_into_daily(hist_df, df15)
+
+        if flat_fill:
+            hist_df, _filled = fill_missing_bars(
+                hist_df, 900 if tf_label == "15m" else 86400
+            )
 
         if chart_engine == "TradingView Lightweight Canvas":
             step = 900 if tf_label == "15m" else 86400
@@ -2113,6 +2136,7 @@ with tab_charts:
                 "height": 470 if stacked_layout else 430,
                 "volume": bool(show_volume),
                 "stitch": bool(stitch_gaps),
+                "flat_fill": bool(flat_fill),
             }
             live_pairs = []
             seen = set()

@@ -6,7 +6,7 @@ pair navigation (prev/next), table lookup across the timeframe summary frames,
 and a synthetic demo-data generator used when no TimescaleDB is reachable.
 """
 import json
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -759,11 +759,14 @@ def build_lightweight_chart_html(
             const fmtPrice = (p) => {{
                 const a = Math.abs(p);
                 const trim = (x) => {{
+                    // 6 significant digits, trailing zeros stripped.
+                    // `toFixed(0)` above 100 used to collapse a whole axis to
+                    // "129 / 129 / 129" and print the last price as 129
+                    // instead of 129.46 — never round away digits the chart
+                    // is actually resolving.
                     const ax = Math.abs(x);
-                    let s;
-                    if (ax >= 100) s = x.toFixed(0);
-                    else if (ax >= 1) s = x.toFixed(2);
-                    else s = x.toPrecision(4);
+                    if (ax === 0) return '0';
+                    let s = ax >= 1 ? x.toPrecision(6) : x.toPrecision(4);
                     return parseFloat(s).toString();
                 }};
                 if (a >= 1e9) return trim(p / 1e9) + 'B';
@@ -1123,6 +1126,66 @@ def stitch_candle_gaps(
         .reset_index(drop=True)
     )
     return merged, len(add_df)
+
+
+
+def fill_missing_bars(
+    df: pd.DataFrame, step: int, max_filled: int = 2000
+) -> Tuple[pd.DataFrame, int]:
+    """
+    Renders intervals without trades the way exchange charts do.
+
+    Illiquid pairs (JUSUNG/USDT:USDT @gateio) simply have no kline for a
+    15m interval in which nothing traded: the exchange's own chart draws a
+    flat carry-forward bar there, ours drew a hole, and the two charts looked
+    like they disagreed about the data. Missing buckets between the first and
+    the last stored bar are filled with a zero-range bar at the previous
+    close (volume 0), so the price line stays continuous without inventing
+    any movement.
+
+    Returns (frame, filled_count); a no-op when nothing is missing or when
+    more than `max_filled` bars would have to be synthesized (a genuinely
+    dead table must still look dead).
+    """
+    if df is None or df.empty or "ts" not in df.columns or len(df) < 2:
+        return df, 0
+
+    frame = df.sort_values("ts").reset_index(drop=True)
+    buckets = [int(t) // step for t in frame["ts"]]
+    missing = find_missing_bucket_ranges(buckets, step)
+    if not missing:
+        return df, 0
+
+    total = sum(r1 - r0 for r0, r1 in missing)
+    if total > max_filled:
+        return df, 0
+
+    closes = {int(t) // step: c for t, c in zip(frame["ts"], frame["close"])}
+    rows = []
+    for r0, r1 in missing:
+        prev_close = closes.get(r0 - 1)
+        if prev_close is None:
+            continue
+        for b in range(r0, r1):
+            price = float(prev_close)
+            rows.append({
+                "ts": b * step,
+                "open": price, "high": price, "low": price, "close": price,
+                "volume": 0.0,
+            })
+
+    if not rows:
+        return df, 0
+
+    add = pd.DataFrame(rows)
+    add["time"] = pd.to_datetime(add["ts"], unit="s")
+    out = (
+        pd.concat([frame, add], ignore_index=True)
+        .drop_duplicates(subset="ts", keep="first")
+        .sort_values("ts")
+        .reset_index(drop=True)
+    )
+    return out, len(rows)
 
 
 def build_metric_chart_html(

@@ -777,3 +777,44 @@ def test_drop_stale_spot_duplicates_noop_without_perps():
     df = pd.DataFrame([_summary_row("BTC/USDT", "bybit", 1_790_000_000)])
     assert len(drop_stale_spot_duplicates(df)) == 1
     assert drop_stale_spot_duplicates(pd.DataFrame()).empty
+
+
+# ---------------------------------------------------------------------------
+# Empty intervals: no candle on the exchange API, flat bar on the chart
+# ---------------------------------------------------------------------------
+
+def test_fill_missing_bars_draws_flat_carry_forward_bars():
+    from dashboard.helpers import fill_missing_bars
+
+    step = 900
+    t0 = 1_790_000_000 // step * step
+    df = _mk_df([t0, t0 + step, t0 + 4 * step])   # two intervals had no trades
+    df.loc[df["ts"] == t0 + step, "close"] = 129.46
+
+    out, filled = fill_missing_bars(df, step)
+
+    assert filled == 2
+    gap = out[out["ts"].isin([t0 + 2 * step, t0 + 3 * step])]
+    assert len(gap) == 2
+    # flat at the previous close, zero volume — no invented movement
+    assert set(gap["open"]) == {129.46}
+    assert set(gap["high"]) == {129.46}
+    assert set(gap["low"]) == {129.46}
+    assert set(gap["close"]) == {129.46}
+    assert set(gap["volume"]) == {0.0}
+    assert list(out["ts"]) == sorted(out["ts"])
+
+
+def test_fill_missing_bars_is_a_noop_when_nothing_is_missing_or_table_is_dead():
+    from dashboard.helpers import fill_missing_bars
+
+    step = 900
+    t0 = 1_790_000_000 // step * step
+    full = _mk_df([t0, t0 + step, t0 + 2 * step])
+    out, filled = fill_missing_bars(full, step)
+    assert filled == 0 and len(out) == 3
+
+    # a month-wide hole must stay visible instead of being papered over
+    dead = _mk_df([t0, t0 + 5000 * step])
+    out2, filled2 = fill_missing_bars(dead, step, max_filled=2000)
+    assert filled2 == 0 and len(out2) == 2
