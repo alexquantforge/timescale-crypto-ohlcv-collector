@@ -41,6 +41,7 @@ from src.db.repository import (
 from src.exchanges.symbol_selector import get_exchange_url, get_swap_url
 from src.core.priority_pairs import (
     MAX_PRIORITY_PAIRS,
+    resolve_exchange_alias,
     PRIORITY_TABLE,
     due_pairs,
     read_priority_pairs,
@@ -1758,7 +1759,10 @@ async def refresh_priority_pair(ccxt_name: str, symbol: str) -> int:
     scan, no history prefill, no tier moves; the full sweep still owns those.
     Returns the number of candles written (0 on any failure).
     """
-    ccxt_id = EXCHANGE_MAP.get(ccxt_name, ccxt_name)
+    # The dashboard may publish either spelling ("gateio" / "gate").
+    ccxt_name, ccxt_id = resolve_exchange_alias(ccxt_name, EXCHANGE_MAP)
+    if ccxt_name not in ALLOWED_EXCHANGES:
+        return 0
     if (ccxt_name, symbol) in _DEAD_SYMBOLS or should_skip_pair(symbol, ccxt_name):
         return 0
 
@@ -1768,6 +1772,10 @@ async def refresh_priority_pair(ccxt_name: str, symbol: str) -> int:
 
     tbl = f"{symbol.replace('/', '_').replace('-', '_')}_on_{ccxt_name}".lower()
     current_db, last_ts, _min_ts = await find_table_in_dbs(tbl)
+    if not current_db:
+        # Creating tables is the full sweep's job: a mistyped/foreign pair
+        # published by a dashboard must never spawn an empty junk table.
+        return 0
 
     # Cover the forming bar plus a couple of closed ones, and never ask for
     # more than the exchange's allowed lookback window (Gate.io).

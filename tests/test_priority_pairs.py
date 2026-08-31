@@ -162,3 +162,81 @@ async def test_refresh_priority_pair_skips_dead_and_filtered_symbols(monkeypatch
 
     assert await u.refresh_priority_pair("bybit", "GONE/USDT") == 0
     assert await u.refresh_priority_pair("bybit", "BTC3L/USDT") == 0  # leveraged token
+
+
+# ---------------------------------------------------------------------------
+# Exchange-label resolution (15m tables say "gateio", 1D tables say "gate")
+# ---------------------------------------------------------------------------
+
+def test_resolve_exchange_alias_accepts_both_spellings():
+    from src.core.priority_pairs import resolve_exchange_alias
+
+    map_1d = {"bybit": "bybit", "gateio": "gate", "okx": "okx"}
+    assert resolve_exchange_alias("gateio", map_1d) == ("gateio", "gate")
+    assert resolve_exchange_alias("gate", map_1d) == ("gateio", "gate")
+    assert resolve_exchange_alias("BYBIT", map_1d) == ("bybit", "bybit")
+    assert resolve_exchange_alias("kucoin", map_1d) == ("kucoin", "kucoin")  # pass-through
+    assert resolve_exchange_alias("", map_1d) == ("", "")
+
+
+@pytest.mark.asyncio
+async def test_lane_never_creates_a_missing_15m_table(monkeypatch):
+    """A published pair with no table must be ignored, not backfilled into a
+    fresh junk table (e.g. a 1D-only exchange label reaching the 15m lane)."""
+    import src.core.updater_15m as u
+
+    async def _no_table(tbl):
+        return None, 0, 0
+
+    async def _boom(*a, **k):
+        raise AssertionError("must not write")
+
+    monkeypatch.setattr(u, "find_table_in_dbs", _no_table)
+    monkeypatch.setattr(u, "save_candles_to_table", _boom)
+
+    class _Ex:
+        async def fetch_ohlcv(self, *a, **k):
+            return [[1_790_000_000_000, 1, 2, 0.5, 1.5, 10]]
+
+    async def _persistent(name):
+        return _Ex()
+
+    monkeypatch.setattr(u, "get_persistent_exchange", _persistent)
+    assert await u.refresh_priority_pair("bybit", "0G/USDT:USDT") == 0
+
+
+@pytest.mark.asyncio
+async def test_1d_engine_lane_refreshes_the_daily_bar(monkeypatch):
+    """The 1D engine runs the same lane: the FORMING daily candle is rewritten
+    in the database, so the dashboard does not have to aggregate 15m itself."""
+    import src.core.updater as u1d
+
+    engine = u1d.MarketDataEngine(timeframe="1d")
+
+    class _Repo:
+        def __init__(self):
+            self.written = None
+
+        async def find_table(self, tbl):
+            return "db_low_1d", 1_789_900_000, 1_600_000_000
+
+        async def upsert_candles(self, db, tbl, df, timeframe="1d"):
+            self.written = (db, tbl, timeframe, len(df))
+
+    class _Ex:
+        async def fetch_ohlcv(self, symbol, tf, since=None, limit=None):
+            assert tf == "1d"
+            return [[1_789_948_800_000, 1, 2, 0.5, 1.5, 10]]
+
+    async def _persistent(ccxt_id, ccxt_name):
+        return _Ex()
+
+    engine.repository = _Repo()
+    monkeypatch.setattr(u1d, "get_persistent_exchange", _persistent)
+    monkeypatch.setattr(engine, "get_configured_exchanges", lambda: ["gateio"])
+
+    # published as "gate" (1D table suffix) -> resolves to the gateio engine name
+    n = await engine.refresh_priority_pair("gate", "0G/USDT:USDT")
+
+    assert n == 1
+    assert engine.repository.written == ("db_low_1d", "0g_usdt:usdt_on_gate", "1d", 1)

@@ -230,6 +230,10 @@ class Settings(BaseSettings):
     # download or compute anything itself.
     priority_lane_enabled: bool = Field(default=True, alias="PRIORITY_LANE_ENABLED")
     priority_lane_interval_sec: float = Field(default=1.0, alias="PRIORITY_LANE_INTERVAL_SEC")
+    # The daily bar moves with every trade too, but one refresh per second
+    # per engine would double the request rate for zero visible gain — the
+    # 1D lane ticks a bit slower by default.
+    priority_lane_interval_sec_1d: float = Field(default=2.0, alias="PRIORITY_LANE_INTERVAL_SEC_1D")
     # A published set expires this fast, so closing the browser tab stops the
     # lane instead of pinning the engine to an abandoned pair.
     priority_lane_ttl_sec: float = Field(default=90.0, alias="PRIORITY_LANE_TTL_SEC")

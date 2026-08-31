@@ -118,6 +118,28 @@ def due_pairs(
     ]
 
 
+
+def resolve_exchange_alias(published: str, name_to_id: dict) -> Tuple[str, str]:
+    """
+    Maps a published exchange label onto (engine_name, ccxt_id).
+
+    The two engines disagree on table suffixes: 15m tables are
+    `..._on_gateio` (engine name) while 1D tables are `..._on_gate` (ccxt id),
+    and the dashboard publishes whatever its summary row carried. Accepting
+    BOTH spellings keeps a published pair from being resolved to a table name
+    that does not exist (which would otherwise create an empty junk table).
+    """
+    label = (published or "").strip().lower()
+    if not label:
+        return "", ""
+    if label in name_to_id:                       # engine name, e.g. "gateio"
+        return label, name_to_id[label]
+    for name, ccxt_id in name_to_id.items():      # ccxt id, e.g. "gate"
+        if label == str(ccxt_id).lower():
+            return name, str(ccxt_id)
+    return label, label                           # unknown: pass through
+
+
 async def ensure_priority_table(conn) -> None:
     await conn.execute(CREATE_SQL)
 

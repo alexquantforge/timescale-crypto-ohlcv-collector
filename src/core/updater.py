@@ -7,6 +7,7 @@ import datetime
 import logging
 import time
 from typing import Dict, List, Optional, Set
+import asyncpg
 import ccxt
 import pandas as pd
 from pytz import timezone as pytz_timezone
@@ -15,6 +16,13 @@ from config.settings import settings
 from src.analytics.atr_filtered import compute_atr_no_paranormal_bars
 from src.analytics.orderbook import fetch_orderbook_snapshot
 from src.core.progress import GlobalProgress
+from src.core.priority_pairs import (
+    MAX_PRIORITY_PAIRS,
+    PRIORITY_TABLE,
+    due_pairs,
+    read_priority_pairs,
+    resolve_exchange_alias,
+)
 from src.core.oi_funding import (
     backfill_funding_history,
     fetch_oi_funding_snapshot,
@@ -39,6 +47,7 @@ from src.exchanges.symbol_selector import (
     get_exchange_url,
     get_swap_url,
     select_symbols_perp_first,
+    should_skip_pair,
 )
 
 logger = logging.getLogger("engine")
@@ -221,6 +230,7 @@ class MarketDataEngine:
         self._gap_budget_logged = False
         self._prefill_done: Dict[str, tuple] = {}  # tbl -> (min_ts_at_latch, attempt_ts) — see should_attempt_prefill
         self._ob_warned: Set[str] = set()          # tbl -> orderbook warning printed once per process
+        self._lane_pool_obj = None                 # asyncpg pool to the priority-lane coordination db
 
     def _should_attempt_backfill(self, tbl_name: str) -> bool:
         """Empty symbols (0 candles: tokenized stocks, delisted) are retried
@@ -817,15 +827,163 @@ class MarketDataEngine:
         )
         release_memory()  # hand freed arenas back to the OS
 
+    # -----------------------------------------------------------------
+    # PRIORITY LANE — keeps the pairs the dashboard is displaying fresh in
+    # the database, in parallel with the slow full sweep. The 15m engine runs
+    # the same lane for its own tables; the daily bar needs it just as much,
+    # since a 1D candle only closes once a day and the FORMING one has to
+    # follow the market for the chart to be live without any dashboard-side
+    # aggregation.
+    # -----------------------------------------------------------------
+
+    async def refresh_priority_pair(self, published_exchange: str, symbol: str) -> int:
+        """
+        Tail refresh of ONE displayed pair on this engine's timeframe: refetch
+        the last few bars (the forming one included) and write them through
+        the repository the main cycle uses. Existing tables only — creating
+        tables stays the sweep's job.
+        """
+        if not self.repository:
+            return 0
+
+        exchange_map = (
+            settings.exchange_map_15m if self.timeframe == "15m" else settings.exchange_map_1d
+        )
+        ccxt_name, ccxt_id = resolve_exchange_alias(published_exchange, exchange_map)
+        if ccxt_name not in self.get_configured_exchanges():
+            return 0
+        if should_skip_pair(symbol, ccxt_name):
+            return 0
+
+        tbl_name = f"{symbol.replace('/', '_').replace('-', '_')}_on_{ccxt_id}".lower()
+        current_db, last_ts, _first_ts = await self.repository.find_table(tbl_name)
+        if not current_db:
+            return 0
+
+        exchange = await get_persistent_exchange(ccxt_id, ccxt_name)
+        if exchange is None:
+            return 0
+
+        step = 900 if self.timeframe == "15m" else 86400
+        since_ms = max(int(last_ts or 0), int(time.time()) - 3 * step) * 1000
+        try:
+            cs = await hard_wait_for(
+                exchange.fetch_ohlcv(symbol, self.timeframe, since=since_ms, limit=10),
+                8.0,
+                label=f"{symbol}@{ccxt_id} lane",
+            )
+        except Exception:
+            return 0
+        if not cs:
+            return 0
+
+        try:
+            df = _candles_df_from_rows(cs, symbol, ccxt_id)
+            await self.repository.upsert_candles(
+                current_db, tbl_name, df, timeframe=self.timeframe
+            )
+        except Exception as e:
+            logger.warning(
+                f"[{self.timeframe.upper()}] [LANE] {symbol}@{ccxt_id}: write failed "
+                f"({type(e).__name__}: {e})"
+            )
+            return 0
+        return len(cs)
+
+    async def _lane_pool(self):
+        """Pool to the coordination database holding the published pair set."""
+        if getattr(self, "_lane_pool_obj", None) is None:
+            db_name = settings.priority_lane_db or settings.db_high_15m
+            self._lane_pool_obj = await asyncpg.create_pool(
+                host=settings.db_host, port=settings.db_port,
+                user=settings.db_user, password=settings.db_password,
+                database=db_name, min_size=1, max_size=2, command_timeout=15,
+            )
+        return self._lane_pool_obj
+
+    async def priority_lane_loop(self) -> None:
+        """Reads the displayed pair set and refreshes it on a short interval."""
+        if not settings.priority_lane_enabled:
+            return
+
+        interval = max(
+            0.2,
+            float(
+                settings.priority_lane_interval_sec
+                if self.timeframe == "15m"
+                else settings.priority_lane_interval_sec_1d
+            ),
+        )
+        ttl = float(settings.priority_lane_ttl_sec)
+        logger.info(
+            f"[{self.timeframe.upper()}] ⚡ priority lane ON: refreshing displayed pairs "
+            f"from '{PRIORITY_TABLE}' every {interval:g}s (≤{MAX_PRIORITY_PAIRS} pairs, "
+            f"publication TTL {ttl:g}s)"
+        )
+
+        last_run: Dict[tuple, float] = {}
+        inflight: Set[tuple] = set()
+        stats = {"pairs": 0, "bars": 0}
+        last_report = time.time()
+
+        async def _run(pair):
+            try:
+                stats["bars"] += await self.refresh_priority_pair(pair[0], pair[1])
+                stats["pairs"] += 1
+            finally:
+                last_run[pair] = time.time()
+                inflight.discard(pair)
+
+        while True:
+            started = time.time()
+            try:
+                pool = await self._lane_pool()
+                async with pool.acquire() as conn:
+                    pairs = await read_priority_pairs(conn, ttl_sec=ttl)
+
+                for pair in due_pairs(pairs, last_run, interval):
+                    if pair in inflight:
+                        continue
+                    inflight.add(pair)
+                    asyncio.create_task(_run(pair))
+
+                if time.time() - last_report >= 60.0:
+                    logger.info(
+                        f"[{self.timeframe.upper()}] [LANE] last 60s: {stats['pairs']} refreshes, "
+                        f"{stats['bars']} bars written, {len(pairs)} pair(s) displayed"
+                    )
+                    stats = {"pairs": 0, "bars": 0}
+                    last_report = time.time()
+            except Exception as e:
+                logger.warning(
+                    f"[{self.timeframe.upper()}] [LANE] cycle error ({type(e).__name__}: {e})"
+                )
+            await asyncio.sleep(max(0.05, interval - (time.time() - started)))
+
     async def start_loop(self) -> None:
         """Starts continuous execution loop."""
         await self.initialize()
+        # Lane runs forever beside the sweep; a crash in it is logged and the
+        # task restarted, it must never stop the collector.
+        lane_task = asyncio.create_task(
+            self.priority_lane_loop(), name=f"priority-lane-{self.timeframe}"
+        )
         interval = (
             settings.update_interval_seconds_15m
             if self.timeframe == "15m"
             else settings.update_interval_seconds_1d
         )
         while True:
+            if settings.priority_lane_enabled and lane_task.done() and not lane_task.cancelled():
+                exc = lane_task.exception()
+                if exc is not None:
+                    logger.warning(
+                        f"[{self.timeframe.upper()}] [LANE] task died "
+                        f"({type(exc).__name__}: {exc}) — restarting"
+                    )
+                lane_task = asyncio.create_task(
+                    self.priority_lane_loop(), name=f"priority-lane-{self.timeframe}"
+                )
             try:
                 await self.run_cycle()
             except Exception as e:
