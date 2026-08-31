@@ -39,6 +39,12 @@ from src.db.repository import (
     repair_text_typed_columns,
 )
 from src.exchanges.symbol_selector import get_exchange_url, get_swap_url
+from src.core.priority_pairs import (
+    MAX_PRIORITY_PAIRS,
+    PRIORITY_TABLE,
+    due_pairs,
+    read_priority_pairs,
+)
 from pytz import timezone as pytz_timezone
 
 from config.settings import Settings, settings
@@ -983,6 +989,100 @@ async def create_empty_symbol_table(db_name: str, tbl_name: str) -> None:
         pass
 
 
+async def save_candles_to_table(current_db, tbl: str, symbol: str, ccxt_id: str, cs: list) -> str:
+    """
+    Persists fetched 15m OHLCV rows into the pair table exactly the way the
+    main cycle does (same columns, same DELETE >= min_ts + COPY + dedup),
+    creating the table in DB_LOW when it does not exist yet.
+    Returns the database the rows landed in.
+
+    Extracted from process_pair so the 1-second PRIORITY LANE writes through
+    the identical code path — one writer implementation, no drift.
+    """
+
+    df = pd.DataFrame(cs, columns=["ts", "open", "high", "low", "close", "volume"])
+    df["Timestamp"] = df["ts"] // 1000
+    df["ticker"], df["exchange"] = symbol, ccxt_id
+    df["volume_x_low"] = df["volume"] * df["low"]
+    df["volume_x_close"] = df["volume"] * df["close"]
+    df["asset_type"] = "swap" if ":" in symbol else "spot"
+
+    dt_utc = pd.to_datetime(df["Timestamp"], unit="s", utc=True)
+    df["open_time_msk"] = dt_utc.dt.tz_convert(MSK_TZ).dt.strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    df["open_time_almaty"] = dt_utc.dt.tz_convert(ALMATY_TZ).dt.strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    if not current_db:
+        current_db = DB_LOW
+        async with db_pools[current_db].acquire() as conn:
+            cols = [f'"{c}" {t}' for c, t in ALL_COLUMNS_SQL.items()]
+            await conn.execute(f'CREATE TABLE "{tbl}" ({", ".join(cols)})')
+            try:
+                await conn.execute(
+                    f"SELECT create_hypertable('{tbl}', 'Timestamp', if_not_exists => TRUE)"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"  [TIMESCALEDB] Failed creating hypertable for {tbl}: {e}"
+                )
+
+    async with db_pools[current_db].acquire() as conn:
+        actual_cols = list(ALL_COLUMNS_SQL.keys())
+        existing_cols = {
+            r["column_name"]
+            for r in await conn.fetch(
+                "SELECT column_name FROM information_schema.columns WHERE table_name=$1",
+                tbl,
+            )
+        }
+        for col in actual_cols:
+            if col not in existing_cols:
+                await conn.execute(
+                    f'ALTER TABLE "{tbl}" ADD COLUMN "{col}" {ALL_COLUMNS_SQL[col]}'
+                )
+
+        tuples = [
+            tuple(None if pd.isna(x) else x for x in row)
+            for row in df[actual_cols].to_numpy()
+        ]
+
+        min_new_ts = int(df["Timestamp"].min())
+        async with conn.transaction():
+            await conn.execute(
+                f'DELETE FROM "{tbl}" WHERE "Timestamp" >= $1', min_new_ts
+            )
+            await conn.copy_records_to_table(
+                tbl, records=tuples, columns=actual_cols
+            )
+
+            # Dedup window is scoped to the freshly written range: the
+            # un-scoped variant scanned the whole 180-day table per pair
+            # per cycle.
+            await conn.execute(
+                f"""
+                WITH dups AS (
+                    SELECT "Timestamp",
+                           row_number() OVER (
+                               PARTITION BY ("Timestamp" / 900)
+                               ORDER BY COALESCE(volume, 0) DESC, "Timestamp" DESC
+                           ) AS rn
+                    FROM "{tbl}"
+                    WHERE "Timestamp" >= $1
+                )
+                DELETE FROM "{tbl}" 
+                WHERE "Timestamp" IN (
+                    SELECT "Timestamp" FROM dups WHERE rn > 1
+                )
+            """,
+                min_new_ts,
+            )
+
+    return current_db
+
+
 async def process_pair(exchange, symbol, ccxt_id):
     tbl = f"{symbol.replace('/', '_').replace('-', '_')}_on_{ccxt_id}".lower()
     current_db, last_ts, min_ts = await find_table_in_dbs(tbl)
@@ -1199,87 +1299,7 @@ async def process_pair(exchange, symbol, ccxt_id):
             return 0, 0, 0, 0
 
         cs = all_candles
-
-        df = pd.DataFrame(cs, columns=["ts", "open", "high", "low", "close", "volume"])
-        df["Timestamp"] = df["ts"] // 1000
-        df["ticker"], df["exchange"] = symbol, ccxt_id
-        df["volume_x_low"] = df["volume"] * df["low"]
-        df["volume_x_close"] = df["volume"] * df["close"]
-        df["asset_type"] = "swap" if ":" in symbol else "spot"
-
-        dt_utc = pd.to_datetime(df["Timestamp"], unit="s", utc=True)
-        df["open_time_msk"] = dt_utc.dt.tz_convert(MSK_TZ).dt.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-        df["open_time_almaty"] = dt_utc.dt.tz_convert(ALMATY_TZ).dt.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-
-        if not current_db:
-            current_db = DB_LOW
-            async with db_pools[current_db].acquire() as conn:
-                cols = [f'"{c}" {t}' for c, t in ALL_COLUMNS_SQL.items()]
-                await conn.execute(f'CREATE TABLE "{tbl}" ({", ".join(cols)})')
-                try:
-                    await conn.execute(
-                        f"SELECT create_hypertable('{tbl}', 'Timestamp', if_not_exists => TRUE)"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"  [TIMESCALEDB] Failed creating hypertable for {tbl}: {e}"
-                    )
-
-        async with db_pools[current_db].acquire() as conn:
-            actual_cols = list(ALL_COLUMNS_SQL.keys())
-            existing_cols = {
-                r["column_name"]
-                for r in await conn.fetch(
-                    "SELECT column_name FROM information_schema.columns WHERE table_name=$1",
-                    tbl,
-                )
-            }
-            for col in actual_cols:
-                if col not in existing_cols:
-                    await conn.execute(
-                        f'ALTER TABLE "{tbl}" ADD COLUMN "{col}" {ALL_COLUMNS_SQL[col]}'
-                    )
-
-            tuples = [
-                tuple(None if pd.isna(x) else x for x in row)
-                for row in df[actual_cols].to_numpy()
-            ]
-
-            min_new_ts = int(df["Timestamp"].min())
-            async with conn.transaction():
-                await conn.execute(
-                    f'DELETE FROM "{tbl}" WHERE "Timestamp" >= $1', min_new_ts
-                )
-                await conn.copy_records_to_table(
-                    tbl, records=tuples, columns=actual_cols
-                )
-
-                # Dedup window is scoped to the freshly written range: the
-                # un-scoped variant scanned the whole 180-day table per pair
-                # per cycle.
-                await conn.execute(
-                    f"""
-                    WITH dups AS (
-                        SELECT "Timestamp",
-                               row_number() OVER (
-                                   PARTITION BY ("Timestamp" / 900)
-                                   ORDER BY COALESCE(volume, 0) DESC, "Timestamp" DESC
-                               ) AS rn
-                        FROM "{tbl}"
-                        WHERE "Timestamp" >= $1
-                    )
-                    DELETE FROM "{tbl}" 
-                    WHERE "Timestamp" IN (
-                        SELECT "Timestamp" FROM dups WHERE rn > 1
-                    )
-                """,
-                    min_new_ts,
-                )
-
+        current_db = await save_candles_to_table(current_db, tbl, symbol, ccxt_id, cs)
         total_bars, gaps_found, gaps_filled = await check_and_fill_table_gaps(
             exchange, symbol, tbl, current_db, ccxt_name=ccxt_id
         )
@@ -1718,6 +1738,130 @@ async def process_exchange(ccxt_name):
         pass
 
 
+# ---------------------------------------------------------------------------
+# PRIORITY LANE — 1-second refresh of the pairs the dashboard is displaying.
+#
+# The dashboard publishes the open pair plus its ±5 neighbours into
+# `dashboard_priority_pairs`; this task refreshes exactly those tables every
+# second, in parallel with the ~40-minute full sweep. The dashboard therefore
+# renders stored rows only: no chart-side downloading, no chart-side maths.
+# ---------------------------------------------------------------------------
+
+_LANE_LAST_RUN: Dict[Tuple[str, str], float] = {}
+_LANE_INFLIGHT: Set[Tuple[str, str]] = set()
+
+
+async def refresh_priority_pair(ccxt_name: str, symbol: str) -> int:
+    """
+    Tail refresh of ONE pair: fetch the last few 15m candles and persist them
+    through the same writer the main cycle uses. Deliberately light — no gap
+    scan, no history prefill, no tier moves; the full sweep still owns those.
+    Returns the number of candles written (0 on any failure).
+    """
+    ccxt_id = EXCHANGE_MAP.get(ccxt_name, ccxt_name)
+    if (ccxt_name, symbol) in _DEAD_SYMBOLS or should_skip_pair(symbol, ccxt_name):
+        return 0
+
+    exchange = await get_persistent_exchange(ccxt_name)
+    if exchange is None:
+        return 0
+
+    tbl = f"{symbol.replace('/', '_').replace('-', '_')}_on_{ccxt_name}".lower()
+    current_db, last_ts, _min_ts = await find_table_in_dbs(tbl)
+
+    # Cover the forming bar plus a couple of closed ones, and never ask for
+    # more than the exchange's allowed lookback window (Gate.io).
+    since_ms = clamp_ohlcv_since_ms(ccxt_name, (int(time.time()) - 4 * 900) * 1000)
+    if last_ts > 1:
+        since_ms = max(since_ms, clamp_ohlcv_since_ms(ccxt_name, last_ts * 1000))
+
+    try:
+        cs = await asyncio.wait_for(
+            exchange.fetch_ohlcv(symbol, "15m", since=since_ms, limit=10),
+            timeout=8.0,
+        )
+    except Exception as e:
+        _mark_dead_symbol_if_gone(e, ccxt_name, symbol)
+        return 0
+
+    if not cs:
+        return 0
+
+    try:
+        await save_candles_to_table(current_db, tbl, symbol, ccxt_id, cs)
+    except Exception as e:
+        log(f"  [LANE] ⚠️ {symbol} @{ccxt_name}: write failed ({type(e).__name__}: {e})")
+        return 0
+    return len(cs)
+
+
+async def _lane_worker(pair: Tuple[str, str], stats: Dict[str, int]) -> None:
+    exchange_name, symbol = pair
+    try:
+        written = await refresh_priority_pair(exchange_name, symbol)
+        stats["candles"] += written
+        stats["pairs"] += 1
+    finally:
+        _LANE_LAST_RUN[pair] = time.time()
+        _LANE_INFLIGHT.discard(pair)
+
+
+async def priority_lane_loop() -> None:
+    """
+    Parallel task started next to the full sweep: every
+    PRIORITY_LANE_INTERVAL_SEC it reads the dashboard's published pair set and
+    refreshes each pair whose own interval has elapsed. Never raises — a lane
+    hiccup must not take the collector down.
+    """
+    if not settings.priority_lane_enabled:
+        log("[15M] priority lane disabled (PRIORITY_LANE_ENABLED=false)")
+        return
+
+    interval = max(0.2, float(settings.priority_lane_interval_sec))
+    ttl = float(settings.priority_lane_ttl_sec)
+    coord_db = settings.priority_lane_db or DB_HIGH
+    log(
+        f"[15M] ⚡ priority lane ON: refreshing dashboard pairs from "
+        f"'{coord_db}.{PRIORITY_TABLE}' every {interval:g}s "
+        f"(≤{MAX_PRIORITY_PAIRS} pairs, publication TTL {ttl:g}s)"
+    )
+
+    stats = {"pairs": 0, "candles": 0}
+    last_report = time.time()
+
+    while True:
+        started = time.time()
+        try:
+            pool = db_pools.get(coord_db)
+            if pool is None:
+                await asyncio.sleep(interval)
+                continue
+
+            async with pool.acquire() as conn:
+                pairs = await read_priority_pairs(conn, ttl_sec=ttl)
+
+            due = [
+                p for p in due_pairs(pairs, _LANE_LAST_RUN, interval)
+                if p not in _LANE_INFLIGHT
+            ]
+            for p in due:
+                _LANE_INFLIGHT.add(p)
+                asyncio.create_task(_lane_worker(p, stats))
+
+            if time.time() - last_report >= 60.0:
+                log(
+                    f"  [LANE] last 60s: {stats['pairs']} refreshes, "
+                    f"{stats['candles']} candles written, "
+                    f"{len(pairs)} pair(s) currently displayed"
+                )
+                stats = {"pairs": 0, "candles": 0}
+                last_report = time.time()
+        except Exception as e:
+            log(f"  [LANE] ⚠️ cycle error ({type(e).__name__}: {e})")
+
+        await asyncio.sleep(max(0.05, interval - (time.time() - started)))
+
+
 async def main_15m_loop():
     await init_db_pools()
     await drop_not_allowed_exchange_tables()
@@ -1734,8 +1878,19 @@ async def main_15m_loop():
     # (e.g. bitget) are skipped — the 1d engine still covers them.
     active_exchanges = [e for e in EXCHANGE_MAP.keys() if e in ALLOWED_EXCHANGES]
 
+    # The priority lane runs FOREVER in parallel with the sweep below: the
+    # sweep gives every pair a slow full refresh (~40 min at 7.5k pairs), the
+    # lane keeps the ≤12 pairs the dashboard is showing second-fresh.
+    lane_task = asyncio.create_task(priority_lane_loop(), name="priority-lane")
+
     global GLOBAL_PROGRESS
     while True:
+        if settings.priority_lane_enabled and lane_task.done() and not lane_task.cancelled():
+            exc = lane_task.exception()
+            if exc is not None:
+                log(f"  [LANE] ⚠️ lane task died ({type(exc).__name__}: {exc}) — restarting")
+            lane_task = asyncio.create_task(priority_lane_loop(), name="priority-lane")
+
         if not active_exchanges:
             log(
                 f"⚠️  [15M] no exchange to serve: ALLOWED_EXCHANGES="

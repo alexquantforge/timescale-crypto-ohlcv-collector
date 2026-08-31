@@ -223,5 +223,18 @@ class Settings(BaseSettings):
     progress_log_every: int = Field(default=25, alias="PROGRESS_LOG_EVERY")
     precount_pairs: bool = Field(default=True, alias="PRECOUNT_PAIRS")
 
+    # Priority lane: 1-second refresh of the pairs the dashboard is showing.
+    # The dashboard publishes the open pair ±5 neighbours into
+    # `dashboard_priority_pairs`; the 15m engine refreshes exactly those
+    # tables in parallel with the full sweep, so the dashboard never has to
+    # download or compute anything itself.
+    priority_lane_enabled: bool = Field(default=True, alias="PRIORITY_LANE_ENABLED")
+    priority_lane_interval_sec: float = Field(default=1.0, alias="PRIORITY_LANE_INTERVAL_SEC")
+    # A published set expires this fast, so closing the browser tab stops the
+    # lane instead of pinning the engine to an abandoned pair.
+    priority_lane_ttl_sec: float = Field(default=90.0, alias="PRIORITY_LANE_TTL_SEC")
+    # Coordination database holding the tiny handshake table (empty = 15m HIGH).
+    priority_lane_db: str = Field(default="", alias="PRIORITY_LANE_DB")
+
 
 settings = Settings()

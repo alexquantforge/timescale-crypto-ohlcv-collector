@@ -1,0 +1,164 @@
+"""Tests for the dashboard → 15m engine priority-pair channel."""
+import time
+
+import pytest
+
+from src.core.priority_pairs import (
+    MAX_PRIORITY_PAIRS,
+    PRIORITY_TABLE,
+    due_pairs,
+    normalize_pairs,
+    select_fresh,
+)
+
+
+def test_normalize_pairs_accepts_dashboard_dicts_and_tuples():
+    pairs = normalize_pairs([
+        {"db": "x", "ex": "bybit", "ccxt": "bybit", "sym": "0G/USDT:USDT"},
+        ("bybit", "BTC/USDT"),
+        {"ex": "bybit", "sym": "0G/USDT:USDT"},   # duplicate -> dropped
+        {"ex": "", "sym": "ETH/USDT"},            # no exchange -> dropped
+        {"ex": "bybit", "sym": "GARBAGE"},        # not a pair -> dropped
+        None,
+    ])
+    assert pairs == [("bybit", "0G/USDT:USDT"), ("bybit", "BTC/USDT")]
+
+
+def test_normalize_pairs_keeps_order_and_caps_the_set():
+    # The open pair is published first, so the cap must never drop it.
+    raw = [{"ex": "bybit", "sym": f"C{i}/USDT"} for i in range(30)]
+    pairs = normalize_pairs(raw)
+    assert len(pairs) == MAX_PRIORITY_PAIRS
+    assert pairs[0] == ("bybit", "C0/USDT")
+
+
+def test_select_fresh_drops_expired_publications():
+    rows = [
+        ("bybit", "0G/USDT:USDT", 2.0),      # dashboard is open on it
+        ("bybit", "OLD/USDT", 950.0),        # tab closed 15 min ago
+        ("bybit", "BAD/USDT", "nan-ish"),    # unparsable age
+        ("", "NOEX/USDT", 1.0),
+    ]
+    assert select_fresh(rows, ttl_sec=90.0) == [("bybit", "0G/USDT:USDT")]
+
+
+def test_due_pairs_respects_per_pair_interval():
+    now = 1_790_000_000.0
+    pairs = [("bybit", "A/USDT"), ("bybit", "B/USDT"), ("bybit", "C/USDT")]
+    last_run = {
+        ("bybit", "A/USDT"): now - 0.2,   # refreshed 200 ms ago -> not due
+        ("bybit", "B/USDT"): now - 1.5,   # due
+        # C never ran -> due
+    }
+    assert due_pairs(pairs, last_run, 1.0, now=now) == [
+        ("bybit", "B/USDT"),
+        ("bybit", "C/USDT"),
+    ]
+
+
+def test_priority_table_name_is_stable():
+    # Both sides (dashboard publisher, engine reader) hardcode nothing else.
+    assert PRIORITY_TABLE == "dashboard_priority_pairs"
+
+
+class _FakeConn:
+    """Minimal asyncpg-like connection recording the statements it receives."""
+
+    def __init__(self, rows=None):
+        self.executed = []
+        self.many = []
+        self._rows = rows or []
+
+    async def execute(self, sql, *args):
+        self.executed.append((" ".join(sql.split()), args))
+
+    async def executemany(self, sql, args):
+        self.many.append((" ".join(sql.split()), list(args)))
+
+    async def fetch(self, sql, *args):
+        self.executed.append((" ".join(sql.split()), args))
+        return self._rows
+
+
+@pytest.mark.asyncio
+async def test_publish_creates_table_upserts_and_expires():
+    from src.core.priority_pairs import publish_priority_pairs
+
+    conn = _FakeConn()
+    n = await publish_priority_pairs(
+        conn, [{"ex": "bybit", "sym": "0G/USDT:USDT"}, ("bybit", "BTC/USDT")], ttl_sec=90.0
+    )
+    assert n == 2
+    assert any("CREATE TABLE IF NOT EXISTS" in sql for sql, _ in conn.executed)
+    assert any("DELETE FROM" in sql for sql, _ in conn.executed)
+    sql, rows = conn.many[0]
+    assert "ON CONFLICT (exchange, symbol) DO UPDATE" in sql
+    assert rows == [("bybit", "0G/USDT:USDT"), ("bybit", "BTC/USDT")]
+
+
+@pytest.mark.asyncio
+async def test_read_priority_pairs_filters_by_age():
+    from src.core.priority_pairs import read_priority_pairs
+
+    conn = _FakeConn(rows=[
+        {"exchange": "bybit", "symbol": "0G/USDT:USDT", "age": 1.0},
+        {"exchange": "bybit", "symbol": "STALE/USDT", "age": 3600.0},
+    ])
+    assert await read_priority_pairs(conn, ttl_sec=90.0) == [("bybit", "0G/USDT:USDT")]
+
+
+def test_due_pairs_defaults_to_wall_clock():
+    pairs = [("bybit", "A/USDT")]
+    assert due_pairs(pairs, {("bybit", "A/USDT"): time.time()}, 1.0) == []
+
+
+# ---------------------------------------------------------------------------
+# Engine-side lane worker (fetch tail -> write through the shared writer)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_refresh_priority_pair_writes_through_the_shared_writer(monkeypatch):
+    import src.core.updater_15m as u
+
+    written = {}
+
+    class _Ex:
+        async def fetch_ohlcv(self, symbol, tf, since=None, limit=None):
+            assert tf == "15m" and limit == 10
+            written["since"] = since
+            return [[1_790_000_000_000, 1, 2, 0.5, 1.5, 10]]
+
+    async def _fake_persistent(name):
+        return _Ex()
+
+    async def _fake_find(tbl):
+        written["tbl"] = tbl
+        return "db_low_15m", 1_789_999_100, 1_700_000_000
+
+    async def _fake_save(db, tbl, symbol, ccxt_id, cs):
+        written["save"] = (db, tbl, symbol, ccxt_id, len(cs))
+        return db
+
+    monkeypatch.setattr(u, "get_persistent_exchange", _fake_persistent)
+    monkeypatch.setattr(u, "find_table_in_dbs", _fake_find)
+    monkeypatch.setattr(u, "save_candles_to_table", _fake_save)
+
+    n = await u.refresh_priority_pair("bybit", "0G/USDT:USDT")
+
+    assert n == 1
+    assert written["tbl"] == "0g_usdt:usdt_on_bybit"
+    assert written["save"][1:] == ("0g_usdt:usdt_on_bybit", "0G/USDT:USDT", "bybit", 1)
+
+
+@pytest.mark.asyncio
+async def test_refresh_priority_pair_skips_dead_and_filtered_symbols(monkeypatch):
+    import src.core.updater_15m as u
+
+    async def _boom(*a, **k):  # must never be reached
+        raise AssertionError("exchange must not be touched")
+
+    monkeypatch.setattr(u, "get_persistent_exchange", _boom)
+    monkeypatch.setattr(u, "_DEAD_SYMBOLS", {("bybit", "GONE/USDT")})
+
+    assert await u.refresh_priority_pair("bybit", "GONE/USDT") == 0
+    assert await u.refresh_priority_pair("bybit", "BTC3L/USDT") == 0  # leveraged token

@@ -36,6 +36,7 @@ from config.settings import settings
 from src.analytics.atr_filtered import compute_atr_no_paranormal_bars
 from src.analytics.orderbook import fetch_orderbook_snapshot
 from src.exchanges.client import create_exchange, close_exchange_safely
+from src.core.priority_pairs import publish_priority_pairs
 from dashboard.helpers import (
     shift_option,
     exchanges_for_ticker,
@@ -514,10 +515,28 @@ def _candles_query_ok(db: str, table: str, to_ts: int) -> bool:
 
 
 def _set_live_target(pairs: list) -> None:
-    """Replaces the writer's working set (current pair ± 5 neighbours)."""
+    """Replaces the writer's working set (current pair ± 5 neighbours).
+
+    Also PUBLISHES that set to the 15m engine through
+    `dashboard_priority_pairs`: the engine's priority lane then refreshes
+    exactly these tables in TimescaleDB every second, which is what keeps the
+    dashboard a pure renderer of stored rows.
+    """
     with _LIVE_TARGET_LOCK:
         _LIVE_TARGET["ts"] = time.time()
         _LIVE_TARGET["pairs"] = list(pairs or [])
+    _publish_priority_pairs_async(pairs)
+
+
+def _publish_priority_pairs_async(pairs: list) -> None:
+    """Fire-and-forget publish on the live infra loop (never blocks the UI)."""
+    infra = _live_infra_or_none()
+    if not infra or not infra.get("submit_publish"):
+        return
+    try:
+        infra["submit_publish"](pairs)
+    except Exception:
+        pass
 
 
 def _get_live_target():
@@ -673,6 +692,27 @@ def _live_infra() -> dict:
                     pass
             return resp
 
+        async def publish_pairs(pairs):
+            """Hands the displayed pair set to the engine's priority lane."""
+            db_name = getattr(settings, "priority_lane_db", "") or getattr(
+                settings, "db_high_15m", ""
+            )
+            if not db_name:
+                return 0
+            pool = await get_pool(db_name)
+            async with pool.acquire() as conn:
+                return await publish_priority_pairs(
+                    conn, pairs, ttl_sec=getattr(settings, "priority_lane_ttl_sec", 90.0)
+                )
+
+        def submit_publish(pairs, timeout=5.0):
+            try:
+                return asyncio.run_coroutine_threadsafe(
+                    publish_pairs(pairs), loop
+                ).result(timeout=timeout)
+            except Exception:
+                return None
+
         def submit_upsert(db, ex, sym, payload, timeout=5.0):
             try:
                 return asyncio.run_coroutine_threadsafe(
@@ -697,6 +737,7 @@ def _live_infra() -> dict:
             except Exception:
                 return None
 
+        infra["submit_publish"] = submit_publish
         infra["submit_upsert"] = submit_upsert
         infra["submit_select"] = submit_select
         infra["submit_candles"] = submit_candles
