@@ -1405,6 +1405,28 @@ PROGRESS_LOG_EVERY: int = settings.progress_log_every
 PRECOUNT_PAIRS: bool = settings.precount_pairs
 
 
+def format_pair_result(count: int, total_bars: int, gaps_found: int, gaps_filled: int) -> str:
+    """
+    Per-pair log tail: "+4 candles, 180.1d stored, no gaps. OK".
+
+    `total_bars` is 0 whenever check_and_fill_table_gaps() short-circuits on
+    its per-table cooldown (gap_recheck_sec, 6h) — printing "0.0d stored" then
+    read like an EMPTY table and sent people hunting a data-loss bug that was
+    not there. Say "gap scan on cooldown" instead; the depth line is printed
+    only when the scan really ran.
+    """
+    if total_bars > 0:
+        depth = f"{round(total_bars / 96, 1)}d stored"
+    else:
+        depth = "gap scan on cooldown"
+    gaps = (
+        f"⚠️ gaps: {gaps_found}, filled: {gaps_filled}"
+        if gaps_found > 0
+        else "no gaps. OK"
+    )
+    return f"+{count} candles, {depth}, {gaps}"
+
+
 def _fmt_eta(seconds: float) -> str:
     try:
         s = int(max(0, round(seconds)))
@@ -1412,9 +1434,12 @@ def _fmt_eta(seconds: float) -> str:
         return "?"
     h, rem = divmod(s, 3600)
     m, sec = divmod(rem, 60)
+    # Unit suffixes on purpose: the bare "22:13" was routinely misread as a
+    # wall-clock time ("last updated at 22:13") instead of "22 min 13 s left".
     if h > 0:
-        return f"{h}:{m:02d}:{sec:02d}"
-    return f"{m}:{sec:02d}"
+        return f"{h}h{m:02d}m"
+    return f"{m}m{sec:02d}s"
+
 
 
 class GlobalProgress:
@@ -1672,25 +1697,19 @@ async def process_exchange(ccxt_name):
                     exchange, s, ccxt_name
                 )
                 processed += 1
-                total_days = round(total_bars / 96, 1)
-                if gaps_found > 0:
-                    gap_msg = f"⚠️ gaps: {gaps_found}, filled: {gaps_filled}"
-                else:
-                    gap_msg = "no gaps. OK"
+                result_msg = format_pair_result(count, total_bars, gaps_found, gaps_filled)
 
                 if GLOBAL_PROGRESS is not None:
                     g_done, g_total, eta_str, pct = GLOBAL_PROGRESS.tick()
                     if count > 0 or g_done % PROGRESS_LOG_EVERY == 0:
                         log(
                             f"  [15M] [ALL {g_done}/{g_total} · {pct:.1f}% · ETA {eta_str}] "
-                            f"[{ccxt_name} {processed}/{total}] {s}: +{count} candles, "
-                            f"{total_days}d stored, {gap_msg}"
+                            f"[{ccxt_name} {processed}/{total}] {s}: {result_msg}"
                         )
                 else:
                     if count > 0 or processed % 10 == 0:
                         log(
-                            f"  [15M] [{ccxt_name}] {processed}/{total} | {s}: +{count} candles, "
-                            f"{total_days}d stored, {gap_msg}"
+                            f"  [15M] [{ccxt_name}] {processed}/{total} | {s}: {result_msg}"
                         )
 
         await asyncio.gather(*[worker(s) for s in syms])

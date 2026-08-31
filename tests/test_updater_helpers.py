@@ -74,3 +74,26 @@ def test_allowed_15m_exchanges_accepts_json_list():
     assert _compute_allowed_15m_exchanges(
         ["bybit", "gateio", "mexc", "okx", "bingx"], '["bybit","gateio"]', ""
     ) == {"bybit", "gateio"}
+
+
+# ---------------------------------------------------------------------------
+# Per-pair log line & ETA formatting
+# ---------------------------------------------------------------------------
+
+def test_format_pair_result_cooldown_is_not_reported_as_empty_table():
+    """total_bars == 0 means the gap scan hit its 6h cooldown, NOT an empty
+    table — the old '0.0d stored' text read like data loss."""
+    from src.core.updater_15m import format_pair_result
+
+    assert format_pair_result(4, 0, 0, 0) == "+4 candles, gap scan on cooldown, no gaps. OK"
+    assert format_pair_result(4, 17280, 0, 0) == "+4 candles, 180.0d stored, no gaps. OK"
+    assert "⚠️ gaps: 2, filled: 1" in format_pair_result(0, 96, 2, 1)
+
+
+def test_fmt_eta_is_not_mistakable_for_a_wall_clock_time():
+    from src.core.progress import fmt_eta
+
+    assert fmt_eta(22 * 60 + 13) == "22m13s"       # was "22:13" -> read as 22:13 o'clock
+    assert fmt_eta(22 * 3600 + 13 * 60) == "22h13m"
+    assert fmt_eta(-5) == "0m00s"
+    assert fmt_eta("nope") == "?"
