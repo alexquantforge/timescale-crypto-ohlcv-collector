@@ -47,6 +47,7 @@ from dashboard.helpers import (
     find_perp_ticker,
     sanitize_candle_frame,
     filter_sane_summary_rows,
+    drop_stale_spot_duplicates,
     merge_intraday_into_daily,
     build_live_poller_js,
     build_history_loader_js,
@@ -1437,6 +1438,14 @@ limit_1d = st.sidebar.slider("Candles · 1D chart", min_value=100, max_value=150
 
 table_tf = st.sidebar.selectbox("📊 Liquidity table timeframe", options=["15m", "1d"], index=0)
 
+hide_spot_dupes = st.sidebar.checkbox(
+    "🚫 Hide dead spot duplicates",
+    value=True,
+    help="Perp-first: once BASE/USDT:USDT exists, the collector stops writing the "
+         "BASE/USDT spot table and it freezes forever. Hides such spot rows when a "
+         "fresher perp table exists for the same base+exchange.",
+)
+
 if st.sidebar.button("🔄 Refresh data (clear caches)"):
     load_summary_cached.clear()
     load_candles_cached.clear()
@@ -1483,6 +1492,13 @@ if enabled_exs and not df_1d.empty:
 # sanitize drops every candle — such pairs must never enter the pair list.
 df_15m = filter_sane_summary_rows(df_15m)
 df_1d = filter_sane_summary_rows(df_1d)
+
+# Perp-first leftovers: a spot table frozen at the day its perp was listed
+# (0G/USDT @bybit: spot 983h behind, perp 0.7h behind). Opening such a pair
+# looks like a data bug — candles end weeks before the live price line.
+if hide_spot_dupes:
+    df_15m = drop_stale_spot_duplicates(df_15m)
+    df_1d = drop_stale_spot_duplicates(df_1d)
 
 df_table = df_15m if table_tf == "15m" else df_1d
 

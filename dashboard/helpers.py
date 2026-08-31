@@ -325,6 +325,53 @@ def filter_sane_summary_rows(df: pd.DataFrame, min_ts: int = 1356998400) -> pd.D
     return df[ok.fillna(False)]
 
 
+def drop_stale_spot_duplicates(
+    df: pd.DataFrame, max_lag_sec: int = 3 * 86400
+) -> pd.DataFrame:
+    """
+    Drops SPOT summary rows that are dead leftovers of the perp-first switch.
+
+    When a base asset gets a perpetual contract on an exchange, the collector
+    starts writing only `BASE/USDT:USDT` and the old `BASE/USDT` spot table is
+    never touched again (nothing drops it). It still shows up in the pair list
+    and opening it looks like a bug: candles end weeks ago while the live price
+    line sits at the current price (0G/USDT @bybit — spot 983h behind, perp
+    0.7h behind).
+
+    A spot row is dropped only when BOTH hold for the same (base, exchange):
+      * a perp row exists, and
+      * the spot table's last candle is more than `max_lag_sec` older than the
+        perp one (a spot market that is still actively collected stays).
+    """
+    if df is None or df.empty or "ticker" not in df.columns:
+        return df
+
+    ts = pd.to_numeric(df.get("max_ts"), errors="coerce").fillna(0)
+    ts = ts.where(ts < 1e11, ts // 1000)  # ms-epoch rows → seconds
+
+    perp_ts: dict = {}
+    for (idx, ticker), exchange in zip(df["ticker"].items(), df.get("exchange", "")):
+        if ":" in str(ticker):
+            base = str(ticker).split("/")[0].upper()
+            key = (base, exchange)
+            perp_ts[key] = max(perp_ts.get(key, 0), float(ts.get(idx, 0)))
+
+    if not perp_ts:
+        return df
+
+    keep = []
+    for (idx, ticker), exchange in zip(df["ticker"].items(), df.get("exchange", "")):
+        ticker = str(ticker)
+        if ":" in ticker:
+            keep.append(True)
+            continue
+        base = ticker.split("/")[0].upper()
+        p_ts = perp_ts.get((base, exchange), 0)
+        keep.append(not (p_ts and float(ts.get(idx, 0)) < p_ts - max_lag_sec))
+
+    return df[pd.Series(keep, index=df.index)]
+
+
 # ---------------------------------------------------------------------------
 # Pair links & shortability badge
 # ---------------------------------------------------------------------------

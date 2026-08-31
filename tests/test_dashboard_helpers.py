@@ -740,3 +740,40 @@ def test_stitch_candle_gaps_bridges_weeks_stale_tail():
     assert calls, "tail range must be requested from the exchange"
     assert added == (now // step) - (last // step) - 1
     assert int(out["ts"].max()) // step == now // step - 1  # forming bar excluded
+
+
+def _summary_row(ticker, exchange, max_ts):
+    return {"ticker": ticker, "exchange": exchange, "max_ts": max_ts}
+
+
+def test_drop_stale_spot_duplicates_removes_frozen_spot_keeps_perp():
+    """0G @bybit: spot table frozen 41 days ago, perp fresh -> only the perp
+    stays in the pair list."""
+    import pandas as pd
+    from dashboard.helpers import drop_stale_spot_duplicates
+
+    now = 1_790_000_000
+    df = pd.DataFrame([
+        _summary_row("0G/USDT:USDT", "bybit", now - 2_520),
+        _summary_row("0G/USDT", "bybit", now - 41 * 86400),
+        _summary_row("BTC/USDT", "bybit", now - 900),          # spot, no perp row
+        _summary_row("ETH/USDT", "bybit", now - 1_800),        # spot, fresh next to perp
+        _summary_row("ETH/USDT:USDT", "bybit", now - 900),
+        _summary_row("0G/USDT", "gateio", now - 41 * 86400),   # other exchange, no perp
+    ])
+    out = drop_stale_spot_duplicates(df)
+    tickers = list(zip(out["ticker"], out["exchange"]))
+    assert ("0G/USDT", "bybit") not in tickers
+    assert ("0G/USDT:USDT", "bybit") in tickers
+    assert ("BTC/USDT", "bybit") in tickers
+    assert ("ETH/USDT", "bybit") in tickers        # actively collected spot stays
+    assert ("0G/USDT", "gateio") in tickers        # no perp there -> keep
+
+
+def test_drop_stale_spot_duplicates_noop_without_perps():
+    import pandas as pd
+    from dashboard.helpers import drop_stale_spot_duplicates
+
+    df = pd.DataFrame([_summary_row("BTC/USDT", "bybit", 1_790_000_000)])
+    assert len(drop_stale_spot_duplicates(df)) == 1
+    assert drop_stale_spot_duplicates(pd.DataFrame()).empty
