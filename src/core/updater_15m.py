@@ -1166,10 +1166,15 @@ async def process_pair(exchange, symbol, ccxt_id):
                 await asyncio.sleep(0.05)
 
         if last_ts > 0:
-            # Catch-up: from the last stored candle forward to now.
+            # Catch-up: from ONE BAR BEFORE the last stored candle forward to
+            # now. The newest stored bar was written while still forming, so
+            # it has to be re-downloaded and replaced (save_candles_to_table
+            # deletes everything >= the oldest fetched timestamp). Starting
+            # exactly AT last_ts leaves that bar untouched on exchanges whose
+            # `since` is exclusive — a permanently half-finished candle.
             if last_ts < download_min_ts:
                 last_ts = download_min_ts
-            cursor_ms = clamp_ohlcv_since_ms(ccxt_id, last_ts * 1000)
+            cursor_ms = clamp_ohlcv_since_ms(ccxt_id, max(0, last_ts - 900) * 1000)
             await _paged_forward_fill(cursor_ms, max_pages=40)
         else:
             # New symbol: full initial history FORWARD from the retention floor
@@ -1777,11 +1782,20 @@ async def refresh_priority_pair(ccxt_name: str, symbol: str) -> int:
         # published by a dashboard must never spawn an empty junk table.
         return 0
 
-    # Cover the forming bar plus a couple of closed ones, and never ask for
-    # more than the exchange's allowed lookback window (Gate.io).
+    # Start ONE BAR BEFORE the last stored candle, never at it.
+    #
+    # The last stored bar is almost always a FORMING bar frozen mid-flight
+    # (the lane wrote it a second ago), so it must be re-downloaded and
+    # replaced, not appended to. save_candles_to_table() does that by deleting
+    # everything >= the oldest fetched timestamp — which only covers the stale
+    # bar if the fetch actually returns it. `since` is inclusive on most
+    # exchanges but exclusive on some, and that difference is exactly what
+    # leaves a permanently half-finished candle in the table. Stepping back
+    # one bar makes the rewrite unconditional on every exchange.
+    step_ms = 900 * 1000
     since_ms = clamp_ohlcv_since_ms(ccxt_name, (int(time.time()) - 4 * 900) * 1000)
     if last_ts > 1:
-        since_ms = max(since_ms, clamp_ohlcv_since_ms(ccxt_name, last_ts * 1000))
+        since_ms = max(since_ms, clamp_ohlcv_since_ms(ccxt_name, last_ts * 1000 - step_ms))
 
     try:
         cs = await asyncio.wait_for(

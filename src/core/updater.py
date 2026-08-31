@@ -361,17 +361,21 @@ class MarketDataEngine:
         tbl_name = f"{symbol.replace('/', '_').replace('-', '_')}_on_{ccxt_id}".lower()
         current_db, last_ts, first_ts = await self.repository.find_table(tbl_name)
 
+        # One bar back: the newest stored candle is a forming bar and must be
+        # re-downloaded so upsert_candles() (DELETE >= min_ts + COPY) replaces
+        # it instead of leaving a partial candle behind.
+        step_sec = 900 if self.timeframe == "15m" else 86400
         since_ts = int(time.time() - (settings.update_days * 86400))
         if settings.data_retention_days and self.timeframe == "15m":
             retention_cutoff = int(time.time() - (settings.data_retention_days * 86400))
             if last_ts > 0 and last_ts < retention_cutoff:
                 since_ts = retention_cutoff
             elif last_ts > 0:
-                since_ts = last_ts
+                since_ts = last_ts - step_sec
             else:
                 since_ts = retention_cutoff
         elif last_ts > 0:
-            since_ts = last_ts
+            since_ts = last_ts - step_sec
 
         bf_limit = settings.backfill_request_limit_per_exchange.get(
             ccxt_id, settings.backfill_request_limit
@@ -864,8 +868,12 @@ class MarketDataEngine:
         if exchange is None:
             return 0
 
+        # One bar BEFORE the last stored candle: that candle is a forming bar
+        # frozen mid-flight, and upsert_candles() replaces everything from the
+        # oldest fetched timestamp on — so the stale partial bar is rewritten
+        # even on exchanges whose `since` is exclusive.
         step = 900 if self.timeframe == "15m" else 86400
-        since_ms = max(int(last_ts or 0), int(time.time()) - 3 * step) * 1000
+        since_ms = max(int(last_ts or 0) - step, int(time.time()) - 3 * step) * 1000
         try:
             cs = await hard_wait_for(
                 exchange.fetch_ohlcv(symbol, self.timeframe, since=since_ms, limit=10),

@@ -240,3 +240,76 @@ async def test_1d_engine_lane_refreshes_the_daily_bar(monkeypatch):
 
     assert n == 1
     assert engine.repository.written == ("db_low_1d", "0g_usdt:usdt_on_gate", "1d", 1)
+
+
+# ---------------------------------------------------------------------------
+# The forming candle must be REWRITTEN, never appended to
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_15m_lane_refetches_the_last_stored_bar(monkeypatch):
+    """The newest stored bar is a forming candle frozen mid-flight; the lane
+    must ask for it again (one step earlier) so the DELETE >= min_ts rewrite
+    replaces it even where `since` is exclusive."""
+    import src.core.updater_15m as u
+
+    last_ts = 1_790_000_100  # inside the 1_790_000_100 // 900 bucket
+    seen = {}
+
+    class _Ex:
+        async def fetch_ohlcv(self, symbol, tf, since=None, limit=None):
+            seen["since"] = since
+            return [[last_ts * 1000, 1, 2, 0.5, 1.5, 10]]
+
+    async def _persistent(name):
+        return _Ex()
+
+    async def _find(tbl):
+        return "db_low_15m", last_ts, 1_700_000_000
+
+    async def _save(db, tbl, symbol, ccxt_id, cs):
+        seen["saved_min_ts"] = min(int(c[0]) // 1000 for c in cs)
+        return db
+
+    monkeypatch.setattr(u, "get_persistent_exchange", _persistent)
+    monkeypatch.setattr(u, "find_table_in_dbs", _find)
+    monkeypatch.setattr(u, "save_candles_to_table", _save)
+
+    await u.refresh_priority_pair("bybit", "0G/USDT:USDT")
+
+    assert seen["since"] <= (last_ts - 900) * 1000
+    # everything from the stale bar on is deleted before the COPY
+    assert seen["saved_min_ts"] <= last_ts
+
+
+@pytest.mark.asyncio
+async def test_1d_lane_refetches_the_forming_daily_bar(monkeypatch):
+    import src.core.updater as u1d
+
+    engine = u1d.MarketDataEngine(timeframe="1d")
+    last_ts = 1_789_948_800
+    seen = {}
+
+    class _Repo:
+        async def find_table(self, tbl):
+            return "db_low_1d", last_ts, 1_600_000_000
+
+        async def upsert_candles(self, db, tbl, df, timeframe="1d"):
+            seen["min_ts"] = int(df["Timestamp"].min())
+
+    class _Ex:
+        async def fetch_ohlcv(self, symbol, tf, since=None, limit=None):
+            seen["since"] = since
+            return [[last_ts * 1000, 1, 2, 0.5, 1.5, 10]]
+
+    async def _persistent(ccxt_id, ccxt_name):
+        return _Ex()
+
+    engine.repository = _Repo()
+    monkeypatch.setattr(u1d, "get_persistent_exchange", _persistent)
+    monkeypatch.setattr(engine, "get_configured_exchanges", lambda: ["bybit"])
+
+    await engine.refresh_priority_pair("bybit", "0G/USDT:USDT")
+
+    assert seen["since"] <= (last_ts - 86400) * 1000
+    assert seen["min_ts"] <= last_ts
