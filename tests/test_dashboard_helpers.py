@@ -717,3 +717,26 @@ def test_build_metric_chart_html_empty_series_safe():
 
     html = build_metric_chart_html("[]", "OI X", "#4c9aff", 230)
     assert "addLineSeries" in html and "const points = [];" in html
+
+
+def test_stitch_candle_gaps_bridges_weeks_stale_tail():
+    """A 30-day-stale 15m table must still get its tail stitched: the old
+    2000-bucket cap silently skipped it and the chart ended weeks before the
+    live price line (visible price gap)."""
+    from dashboard.helpers import stitch_candle_gaps
+
+    step = 900
+    now = 1_790_000_000
+    last = now - 30 * 86400  # ~2880 buckets behind
+    df = _mk_df([last - step, last])
+
+    calls = []
+
+    def fetcher(r0, r1):
+        calls.append((r0, r1))
+        return [[b * step * 1000, 1.0, 1.0, 1.0, 1.0, 1.0] for b in range(r0, r1)]
+
+    out, added = stitch_candle_gaps(df, fetcher, step, include_tail=True, now_sec=now)
+    assert calls, "tail range must be requested from the exchange"
+    assert added == (now // step) - (last // step) - 1
+    assert int(out["ts"].max()) // step == now // step - 1  # forming bar excluded

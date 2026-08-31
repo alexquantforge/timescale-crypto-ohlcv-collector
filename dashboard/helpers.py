@@ -1012,13 +1012,19 @@ def stitch_candle_gaps(
     max_gap_buckets: int = 2000,
     include_tail: bool = True,
     now_sec: Optional[int] = None,
+    max_tail_buckets: int = 40_000,
 ):
     """
     Fills gaps in a candle frame by fetching the missing bars through `fetcher`
     (a callable (start_bucket, end_bucket) -> [[ts_ms, o, h, l, c, v], ...]).
     With include_tail=True it also fetches the CLOSED bars between the last
     stored candle and now (the still-forming bar is left to the live poller —
-    closed bars are immutable and safe to cache). Pure data operation (fully
+    closed bars are immutable and safe to cache). The TAIL has its own, much
+    larger budget (`max_tail_buckets`, ~40k bars ≈ 1.1 years of 15m): an
+    interior hole of 3 weeks is suspicious, but a 3-week-stale table tail is
+    exactly the case that MUST be bridged — otherwise the chart ends weeks
+    before the live price line and the user sees a big empty price gap.
+    Pure data operation (fully
     testable with a fake fetcher); returns (new_df, added_count). The database
     itself is NOT modified.
     """
@@ -1032,7 +1038,7 @@ def stitch_candle_gaps(
     if include_tail and buckets:
         now = int(now_sec if now_sec is not None else _time.time())
         now_bucket = now // step
-        if buckets[-1] < now_bucket and now_bucket - buckets[-1] <= max_gap_buckets:
+        if buckets[-1] < now_bucket and now_bucket - buckets[-1] <= max_tail_buckets:
             ranges.append((buckets[-1] + 1, now_bucket))  # half-open: forming bar excluded
 
     if not ranges:

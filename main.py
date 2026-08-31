@@ -275,5 +275,124 @@ def check_gaps(
     )
 
 
+@app.command(name="diagnose-pair")
+def diagnose_pair(
+    symbol: str = typer.Argument(..., help="Pair as shown in the dashboard, e.g. '0G/USDT' or '0G/USDT:USDT'"),
+    exchange: str = typer.Option("bybit", help="Exchange id as used by the collector (bybit, gateio, okx, ...)"),
+):
+    """
+    Explain WHY a pair's chart is stale: which tables exist in the 4 databases,
+    how far behind each one is, and whether the collector still selects this
+    exact symbol (perp-first) or writes to the perp table instead.
+    """
+    import time
+    import datetime as _dt
+    from src.exchanges.symbol_selector import (
+        should_skip_pair,
+        select_symbols_perp_first,
+    )
+
+    base = (symbol.split("/")[0] or "").upper()
+    spot_sym = f"{base}/USDT"
+    perp_sym = f"{base}/USDT:USDT"
+
+    def _tbl(sym: str) -> str:
+        return f"{sym.replace('/', '_').replace('-', '_')}_on_{exchange}".lower()
+
+    candidates = {spot_sym: _tbl(spot_sym), perp_sym: _tbl(perp_sym)}
+
+    async def _scan():
+        out = []
+        dbs = [
+            ("1D HIGH", settings.db_high_1d), ("1D LOW", settings.db_low_1d),
+            ("15M HIGH", settings.db_high_15m), ("15M LOW", settings.db_low_15m),
+        ]
+        for label, db_name in dbs:
+            try:
+                conn = await asyncpg.connect(
+                    host=settings.db_host, port=settings.db_port,
+                    user=settings.db_user, password=settings.db_password,
+                    database=db_name, timeout=15,
+                )
+            except Exception as e:
+                console.print(f"[yellow]Could not connect to {db_name}: {e}[/yellow]")
+                continue
+            try:
+                for sym, tbl in candidates.items():
+                    exists = await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name=$1)",
+                        tbl,
+                    )
+                    if not exists:
+                        continue
+                    row = await conn.fetchrow(
+                        f'SELECT MIN("Timestamp") AS mn, MAX("Timestamp") AS mx, COUNT(*) AS n FROM "{tbl}"'
+                    )
+                    mx = int(row["mx"]) if row and row["mx"] else 0
+                    mn = int(row["mn"]) if row and row["mn"] else 0
+                    if mx > 1e11:  # legacy ms-epoch table
+                        mx //= 1000
+                        mn //= 1000
+                    age_h = (time.time() - mx) / 3600.0 if mx else float("inf")
+                    out.append({
+                        "db": label, "table": tbl, "symbol": sym,
+                        "rows": int(row["n"]) if row else 0,
+                        "first": _dt.datetime.fromtimestamp(mn, tz=_dt.timezone.utc).strftime("%Y-%m-%d %H:%M") if mn else "-",
+                        "last": _dt.datetime.fromtimestamp(mx, tz=_dt.timezone.utc).strftime("%Y-%m-%d %H:%M") if mx else "-",
+                        "age_h": age_h,
+                    })
+            finally:
+                await conn.close()
+        return out
+
+    found = asyncio.run(_scan())
+
+    t = Table(title=f"🔎 Tables for {base} @ {exchange}")
+    t.add_column("Database", style="cyan")
+    t.add_column("Table", style="white")
+    t.add_column("Rows", justify="right", style="green")
+    t.add_column("First", style="dim")
+    t.add_column("Last (UTC)", style="bold")
+    t.add_column("Behind", justify="right", style="magenta")
+    if not found:
+        console.print(f"[yellow]No table for {base} @ {exchange} in any of the 4 databases.[/yellow]")
+    else:
+        for r in sorted(found, key=lambda r: (r["db"], r["table"])):
+            behind = "—" if r["age_h"] == float("inf") else f"{r['age_h']:.1f}h"
+            style = "red" if r["age_h"] > 24 else "green"
+            t.add_row(r["db"], r["table"], f"{r['rows']:,}", r["first"],
+                      f"[{style}]{r['last']}[/{style}]", behind)
+        console.print(t)
+
+    # --- Would the collector still pick THIS symbol? ------------------------
+    console.print("\n[bold]Collector selection check (perp-first):[/bold]")
+    if should_skip_pair(symbol, exchange):
+        console.print(f"  [red]✗ {symbol} is filtered out by should_skip_pair() "
+                      f"(leveraged/stock/blacklisted token) — never collected.[/red]")
+    try:
+        import ccxt as _ccxt
+        ex = getattr(_ccxt, settings.exchange_map_1d.get(exchange, exchange))({"enableRateLimit": True})
+        markets = ex.load_markets()
+        syms = [s for s in markets if s in (spot_sym, perp_sym)]
+        selected = select_symbols_perp_first(syms, markets, exchange)
+        console.print(f"  markets present: {', '.join(syms) or 'none'}")
+        console.print(f"  collector would collect: [bold]{', '.join(selected) or 'nothing'}[/bold]")
+        if perp_sym in markets and symbol.split(":")[0] == symbol:
+            console.print(
+                f"  [yellow]⚠ {spot_sym} is a SPOT leftover: a perpetual ({perp_sym}) exists, "
+                f"so perp-first makes the collector write only {_tbl(perp_sym)}. "
+                f"The spot table stays frozen forever — open the perp pair in the dashboard "
+                f"(or drop the stale spot table).[/yellow]"
+            )
+    except Exception as e:
+        console.print(f"  [yellow]ccxt check skipped: {e}[/yellow]")
+
+    console.print(
+        "\n[dim]15m engine serves: bybit, gateio, mexc, okx, bingx "
+        f"(ALLOWED_EXCHANGES={','.join(settings.allowed_exchanges) or 'all'}, "
+        f"EXCLUDED_EXCHANGES={','.join(settings.excluded_exchanges) or 'none'}).[/dim]"
+    )
+
+
 if __name__ == "__main__":
     app()

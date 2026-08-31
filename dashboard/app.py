@@ -362,10 +362,14 @@ def _fetch_missing_candles_cached(ccxt_id: str, symbol: str, timeframe: str, r0:
     except Exception:
         return []
 
+    # Pages needed for the requested span (+1 slack), bounded so a very stale
+    # table (weeks behind) is still bridged completely instead of stopping
+    # mid-way at a fixed 6-page cap.
+    pages = min(40, max(2, (int(r1) - int(r0)) // 1000 + 2))
     out = []
     cursor = r0 * step_ms
     try:
-        for _ in range(6):  # up to 6 pages per gap range
+        for _ in range(pages):  # paged catch-up over the requested gap
             batch = ex.fetch_ohlcv(symbol, timeframe, since=cursor, limit=1000)
             if not batch:
                 break
@@ -375,7 +379,10 @@ def _fetch_missing_candles_cached(ccxt_id: str, symbol: str, timeframe: str, r0:
                     out.append(c)
             if batch[-1][0] >= (r1 - 1) * step_ms:
                 break
-            cursor = batch[-1][0] + step_ms
+            nxt = batch[-1][0] + step_ms
+            if nxt <= cursor:  # exchange ignored `since` → no progress, stop
+                break
+            cursor = nxt
     except Exception:
         pass
     return out
@@ -1255,17 +1262,29 @@ def _render_chart_html_cached(
         frame = merge_intraday_into_daily(frame, df15)
 
     stale_hint = ""
-    if stitched and max_ts and max_ts > 0:
+    age_h = None
+    if max_ts and max_ts > 0:
         mt = max_ts // 1000 if max_ts > 1e11 else max_ts
         age_h = (time.time() - mt) / 3600.0
-        thr = 1.0 if tf_key == "15m" else 49.0
-        if age_h > thr:
-            stale_hint = f" · ⏳ collector {age_h:.1f}h behind"
-    stitch_txt = (
-        f"🩹 {stitched} missing {tf_label} candles stitched from exchange (in-memory){stale_hint}"
-        if stitched
-        else "&nbsp;"
-    )
+    thr = 1.0 if tf_key == "15m" else 49.0
+    stale = age_h is not None and age_h > thr
+    if stitched and stale:
+        stale_hint = f" · ⏳ collector {age_h:.1f}h behind"
+    if stitched:
+        stitch_txt = (
+            f"🩹 {stitched} missing {tf_label} candles stitched from exchange "
+            f"(in-memory){stale_hint}"
+        )
+    elif stale:
+        # Nothing could be stitched while the table is stale → the chart would
+        # silently end weeks before the live price line. Say so out loud.
+        stitch_txt = (
+            f"<span style='color:#ef5350'>⚠️ collector {age_h:.1f}h behind on this table "
+            f"and the exchange returned no {tf_label} catch-up candles — "
+            f"chart tail may be missing</span>"
+        )
+    else:
+        stitch_txt = "&nbsp;"
 
     candles_arr, volume_arr = build_series_arrays(frame, with_volume=show_volume)
     dumps = lambda x: json.dumps(x, separators=(",", ":"))
