@@ -368,10 +368,17 @@ def _fetch_missing_candles_cached(ccxt_id: str, symbol: str, timeframe: str, r0:
     # table (weeks behind) is still bridged completely instead of stopping
     # mid-way at a fixed 6-page cap.
     pages = min(40, max(2, (int(r1) - int(r0)) // 1000 + 2))
+    # Hard wall-clock budget: this runs on the chart's critical path, and a
+    # very stale table could otherwise page the exchange for a minute while
+    # the user waits for a pair flip. Whatever arrived in time is drawn; the
+    # rest streams in on the next render (the result is cached 1 h).
+    deadline = time.time() + settings.dash_stitch_budget_sec
     out = []
     cursor = r0 * step_ms
     try:
         for _ in range(pages):  # paged catch-up over the requested gap
+            if time.time() > deadline:
+                break
             batch = ex.fetch_ohlcv(symbol, timeframe, since=cursor, limit=1000)
             if not batch:
                 break
@@ -528,11 +535,26 @@ def _set_live_target(pairs: list) -> None:
     _publish_priority_pairs_async(pairs)
 
 
+_LAST_PUBLISH = {"ts": 0.0, "key": None}
+_PUBLISH_MIN_INTERVAL = 5.0  # TTL is 90 s — re-announcing more often is waste
+
+
 def _publish_priority_pairs_async(pairs: list) -> None:
-    """Fire-and-forget publish on the live infra loop (never blocks the UI)."""
+    """Hands the displayed pair set to the engine without blocking the rerun.
+
+    Skips the call entirely when the same set was announced moments ago, so
+    holding down Prev/Next does not queue a write per keystroke.
+    """
+    key = tuple((p.get("ex"), p.get("sym")) for p in (pairs or []) if isinstance(p, dict))
+    now = time.time()
+    if key == _LAST_PUBLISH["key"] and now - _LAST_PUBLISH["ts"] < _PUBLISH_MIN_INTERVAL:
+        return
+
     infra = _live_infra_or_none()
     if not infra or not infra.get("submit_publish"):
         return
+    _LAST_PUBLISH["key"] = key
+    _LAST_PUBLISH["ts"] = now
     try:
         infra["submit_publish"](pairs)
     except Exception:
@@ -705,13 +727,19 @@ def _live_infra() -> dict:
                     conn, pairs, ttl_sec=getattr(settings, "priority_lane_ttl_sec", 90.0)
                 )
 
-        def submit_publish(pairs, timeout=5.0):
+        def submit_publish(pairs):
+            """Schedules the publish and returns IMMEDIATELY.
+
+            Waiting for the round-trip here would put a database write on the
+            critical path of every rerun — i.e. of every Prev/Next flip. The
+            engine only needs the set within its 90 s TTL, so nothing is lost
+            by letting it land a few milliseconds later.
+            """
             try:
-                return asyncio.run_coroutine_threadsafe(
-                    publish_pairs(pairs), loop
-                ).result(timeout=timeout)
+                asyncio.run_coroutine_threadsafe(publish_pairs(pairs), loop)
             except Exception:
-                return None
+                pass
+            return None
 
         def submit_upsert(db, ex, sym, payload, timeout=5.0):
             try:

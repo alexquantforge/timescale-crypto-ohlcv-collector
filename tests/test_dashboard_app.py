@@ -265,3 +265,72 @@ def test_spread_history_panel_wired():
     assert '"ob_spread_pct"' in src
     assert "Spread History" in src
     assert "🟠 Spread %" in src
+
+
+# ---------------------------------------------------------------------------
+# Pair flipping must never wait on the priority-pair publish
+# ---------------------------------------------------------------------------
+
+def _load_app_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("dashboard_app_mod", APP_FILE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_publish_is_throttled_and_never_blocks(monkeypatch):
+    """The publish is fire-and-forget and skipped when the set is unchanged:
+    holding Prev/Next must not queue one database write per keystroke."""
+    os.environ["DASHBOARD_DEMO"] = "1"
+    app = _load_app_module()
+
+    calls = []
+    monkeypatch.setattr(
+        app, "_live_infra_or_none", lambda: {"submit_publish": calls.append}
+    )
+    app._LAST_PUBLISH["ts"] = 0.0
+    app._LAST_PUBLISH["key"] = None
+
+    pairs = [{"db": "d", "ex": "bybit", "sym": "0G/USDT:USDT"}]
+    app._publish_priority_pairs_async(pairs)
+    app._publish_priority_pairs_async(pairs)        # same set, immediately -> skipped
+    assert len(calls) == 1
+
+    app._publish_priority_pairs_async(
+        [{"db": "d", "ex": "bybit", "sym": "BTC/USDT:USDT"}]  # new pair -> published
+    )
+    assert len(calls) == 2
+
+
+def test_stitch_fetch_honours_its_time_budget(monkeypatch):
+    """A very stale table must not page an exchange forever on the chart's
+    critical path."""
+    import time as _time
+
+    os.environ["DASHBOARD_DEMO"] = "1"
+    app = _load_app_module()
+
+    class _SlowExchange:
+        markets = {"X/USDT": {}}
+        calls = 0
+
+        def load_markets(self):
+            return self.markets
+
+        def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None):
+            type(self).calls += 1
+            _time.sleep(0.05)
+            return [[since + i * 900_000, 1, 1, 1, 1, 1] for i in range(1000)]
+
+    monkeypatch.setattr(app, "_get_sync_exchange", lambda ccxt_id: _SlowExchange())
+    monkeypatch.setattr(app.settings, "dash_stitch_budget_sec", 0.12)
+
+    fetch = app._fetch_missing_candles_cached.__wrapped__  # bypass st.cache_data
+    started = _time.perf_counter()
+    fetch("bybit", "X/USDT", "15m", 0, 40_000)
+    elapsed = _time.perf_counter() - started
+
+    assert elapsed < 2.0
+    assert _SlowExchange.calls < 40  # stopped early instead of paging 40 times

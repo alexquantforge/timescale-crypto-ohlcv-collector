@@ -228,6 +228,11 @@ class Settings(BaseSettings):
     # `dashboard_priority_pairs`; the 15m engine refreshes exactly those
     # tables in parallel with the full sweep, so the dashboard never has to
     # download or compute anything itself.
+    # Wall-clock budget for the dashboard's in-memory gap stitching. It runs
+    # while the user waits for a chart, so it is bounded by time, not only
+    # by page count.
+    dash_stitch_budget_sec: float = Field(default=4.0, alias="DASH_STITCH_BUDGET_SEC")
+
     priority_lane_enabled: bool = Field(default=True, alias="PRIORITY_LANE_ENABLED")
     priority_lane_interval_sec: float = Field(default=1.0, alias="PRIORITY_LANE_INTERVAL_SEC")
     # The daily bar moves with every trade too, but one refresh per second
