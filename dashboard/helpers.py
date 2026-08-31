@@ -926,7 +926,25 @@ _LIVE_POLLER_TEMPLATE = """
         const now = Math.floor(Date.now() / 1000);
         const barTs = now - (now % STEP);
         if (!lastBar || barTs > lastBar.time) {
-          lastBar = { time: barTs, open: price, high: price, low: price, close: price };
+          // A new interval starts: OPEN AT THE PREVIOUS CLOSE, not at the
+          // current live price.
+          //
+          // The poller samples the ticker once per second, so the first
+          // sample of a fresh bar is already N seconds into it. Using that
+          // sample as the open made every bar start away from where the
+          // previous one ended — a visible vertical break at each 15m
+          // boundary that the exchange chart (whose open IS the first trade,
+          // i.e. the previous close in a continuous market) never shows.
+          // The real open replaces this as soon as the candle is read back
+          // from the database.
+          const prevClose = lastBar ? lastBar.close : price;
+          lastBar = {
+            time: barTs,
+            open: prevClose,
+            high: Math.max(prevClose, price),
+            low: Math.min(prevClose, price),
+            close: price
+          };
         } else {
           lastBar.close = price;
           if (price > lastBar.high) { lastBar.high = price; }

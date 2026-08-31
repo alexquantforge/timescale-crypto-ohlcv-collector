@@ -818,3 +818,19 @@ def test_fill_missing_bars_is_a_noop_when_nothing_is_missing_or_table_is_dead():
     dead = _mk_df([t0, t0 + 5000 * step])
     out2, filled2 = fill_missing_bars(dead, step, max_filled=2000)
     assert filled2 == 0 and len(out2) == 2
+
+
+def test_live_poller_opens_new_bar_at_previous_close():
+    """The once-per-second poller samples the ticker mid-interval. Opening a
+    fresh bar at that sample made every 15m boundary show a vertical break
+    (prev close ≠ next open) that the exchange chart does not have."""
+    from dashboard.helpers import build_live_poller_js
+
+    js = build_live_poller_js("gateio", "JUSUNG/USDT:USDT", 900, interval_ms=1000)
+
+    assert "const prevClose = lastBar ? lastBar.close : price;" in js
+    assert "open: prevClose," in js
+    assert "high: Math.max(prevClose, price)," in js
+    assert "low: Math.min(prevClose, price)," in js
+    # the old behaviour must be gone
+    assert "open: price, high: price, low: price, close: price" not in js

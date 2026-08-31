@@ -394,5 +394,100 @@ def diagnose_pair(
     )
 
 
+@app.command(name="check-continuity")
+def check_continuity(
+    table: str = typer.Argument(..., help="Table, e.g. 'jusung_usdt:usdt_on_gateio'"),
+    timeframe: str = typer.Option("15m", help="Timeframe of the table: '15m' or '1d'"),
+    last: int = typer.Option(60, help="How many latest candles to inspect"),
+    threshold_pct: float = typer.Option(0.05, help="Report jumps larger than this % of price"),
+):
+    """
+    Report candles whose OPEN does not continue the previous CLOSE.
+
+    Tells apart the two reasons a chart can look broken:
+      * the stored candles really jump (collector/exchange data), or
+      * only the on-screen live bar did (browser-side poller).
+    """
+    import datetime as _dt
+
+    step = 900 if timeframe == "15m" else 86400
+
+    async def _read():
+        dbs = (
+            [settings.db_high_15m, settings.db_low_15m]
+            if timeframe == "15m"
+            else [settings.db_high_1d, settings.db_low_1d]
+        )
+        for db_name in dbs:
+            try:
+                conn = await asyncpg.connect(
+                    host=settings.db_host, port=settings.db_port,
+                    user=settings.db_user, password=settings.db_password,
+                    database=db_name, timeout=15,
+                )
+            except Exception:
+                continue
+            try:
+                exists = await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name=$1)",
+                    table,
+                )
+                if not exists:
+                    continue
+                rows = await conn.fetch(
+                    f'SELECT "Timestamp" AS ts, open, high, low, close, volume '
+                    f'FROM "{table}" ORDER BY "Timestamp" DESC LIMIT {int(last)}'
+                )
+                return db_name, [dict(r) for r in reversed(rows)]
+            finally:
+                await conn.close()
+        return None, []
+
+    db_name, rows = asyncio.run(_read())
+    if not rows:
+        console.print(f"[yellow]Table '{table}' not found (or empty) for {timeframe}.[/yellow]")
+        return
+
+    out = Table(title=f"🔗 Continuity of last {len(rows)} {timeframe} candles — {table} @ {db_name}")
+    out.add_column("Time (UTC)", style="cyan")
+    out.add_column("Prev close", justify="right")
+    out.add_column("Open", justify="right")
+    out.add_column("Jump", justify="right", style="bold")
+    out.add_column("Note", style="dim")
+
+    breaks = 0
+    missing = 0
+    prev = None
+    for r in rows:
+        ts = int(r["ts"])
+        if ts > 1e11:
+            ts //= 1000
+        when = _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).strftime("%Y-%m-%d %H:%M")
+        if prev is not None:
+            gap_bars = (ts - prev["ts"]) // step - 1
+            if gap_bars > 0:
+                missing += gap_bars
+                out.add_row(when, "", "", "", f"⛔ {gap_bars} candle(s) missing before this one")
+            pc, op = float(prev["close"] or 0), float(r["open"] or 0)
+            if pc > 0 and op > 0:
+                jump = (op - pc) / pc * 100.0
+                if abs(jump) >= threshold_pct:
+                    breaks += 1
+                    out.add_row(when, f"{pc:.8g}", f"{op:.8g}", f"{jump:+.3f}%", "open ≠ prev close")
+        prev = {"ts": ts, "close": r["close"]}
+
+    if breaks or missing:
+        console.print(out)
+    console.print(
+        f"[bold]{breaks}[/bold] open/close break(s) ≥ {threshold_pct}% and "
+        f"[bold]{missing}[/bold] missing candle(s) in the last {len(rows)} bars."
+    )
+    if not breaks and not missing:
+        console.print(
+            "[green]✓ Stored candles are continuous — a gap seen in the dashboard came "
+            "from the browser-side live bar, not from the database.[/green]"
+        )
+
+
 if __name__ == "__main__":
     app()
