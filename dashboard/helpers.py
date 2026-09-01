@@ -6,6 +6,7 @@ pair navigation (prev/next), table lookup across the timeframe summary frames,
 and a synthetic demo-data generator used when no TimescaleDB is reachable.
 """
 import json
+import os
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -158,6 +159,112 @@ def generate_demo_candles(timeframe: str, ticker: str, exchange: str, n: int = 1
         "close": closes,
         "volume": vols,
     })
+
+
+
+# ---------------------------------------------------------------------------
+# Summary scan SQL (one query per CHUNK of tables instead of one per table)
+# ---------------------------------------------------------------------------
+
+# Padding types for columns a table does not have. Tables whose orderbook
+# snapshot never landed simply lack the ob_* columns, so every subquery must
+# expose the same column list — NULL-casted where the column is missing.
+SUMMARY_COLUMN_TYPES = {
+    "ticker": "text",
+    "exchange": "text",
+    "asset_type": "text",
+    "ob_vitality_grade": "text",
+    "ob_is_barcode": "boolean",
+}
+SUMMARY_DEFAULT_TYPE = "double precision"
+
+
+def summary_column_sql(table_columns, column: str) -> str:
+    """One projected column of a per-table subquery (real column or NULL pad)."""
+    if column in table_columns:
+        return f'"{column}"'
+    pg_type = SUMMARY_COLUMN_TYPES.get(column, SUMMARY_DEFAULT_TYPE)
+    return f'NULL::{pg_type} AS "{column}"'
+
+
+def build_summary_union_sql(tables: dict, columns) -> str:
+    """
+    UNION ALL of `last row of table` subqueries for a chunk of tables.
+
+    The scan used to issue ONE round trip per table: ~7.5k tables per
+    timeframe meant ~15k queries on dashboard startup, which turns into a
+    minutes-long spinner as soon as the collector puts the database under
+    load. Batching keeps the exact same result (last row, missing columns
+    padded) at ~1/100th of the round trips.
+
+    `tables` maps table_name -> set of its column names. Tables without a
+    "Timestamp" column are skipped.
+    """
+    parts = []
+    for tbl, cols in tables.items():
+        if "Timestamp" not in cols:
+            continue
+        projected = ", ".join(summary_column_sql(cols, c) for c in columns)
+        parts.append(
+            f"(SELECT '{tbl}'::text AS table_name, \"Timestamp\" AS max_ts, {projected}"
+            f' FROM "{tbl}" ORDER BY "Timestamp" DESC LIMIT 1)'
+        )
+    return "\nUNION ALL\n".join(parts)
+
+
+def chunked(items, size: int):
+    """Yields consecutive slices of `items` (list or dict) of at most `size`."""
+    if isinstance(items, dict):
+        keys = list(items.keys())
+        for i in range(0, len(keys), size):
+            yield {k: items[k] for k in keys[i:i + size]}
+        return
+    items = list(items)
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+
+# ---------------------------------------------------------------------------
+# Summary snapshot on disk (stale-while-revalidate startup)
+# ---------------------------------------------------------------------------
+
+def snapshot_path(directory: str, timeframe: str) -> str:
+    """File the last good summary of a timeframe is cached in."""
+    base = directory or os.path.join(
+        os.path.expanduser("~"), ".cache", "timescale-ohlcv-dashboard"
+    )
+    return os.path.join(base, f"summary_{timeframe}.pkl")
+
+
+def save_summary_snapshot(path: str, df: pd.DataFrame) -> bool:
+    """Persists a scan result; failures are non-fatal (cache is an optimisation)."""
+    if df is None or df.empty:
+        return False
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        df.to_pickle(path)
+        return True
+    except Exception:
+        return False
+
+
+def load_summary_snapshot(path: str, max_age_sec: float):
+    """
+    Returns (frame, age_sec) of the stored snapshot, or (None, None).
+
+    Lets the dashboard paint the pair list and charts IMMEDIATELY on startup
+    instead of waiting for a full database scan — which, while the collector
+    is writing, is exactly the difference between a usable page and an endless
+    spinner. The fresh scan then replaces it.
+    """
+    try:
+        age = _time.time() - os.path.getmtime(path)
+        if age > float(max_age_sec):
+            return None, None
+        return pd.read_pickle(path), age
+    except Exception:
+        return None, None
 
 
 # ---------------------------------------------------------------------------

@@ -232,6 +232,15 @@ class Settings(BaseSettings):
     # while the user waits for a chart, so it is bounded by time, not only
     # by page count.
     dash_stitch_budget_sec: float = Field(default=4.0, alias="DASH_STITCH_BUDGET_SEC")
+    # Wall-clock budget for the whole-database summary scan. Whatever came
+    # back in time is rendered — the dashboard must stay usable while the
+    # collector writes.
+    dash_scan_budget_sec: float = Field(default=25.0, alias="DASH_SCAN_BUDGET_SEC")
+    # Keep the last good summary on disk and paint it instantly on startup,
+    # refreshing in the background (stale-while-revalidate).
+    dash_snapshot_enabled: bool = Field(default=True, alias="DASH_SNAPSHOT_ENABLED")
+    dash_snapshot_dir: str = Field(default="", alias="DASH_SNAPSHOT_DIR")
+    dash_snapshot_max_age_sec: float = Field(default=86400.0, alias="DASH_SNAPSHOT_MAX_AGE_SEC")
 
     priority_lane_enabled: bool = Field(default=True, alias="PRIORITY_LANE_ENABLED")
     priority_lane_interval_sec: float = Field(default=1.0, alias="PRIORITY_LANE_INTERVAL_SEC")

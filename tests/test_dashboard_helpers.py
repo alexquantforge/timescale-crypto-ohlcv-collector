@@ -834,3 +834,60 @@ def test_live_poller_opens_new_bar_at_previous_close():
     assert "low: Math.min(prevClose, price)," in js
     # the old behaviour must be gone
     assert "open: price, high: price, low: price, close: price" not in js
+
+
+# ---------------------------------------------------------------------------
+# Batched summary scan + snapshot cache
+# ---------------------------------------------------------------------------
+
+def test_build_summary_union_sql_pads_missing_columns_and_batches():
+    from dashboard.helpers import build_summary_union_sql
+
+    tables = {
+        "btc_usdt_on_bybit": {"Timestamp", "ticker", "close", "ob_cvd_5m"},
+        "pixel_usdt:usdt_on_bybit": {"Timestamp", "ticker", "close"},   # no ob_* yet
+        "broken_on_bybit": {"open", "close"},                            # no Timestamp
+    }
+    cols = ["ticker", "close", "ob_cvd_5m", "ob_is_barcode", "ob_vitality_grade"]
+    sql = build_summary_union_sql(tables, cols)
+
+    assert sql.count("UNION ALL") == 1                 # the Timestamp-less table is skipped
+    assert "broken_on_bybit" not in sql
+    assert 'NULL::double precision AS "ob_cvd_5m"' in sql   # padded for the perp table
+    assert 'NULL::boolean AS "ob_is_barcode"' in sql
+    assert 'NULL::text AS "ob_vitality_grade"' in sql
+    assert sql.count('ORDER BY "Timestamp" DESC LIMIT 1') == 2
+    # every subquery must project the columns in the same order
+    assert sql.index('"ticker"') < sql.index('"close"')
+
+
+def test_chunked_splits_dicts_and_lists():
+    from dashboard.helpers import chunked
+
+    assert [len(c) for c in chunked({f"t{i}": set() for i in range(250)}, 120)] == [120, 120, 10]
+    assert [c for c in chunked([1, 2, 3, 4, 5], 2)] == [[1, 2], [3, 4], [5]]
+    assert list(chunked([], 10)) == []
+
+
+def test_summary_snapshot_round_trip(tmp_path):
+    import pandas as pd
+    from dashboard.helpers import (
+        load_summary_snapshot,
+        save_summary_snapshot,
+        snapshot_path,
+    )
+
+    path = snapshot_path(str(tmp_path), "15m")
+    assert path.endswith("summary_15m.pkl")
+
+    df = pd.DataFrame([{"ticker": "0G/USDT:USDT", "exchange": "bybit", "max_ts": 1_790_000_000}])
+    assert save_summary_snapshot(path, df) is True
+
+    back, age = load_summary_snapshot(path, max_age_sec=3600)
+    assert back is not None and list(back["ticker"]) == ["0G/USDT:USDT"]
+    assert age is not None and age < 60
+
+    # expired snapshot is ignored, and a missing file never raises
+    assert load_summary_snapshot(path, max_age_sec=0.0) == (None, None)
+    assert load_summary_snapshot(str(tmp_path / "nope.pkl"), 3600) == (None, None)
+    assert save_summary_snapshot(path, pd.DataFrame()) is False

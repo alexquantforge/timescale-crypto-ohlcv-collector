@@ -61,6 +61,11 @@ from dashboard.helpers import (
     rows_to_compact_candles,
     stitch_candle_gaps,
     fill_missing_bars,
+    build_summary_union_sql,
+    chunked,
+    snapshot_path,
+    save_summary_snapshot,
+    load_summary_snapshot,
 )
 
 st.set_page_config(
@@ -129,8 +134,23 @@ async def _summary_row_for_table(pool, tbl: str, sem: asyncio.Semaphore, errors:
 # Data loading (cached)
 # ---------------------------------------------------------------------------
 
-async def _scan_database(db_name: str, tier_label: str, db_host, db_port, db_user, db_pass, pool_size: int = 6):
-    """Scans all %_on_% tables of one database in parallel and returns last-row summaries."""
+async def _scan_database(
+    db_name: str, tier_label: str, db_host, db_port, db_user, db_pass,
+    pool_size: int = 6, chunk_size: int = 120, budget_sec: float = None,
+):
+    """
+    Last-row summary of every %_on_% table of one database.
+
+    Batched on purpose: one query per `chunk_size` tables instead of one per
+    table. With ~7.5k pairs the old per-table scan fired ~15k round trips at
+    dashboard startup, which is why the page could spin for minutes while the
+    collector was writing — the queries themselves are trivial, the round
+    trips under concurrent write load are not.
+
+    Bounded by `budget_sec`: whatever chunks answered in time are returned and
+    the page renders, instead of the user staring at a spinner.
+    """
+    budget_sec = settings.dash_scan_budget_sec if budget_sec is None else budget_sec
     try:
         pool = await asyncpg.create_pool(
             host=db_host, port=db_port, user=db_user, password=db_pass,
@@ -141,36 +161,62 @@ async def _scan_database(db_name: str, tier_label: str, db_host, db_port, db_use
 
     try:
         async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT table_name FROM information_schema.tables "
+            col_rows = await conn.fetch(
+                "SELECT table_name, column_name FROM information_schema.columns "
                 "WHERE table_schema='public' AND table_name LIKE '%_on_%'"
             )
-        tables = [r["table_name"] for r in rows]
+        tables: dict = {}
+        for r in col_rows:
+            tables.setdefault(r["table_name"], set()).add(r["column_name"])
+        if not tables:
+            return []
 
         sem = asyncio.Semaphore(pool_size)
+        deadline = time.time() + float(budget_sec)
         errors: list = []
+        out: list = []
 
-        async def fetch_one(tbl: str):
-            d = await _summary_row_for_table(pool, tbl, sem, errors)
-            if d is None:
-                return None
-            d["table_name"] = tbl
+        async def run_chunk(chunk: dict):
+            if time.time() > deadline:
+                return []
+            sql = build_summary_union_sql(chunk, _EXPECTED_SUMMARY_KEYS)
+            if not sql:
+                return []
+            async with sem:
+                try:
+                    async with pool.acquire() as conn:
+                        rows = await conn.fetch(sql)
+                    return [dict(r) for r in rows]
+                except Exception as e:
+                    # One broken table must not lose its whole chunk: fall
+                    # back to the per-table reads for this batch only.
+                    errors.append((f"chunk[{len(chunk)}]", f"{type(e).__name__}: {e}"))
+            recovered = []
+            for tbl in chunk:
+                d = await _summary_row_for_table(pool, tbl, sem, errors)
+                if d:
+                    d["table_name"] = tbl
+                    recovered.append(d)
+            return recovered
+
+        chunks = list(chunked(tables, chunk_size))
+        for result in await asyncio.gather(*[run_chunk(c) for c in chunks]):
+            out.extend(result)
+
+        for d in out:
             d["db_name"] = db_name
             d["volume_tier"] = tier_label
-            return d
 
-        results = await asyncio.gather(*[fetch_one(t) for t in tables])
         if errors:
-            # Loud, once per scan: a silently skipped table was the
-            # "No 15m table for PIXEL" ghost — must stay visible.
-            preview = "; ".join(f"{t}: {e}" for t, e in errors[:5])
+            preview = "; ".join(f"{t}: {e}" for t, e in errors[:3])
+            print(f"[scan] {db_name}: {len(errors)} chunk(s) fell back to per-table reads: {preview}", flush=True)
+        if time.time() > deadline:
             print(
-                f"[scan] {db_name}: {len(errors)}/{len(tables)} tables failed "
-                f"the last-row read and were skipped: {preview}"
-                + (" …" if len(errors) > 5 else ""),
+                f"[scan] {db_name}: {budget_sec:.0f}s budget exhausted — rendering "
+                f"{len(out)}/{len(tables)} tables (collector is probably writing hard)",
                 flush=True,
             )
-        return [r for r in results if r]
+        return out
     finally:
         await pool.close()
 
@@ -190,11 +236,53 @@ async def _load_summary(db_host, db_port, db_user, db_pass, timeframe: str) -> p
     return pd.DataFrame(all_rows)
 
 
+def _scan_summary_now(db_host, db_port, db_user, db_pass, timeframe: str) -> pd.DataFrame:
+    """Full scan + snapshot persist (used by both the sync and the background path)."""
+    df = asyncio.run(_load_summary(db_host, db_port, db_user, db_pass, timeframe))
+    if settings.dash_snapshot_enabled:
+        save_summary_snapshot(
+            snapshot_path(settings.dash_snapshot_dir, timeframe), df
+        )
+    return df
+
+
+def _refresh_summary_in_background(db_host, db_port, db_user, db_pass, timeframe: str) -> None:
+    """Rescans off the UI thread and drops the cache so the next rerun picks it up."""
+    def _run():
+        try:
+            _scan_summary_now(db_host, db_port, db_user, db_pass, timeframe)
+        except Exception:
+            return
+        try:
+            load_summary_cached.clear()
+        except Exception:
+            pass
+
+    _bg(("summary-scan", timeframe), _run)
+
+
 @st.cache_data(ttl=600, show_spinner="📡 Scanning TimescaleDB tables…")
 def load_summary_cached(db_host, db_port, db_user, db_pass, timeframe: str) -> pd.DataFrame:
-    """Cached (10 min) summary of the 2 databases for a timeframe."""
+    """
+    Summary of the 2 databases for a timeframe (cached 10 min).
+
+    Stale-while-revalidate: when a snapshot of the previous scan exists, it is
+    returned IMMEDIATELY and the rescan runs in a daemon thread. A dashboard
+    opened while the collector is mid-cycle then paints instantly instead of
+    blocking on a full scan of every table.
+    """
+    if settings.dash_snapshot_enabled:
+        snap, age = load_summary_snapshot(
+            snapshot_path(settings.dash_snapshot_dir, timeframe),
+            settings.dash_snapshot_max_age_sec,
+        )
+        if snap is not None and not snap.empty:
+            _refresh_summary_in_background(db_host, db_port, db_user, db_pass, timeframe)
+            st.session_state[f"_snap_age_{timeframe}"] = age
+            return snap
+
     try:
-        return asyncio.run(_load_summary(db_host, db_port, db_user, db_pass, timeframe))
+        return _scan_summary_now(db_host, db_port, db_user, db_pass, timeframe)
     except Exception as e:
         st.error(f"Database connection error: {e}")
         return pd.DataFrame()
@@ -742,6 +830,12 @@ def _live_infra() -> dict:
                 pass
             return None
 
+        def submit_upsert_nowait(db, ex, sym, payload):
+            try:
+                asyncio.run_coroutine_threadsafe(upsert(db, ex, sym, payload), loop)
+            except Exception:
+                pass
+
         def submit_upsert(db, ex, sym, payload, timeout=5.0):
             try:
                 return asyncio.run_coroutine_threadsafe(
@@ -767,6 +861,7 @@ def _live_infra() -> dict:
                 return None
 
         infra["submit_publish"] = submit_publish
+        infra["submit_upsert_nowait"] = submit_upsert_nowait
         infra["submit_upsert"] = submit_upsert
         infra["submit_select"] = submit_select
         infra["submit_candles"] = submit_candles
@@ -912,9 +1007,17 @@ def _live_infra() -> dict:
         return ex
 
     def writer_fetch_pair(entry: dict):
-        """Fetches ticker + orderbook top + trade tape; returns payload dict."""
+        """Live payload for one pair.
+
+        FULL (ticker + orderbook + trade tape) only for the pair actually on
+        screen; the ±5 neighbours get the ticker alone. Fetching everything
+        for all 11 pairs meant ~33 blocking HTTP calls per second inside the
+        Streamlit process — enough GIL and socket pressure to make the page
+        itself feel stuck while the collector was also running.
+        """
         ex = writer_exchange(entry["ccxt"])
         sym = entry["sym"]
+        full = bool(entry.get("cur"))
 
         last = bid = ask = pct = None
         try:
@@ -927,6 +1030,8 @@ def _live_infra() -> dict:
 
         depth = None
         try:
+            if not full:
+                raise StopIteration  # neighbour: ticker is enough
             ob = ex.fetch_order_book(sym, limit=50)
             bids, asks = ob.get("bids") or [], ob.get("asks") or []
             if bids and asks:
@@ -947,6 +1052,8 @@ def _live_infra() -> dict:
         tpm = None
         barcode = False
         try:
+            if not full:
+                raise StopIteration  # neighbour: ticker is enough
             trades = ex.fetch_trades(sym, limit=200) or []
             now_ms = time.time() * 1000.0
             recent = [
@@ -994,7 +1101,9 @@ def _live_infra() -> dict:
                 except Exception:
                     payload = None
                 if payload:
-                    infra["submit_upsert"](e["db"], e["ex"], e["sym"], payload)
+                    # fire-and-forget: waiting per pair serialised the whole
+                    # second-long round on database latency
+                    infra["submit_upsert_nowait"](e["db"], e["ex"], e["sym"], payload)
             time.sleep(max(0.2, 1.0 - (time.time() - started)))
 
     threading.Thread(target=writer_loop, daemon=True, name="live-writer").start()
@@ -1549,6 +1658,13 @@ st.markdown(
 
 if demo_mode:
     st.caption("🧪 Demo mode — synthetic data (uncheck in sidebar to connect to TimescaleDB)")
+else:
+    _snap_age = st.session_state.get("_snap_age_15m") or st.session_state.get("_snap_age_1d")
+    if _snap_age:
+        st.caption(
+            f"📸 Pair list from the last scan snapshot ({_snap_age / 60:.0f} min old) — "
+            f"rescanning in the background; charts and live data are unaffected."
+        )
 
 # ---------------------------------------------------------------------------
 # Load summaries for BOTH timeframes (cached)
@@ -2150,10 +2266,14 @@ with tab_charts:
                 nb_1d = find_table_row(df_1d, nb_ticker, sym_ex)
                 if delta != 0 and not (nb_15 or nb_1d):
                     continue
-                live_pairs.append({
+                entry = {
                     "db": _live_db_for(nb_1d, nb_15) or live_db,
                     "ex": sym_ex, "ccxt": ccxt_id, "sym": nb_ticker,
-                })
+                    "cur": delta == 0,
+                }
+                # the displayed pair leads the list: it gets the full live
+                # payload here and survives the engine-side cap
+                live_pairs.insert(0, entry) if delta == 0 else live_pairs.append(entry)
                 if delta == 0:
                     continue
                 if abs(delta) > settings.dash_warm_neighbors:
