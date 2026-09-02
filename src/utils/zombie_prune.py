@@ -45,7 +45,8 @@ _QUOTES = ("usdt", "usdc", "usd", "dai", "tusd", "fdusd", "brl", "eur", "try")
 # pair filter could otherwise match them.
 _NEVER_PRUNE = {"dashboard_live_ticks"}
 
-_ZOMBIE_SCHEMA = "zombie_pruned"
+ZOMBIE_SCHEMA = "zombie_pruned"          # what `--mode trash` parks tables in
+_ZOMBIE_SCHEMA = ZOMBIE_SCHEMA
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +316,23 @@ def plan_pruning(
     return out
 
 
+def prune_order(plan: list[dict]) -> list[dict]:
+    """The prune list, ordered by what removing each table actually gains.
+
+    `--limit` takes a slice of this, so a partial run should free the tables that
+    cost the most rather than the ones whose names sort first. Rows without usable
+    counts gain nothing measurable and go last; ties break on the name, so two runs
+    over the same database pick the same tables.
+    """
+    def gain(row: dict) -> int:
+        spot, perp = row.get("spot_bars"), row.get("perp_bars")
+        if spot is None or perp is None:
+            return 0
+        return max(0, int(perp) - int(spot))
+
+    return sorted((r for r in plan if r["verdict"] == "prune"), key=lambda r: (-gain(r), r["spot"]))
+
+
 # ---------------------------------------------------------------------------
 # database work
 # ---------------------------------------------------------------------------
@@ -412,6 +430,40 @@ def statements_for(actions: list[dict], mode: str, schema: str = _ZOMBIE_SCHEMA)
         else:
             raise ValueError(f"unknown mode {mode!r} (expected 'trash' or 'drop')")
     return stmts
+
+
+async def parked_tables(conn, schema: str = _ZOMBIE_SCHEMA) -> list[str]:
+    """What is sitting in the parking schema right now — the undo list."""
+    rows = await conn.fetch(
+        "SELECT c.relname AS table_name FROM pg_catalog.pg_class c "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = $1 AND c.relkind IN ('r','p') ORDER BY 1",
+        schema,
+    )
+    return [r["table_name"] for r in rows]
+
+
+async def purge_parked(conn, *, drop: bool = False, schema: str = _ZOMBIE_SCHEMA) -> list[dict]:
+    """List (and with `drop`, delete) the tables parked in `schema`.
+
+    `trash` saves a wrong decision, and the price of that is that the disk stays
+    allocated until somebody says so out loud. This is that command: it reads one
+    schema and nothing else, so a live pair cannot be reached from here. `drop` is
+    still irreversible — the caller is expected to have looked at the listing.
+    """
+    tables = await parked_tables(conn, schema)
+    if not drop:
+        return [{"sql": None, "spot": t, "ok": True, "listed": True} for t in tables]
+    results = []
+    for tbl in tables:
+        sql = f"DROP TABLE IF EXISTS {quote_ident(schema)}.{quote_ident(tbl)}"
+        try:
+            await conn.execute(sql)
+            results.append({"sql": sql, "spot": tbl, "ok": True})
+        except Exception as e:
+            results.append({"sql": sql, "spot": tbl, "ok": False,
+                            "error": f"{type(e).__name__}: {e}"})
+    return results
 
 
 async def apply_pruning(conn, actions: list[dict], mode: str, schema: str = _ZOMBIE_SCHEMA) -> list[dict]:

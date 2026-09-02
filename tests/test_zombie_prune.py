@@ -26,6 +26,8 @@ from src.utils.zombie_prune import (
     pair_tables_sql,
     perp_to_spot_name,
     plan_pruning,
+    prune_order,
+    purge_parked,
     read_pair_tables,
     spot_perp_pairs,
     split_pair_table,
@@ -213,6 +215,55 @@ def test_statements_move_rather_than_drop_unless_told_otherwise():
 
     # nothing that looks like a perp is ever a target
     assert not any(":usdt" in s for s in trash + dropped)
+
+
+def test_prune_order_puts_the_biggest_gain_first():
+    plan = [
+        {"spot": "aaa_usdt_on_x", "verdict": "prune", "spot_bars": 100, "perp_bars": 200},
+        {"spot": "bbb_usdt_on_x", "verdict": "prune", "spot_bars": 10, "perp_bars": 5000},
+        {"spot": "ccc_usdt_on_x", "verdict": "keep", "spot_bars": 1, "perp_bars": 9},
+        {"spot": "ddd_usdt_on_x", "verdict": "prune", "spot_bars": None, "perp_bars": 9},
+        {"spot": "eee_usdt_on_x", "verdict": "prune", "spot_bars": 5, "perp_bars": 105},
+    ]
+    ordered = prune_order(plan)
+    # --limit takes the head of this list, so the head must be the tables whose
+    # removal saves the most: bbb (+4990) before aaa/eee (+100, tie broken by name)
+    # and an unmeasurable row last.
+    assert [r["spot"] for r in ordered] == [
+        "bbb_usdt_on_x", "aaa_usdt_on_x", "eee_usdt_on_x", "ddd_usdt_on_x",
+    ]
+    assert all(r["verdict"] == "prune" for r in ordered)
+    # a table the perp has NOT outgrown contributes no gain, and never a negative
+    # one (that would sort it to the front of the list)
+    odd = prune_order([{"spot": "x", "verdict": "prune", "spot_bars": 90, "perp_bars": 10}])
+    assert [r["spot"] for r in odd] == ["x"]
+
+
+def test_purging_the_parking_schema_never_looks_at_public():
+    conn = _FakeConn([], {})
+    conn.parked = ["bbb_usdt_on_x", "eee_usdt_on_x"]
+
+    async def fetch(sql, *args):
+        assert args == ("zombie_pruned",), "the purge is scoped to one schema"
+        assert "nspname = $1" in sql
+        return [{"table_name": t} for t in conn.parked]
+
+    conn.fetch = fetch
+    listing = asyncio.run(purge_parked(conn))
+    assert [r["spot"] for r in listing] == conn.parked
+    assert all(r["listed"] and r["sql"] is None for r in listing)
+    assert conn.executed == [], "listing must not run DDL"
+
+    dropped = asyncio.run(purge_parked(conn, drop=True))
+    assert conn.executed == [
+        'DROP TABLE IF EXISTS "zombie_pruned"."bbb_usdt_on_x"',
+        'DROP TABLE IF EXISTS "zombie_pruned"."eee_usdt_on_x"',
+    ]
+    assert all(r["ok"] and not r.get("listed") for r in dropped)
+    # nothing parked: nothing dropped, and no empty statement either
+    conn.parked = []
+    assert asyncio.run(purge_parked(conn, drop=True)) == []
+    assert len(conn.executed) == 2
 
 
 def test_identifier_quoting_cannot_be_injected():

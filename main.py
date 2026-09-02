@@ -489,6 +489,14 @@ def check_continuity(
         )
 
 
+def _fmt_names(names: list[str], limit: int = 8) -> str:
+    """First few table names, then how many more. Enough to undo from, short
+    enough to read on a terminal that is already showing a 20-row table."""
+    if not names:
+        return ""
+    return ", ".join(names[:limit]) + (f" … +{len(names) - limit} more" if len(names) > limit else "")
+
+
 @app.command(name="prune-zombie-spots")
 def prune_zombie_spots(
     timeframe: str = typer.Option("all", help="'1d', '15m' or 'all' — 'all' covers all 4 databases"),
@@ -501,6 +509,11 @@ def prune_zombie_spots(
     max_fraction: float = typer.Option(0.35, help="Refuse to prune more than this share of a database's pair tables without --yes"),
     yes: bool = typer.Option(False, "--yes", help="Accept the mass-prune guard"),
     report: str = typer.Option("", help="Write every decision as JSON to this file"),
+    purge_parked_tables: bool = typer.Option(
+        False, "--purge-parked",
+        help="Only report (and with --yes, DROP) what is already parked in the "
+             "zombie_pruned schema — frees the disk a previous --apply kept",
+    ),
 ):
     """
     Delete (or park) spot pair tables that their own perp outgrew.
@@ -519,15 +532,26 @@ def prune_zombie_spots(
     import time as _time
 
     from src.utils.zombie_prune import (
+        ZOMBIE_SCHEMA,
         apply_pruning,
         candidate_tables,
         measure,
         over_prune_guard,
         plan_pruning,
+        prune_order,
+        purge_parked,
         read_pair_tables,
         summarize,
     )
 
+    zombie_schema = ZOMBIE_SCHEMA
+
+    if purge_parked_tables and not apply:
+        console.print(
+            "[red]--purge-parked deletes tables, so it needs --apply too[/red] "
+            "(without it: nothing is dropped, and that is the point of asking)."
+        )
+        raise typer.Exit(2)
     if mode not in ("trash", "drop"):
         console.print("[red]--mode must be 'trash' or 'drop'[/red]")
         raise typer.Exit(2)
@@ -566,6 +590,34 @@ def prune_zombie_spots(
             return
         try:
             conn = await pool.acquire()
+            if purge_parked_tables:
+                # A different question than the rest of the command: not "what
+                # should be moved" but "what did a previous run move, and is it
+                # now safe to give the disk back".
+                res = await purge_parked(conn, drop=yes)
+                listed = [r["spot"] for r in res if r.get("listed")]
+                gone = [r["spot"] for r in res if r["ok"] and not r.get("listed")]
+                bad = [r for r in res if not r["ok"]]
+                if not res:
+                    console.print(f"[dim]{label} {db_name}: nothing parked in "
+                                  f"{zombie_schema}, nothing to free[/dim]")
+                elif listed:
+                    console.print(
+                        f"[yellow]{label} {db_name}: {len(listed)} table(s) parked in "
+                        f"{zombie_schema}[/yellow] — they cost disk, not scan time; "
+                        f"re-run with --yes to drop them for good"
+                    )
+                    console.print(f"[dim]{_fmt_names(listed)}[/dim]")
+                else:
+                    console.print(
+                        f"[bold]dropped {len(gone)} parked table(s) of {db_name}"
+                        + (f", [red]{len(bad)} failed[/red]" if bad else "") + "[/bold]"
+                    )
+                    console.print(f"[dim]{_fmt_names(gone)}[/dim]")
+                for r in bad:
+                    console.print(f"[red]{r['spot']}: {r['error'][:160]}[/red]")
+                all_rows.extend({"db": db_name, "tier": label, **r} for r in res)
+                return
             tables = await read_pair_tables(conn)
             if not tables:
                 console.print(f"[dim]{label} {db_name}: no pair tables found[/dim]")
@@ -616,7 +668,7 @@ def prune_zombie_spots(
                     )
                 console.print(out)
             if apply and summ["prune"]:
-                actions = [r for r in plan if r["verdict"] == "prune"]
+                actions = prune_order(plan)
                 if limit and limit > 0:
                     actions = actions[:limit]
                 refusal = None if yes else over_prune_guard(len(actions), n_tables, max_fraction)
@@ -636,6 +688,17 @@ def prune_zombie_spots(
                     f"[bold]{mode}[/bold]ed {ok}/{len(actions)} table(s) of {db_name}"
                     + (f", [red]{len(bad)} failed[/red]: {bad[0]['error'][:120]}" if bad else "")
                 )
+                # Which ones. "trashed 5/5" is not an audit trail: an operator who
+                # wants to undo a run must not have to re-derive the list from the
+                # report file they may not even have passed.
+                names = [r["spot"] for r in moved if r["ok"]]
+                if names:
+                    console.print(f"[dim]{_fmt_names(names)}[/dim]")
+                if limit and limit > 0 and summ["prune"] > len(actions):
+                    console.print(
+                        f"[dim]{summ['prune'] - len(actions)} further candidate(s) of "
+                        f"{db_name} were left alone by --limit[/dim]"
+                    )
                 for r in bad:
                     r["db"] = db_name
                     r.setdefault("spot", None)
