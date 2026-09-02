@@ -489,5 +489,182 @@ def check_continuity(
         )
 
 
+@app.command(name="prune-zombie-spots")
+def prune_zombie_spots(
+    timeframe: str = typer.Option("all", help="'1d', '15m' or 'all' — 'all' covers all 4 databases"),
+    apply: bool = typer.Option(False, "--apply", help="Run the DDL. Without it nothing is touched (dry-run)"),
+    mode: str = typer.Option("trash", help="'trash' = move into schema zombie_pruned (reversible), 'drop' = DROP TABLE"),
+    stale_hours: float = typer.Option(24.0, help="Only prune a spot table idle this long (0 = ignore freshness)"),
+    exact: bool = typer.Option(True, "--exact/--estimate-only", help="COUNT(*) the candidate pairs, or trust catalog estimates"),
+    concurrency: int = typer.Option(8, help="Parallel COUNT(*) queries — the collector is writing, be polite"),
+    limit: int = typer.Option(0, help="Prune at most N tables this run (0 = all). Use a small N as a canary"),
+    max_fraction: float = typer.Option(0.35, help="Refuse to prune more than this share of a database's pair tables without --yes"),
+    yes: bool = typer.Option(False, "--yes", help="Accept the mass-prune guard"),
+    report: str = typer.Option("", help="Write every decision as JSON to this file"),
+):
+    """
+    Delete (or park) spot pair tables that their own perp outgrew.
+
+    Rule: for a perp BASE/USDT:USDT on exchange E, if the spot BASE/USDT table
+    on E in the same database holds FEWER bars, the spot table is a leftover of
+    the perp-first switch — it is never written again, and it still costs every
+    scan, summary and dashboard query its attention. Perp tables, non-pair
+    tables and spots with no perp counterpart are never touched, and a table
+    that is still being collected is kept even when it is smaller.
+
+    Reads all 4 databases (HIGH/LOW × 15m/1D) by default. DRY-RUN unless
+    --apply, and the default action is a reversible schema move.
+    """
+    import json as _json
+    import time as _time
+
+    from src.utils.zombie_prune import (
+        apply_pruning,
+        candidate_tables,
+        measure,
+        over_prune_guard,
+        plan_pruning,
+        read_pair_tables,
+        statements_for,
+        summarize,
+    )
+
+    if mode not in ("trash", "drop"):
+        console.print("[red]--mode must be 'trash' or 'drop'[/red]")
+        raise typer.Exit(2)
+    if apply and not exact:
+        console.print(
+            "[red]--apply needs --exact counts.[/red] Catalog estimates (reltuples) are "
+            "stale until ANALYZE and would decide deletions on a guess."
+        )
+        raise typer.Exit(2)
+
+    if timeframe == "all":
+        targets = [("15m/HIGH", settings.db_high_15m), ("15m/LOW", settings.db_low_15m),
+                   ("1D/HIGH", settings.db_high_1d), ("1D/LOW", settings.db_low_1d)]
+    elif timeframe == "15m":
+        targets = [("15m/HIGH", settings.db_high_15m), ("15m/LOW", settings.db_low_15m)]
+    elif timeframe == "1d":
+        targets = [("1D/HIGH", settings.db_high_1d), ("1D/LOW", settings.db_low_1d)]
+    else:
+        console.print("[red]--timeframe must be '1d', '15m' or 'all'[/red]")
+        raise typer.Exit(2)
+
+    all_rows, total_prune = [], 0
+
+    async def _scan_db(label, db_name):
+        nonlocal total_prune
+        try:
+            # A pool, not one connection: COUNT(*) runs concurrently, and a
+            # single connection cannot hold concurrent transaction blocks.
+            pool = await asyncpg.create_pool(
+                host=settings.db_host, port=settings.db_port,
+                user=settings.db_user, password=settings.db_password, database=db_name,
+                min_size=1, max_size=max(1, int(concurrency)),
+            )
+        except Exception as e:
+            console.print(f"[yellow]{label} {db_name}: cannot connect ({e}) — skipped[/yellow]")
+            return
+        try:
+            conn = await pool.acquire()
+            tables = await read_pair_tables(conn)
+            if not tables:
+                console.print(f"[dim]{label} {db_name}: no pair tables found[/dim]")
+                return
+            to_count, n_tables = candidate_tables(tables)
+            if not to_count:
+                console.print(f"[green]\u2713 {label} {db_name}: {n_tables} pair tables, "
+                              f"no spot/perp duplicates[/green]")
+                return
+            if not exact:
+                counts = {tb: {"bars": tables.get(tb), "last_ts": None} for tb in to_count}
+            else:
+                console.print(f"[dim]{label} {db_name}: counting {len(to_count)} tables "
+                              f"(both sides of {len(to_count) // 2} duplicate(s))\u2026[/dim]")
+                t0 = _time.time()
+                counts = await measure(conn, to_count, concurrency=concurrency)
+                console.print(f"[dim]{label}: counted in {_time.time() - t0:.1f}s[/dim]")
+            plan = plan_pruning({t: tables.get(t, 0) for t in to_count}, counts,
+                                stale_sec=max(0.0, float(stale_hours)) * 3600.0)
+            summ = summarize(plan)
+            total_prune += summ["prune"]
+            for row in plan:
+                row["db"] = db_name
+                row["tier"] = label
+            all_rows.extend(plan)
+            console.print(
+                f"\n[bold]{label}[/bold] {db_name}: {n_tables} pair tables, "
+                f"{summ['candidates']} spot/perp duplicate(s) → "
+                f"[red]{summ['prune']} to prune[/red], {summ['keep']} kept, "
+                f"{summ['unknown']} unknown"
+            )
+            if plan:
+                out = Table("spot table", "spot bars", "perp bars", "idle", "verdict", "why",
+                            title=f"{label}: decisions (first 20 of {len(plan)})")
+                for row in plan[:20]:
+                    idle = "—" if row["spot_idle_sec"] is None else f"{row['spot_idle_sec'] / 3600:.1f}h"
+                    out.add_row(
+                        row["spot"],
+                        "?" if row["spot_bars"] is None else f"{row['spot_bars']}",
+                        "?" if row["perp_bars"] is None else f"{row['perp_bars']}",
+                        idle,
+                        row["verdict"],
+                        row["reason"][:70],
+                    )
+                console.print(out)
+            if apply and summ["prune"]:
+                actions = [r for r in plan if r["verdict"] == "prune"]
+                if limit and limit > 0:
+                    actions = actions[:limit]
+                refusal = None if yes else over_prune_guard(len(actions), n_tables, max_fraction)
+                if refusal:
+                    console.print(f"[red]{refusal}[/red]")
+                    # Say so in the report too: the JSON is what an operator
+                    # re-reads afterwards, and "prune" rows there must not look
+                    # like work that was already done.
+                    all_rows.append({"db": db_name, "tier": label, "tables": len(actions),
+                                     "verdict": "refused-by-guard", "reason": refusal})
+                    return
+                res = await apply_pruning(conn, actions, mode)
+                moved = [r for r in res if r.get("spot")]
+                ok = sum(1 for r in moved if r["ok"])
+                bad = [r for r in res if not r["ok"]]
+                console.print(
+                    f"[bold]{mode}[/bold]ed {ok}/{len(actions)} table(s) of {db_name}"
+                    + (f", [red]{len(bad)} failed[/red]: {bad[0]['error'][:120]}" if bad else "")
+                )
+                for r in bad:
+                    r["db"] = db_name
+                    r.setdefault("spot", None)
+                all_rows.extend({"db": db_name, "sql": r["sql"], "ok": r["ok"],
+                                 "error": r.get("error")} for r in bad)
+        finally:
+            await pool.release(conn)
+            await pool.close()
+
+    async def _run():
+        for label, db in targets:
+            await _scan_db(label, db)
+
+    asyncio.run(_run())
+
+    if report:
+        with open(report, "w", encoding="utf-8") as fh:
+            _json.dump(all_rows, fh, ensure_ascii=False, indent=1, default=str)
+        console.print(f"[dim]report → {report}[/dim]")
+
+    if not apply:
+        console.print(
+            f"\n[yellow]Dry-run: {total_prune} table(s) would be pruned. Nothing was changed.[/yellow] "
+            f"Re-run with --apply (default mode=trash, reversible: "
+            f"ALTER TABLE zombie_pruned.<table> SET SCHEMA public)."
+        )
+    else:
+        console.print(
+            "[green]Done.[/green] Press 🔄 Refresh data in the dashboard (or wait for "
+            "DASH_SCAN_INVENTORY_TTL_SEC) for the pair list to shrink."
+        )
+
+
 if __name__ == "__main__":
     app()
