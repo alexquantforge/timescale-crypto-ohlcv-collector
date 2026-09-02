@@ -1497,3 +1497,55 @@ def test_warm_thread_reports_a_cancelled_exchange_call_and_survives(monkeypatch,
             break
         _time.sleep(0.01)
     assert done == [1]                                # and _bg still works after
+
+
+def test_a_slow_switch_says_where_the_time_went(capsys, monkeypatch):
+    """The diagnostic that should have existed two rounds ago.
+
+    Three opposite causes hide behind "switching is slow": a warm that never
+    ran (Streamlit), a slow candle query (database), a slow HTML/JSON build
+    (CPU). The line names which one it was, so the next report can be fixed
+    instead of guessed at.
+    """
+    import time as _time
+
+    from dashboard import app as dapp
+
+    monkeypatch.setattr(dapp.settings, "dash_switch_report_ms", 20)
+    dapp._report_switch("BTC/USDT", "15m", "cached page",
+                        _time.perf_counter() - 0.5, _time.perf_counter() - 0.1)
+    out = capsys.readouterr().out
+    assert "[switch] BTC/USDT 15m" in out and "cached page" in out and "ms" in out
+
+    # fast renders stay silent — this is a diagnostic, not a log of every frame
+    dapp._report_switch("BTC/USDT", "15m", "warmed page", _time.perf_counter(), _time.perf_counter())
+    assert capsys.readouterr().out == ""
+
+    # 0 logs everything, which is what DASH_SWITCH_REPORT_MS=0 is for
+    monkeypatch.setattr(dapp.settings, "dash_switch_report_ms", 0)
+    dapp._report_switch("ETH/USDT", "1D", "warmed page", _time.perf_counter(), _time.perf_counter())
+    assert "[switch] ETH/USDT 1D" in capsys.readouterr().out
+
+
+def test_the_build_counter_tells_a_cache_hit_from_a_query(monkeypatch):
+    """"cached page" vs "built from DB" is only knowable from inside the cached
+    function, so the function counts its own runs."""
+    import pandas as pd
+
+    from dashboard import app as dapp
+
+    monkeypatch.setattr(dapp, "load_candles_cached", lambda *a, **k: pd.DataFrame())
+    for k, v in {"db_host": "h", "db_port": 1, "db_user": "u", "db_pass": "p"}.items():
+        monkeypatch.setattr(dapp, k, v)
+
+    before = dapp._CHART_BUILDS
+    # __wrapped__ bypasses st.cache_data, which is exactly the "we did query" case
+    out = dapp._render_chart_html_cached.__wrapped__(
+        db_host="h", db_port=1, db_user="u", db_pass="p", db_name="db1",
+        table_name="t1", max_ts=1, tf_label="15m", limit=10, merge_db="", merge_table="",
+        merge_limit=0, ccxt_id="bybit", sym_ticker="BTC/USDT", sym_ex="bybit",
+        chart_style="Candlesticks", chart_height=430, show_volume=False,
+        stitch_enabled=False, live_poller_js="", history_loader_js="", flat_fill=True,
+    )
+    assert out is None                      # no candles → the caller's empty-state path
+    assert dapp._CHART_BUILDS == before + 1

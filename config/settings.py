@@ -168,6 +168,9 @@ class Settings(BaseSettings):
     # first. The app felt SLOWER while warming was unthrottled: the prefetch was
     # competing with the render for the same connections.
     dash_warm_delay_sec: float = Field(default=1.5, alias="DASH_WARM_DELAY_SEC")
+    # A chart render slower than this prints one "[switch] …" line to the
+    # dashboard console saying where the milliseconds went. 0 = every render.
+    dash_switch_report_ms: int = Field(default=250, alias="DASH_SWITCH_REPORT_MS")
     # Pairs whose collector stopped writing this long ago (the dead spot tables
     # left by a spot→perp migration) are pre-built from the database only — no
     # exchange round trips for hundreds of missing candles nobody will watch.

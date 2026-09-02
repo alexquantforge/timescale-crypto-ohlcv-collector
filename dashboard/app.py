@@ -2137,6 +2137,32 @@ def _remember(store: dict, key, value, limit: int = _PAGE_STORE_LIMIT) -> None:
         store.pop(next(iter(store)))
 
 
+# Bumped by the chart builder itself: st.cache_data hides whether a page was
+# built or looked up, and those two differ by a database round trip.
+_CHART_BUILDS = 0
+
+
+def _report_switch(ticker: str, tf_label: str, source: str,
+                   started: float, build_started: float) -> None:
+    """One console line per SLOW chart render, saying where the time went.
+
+    "Switching is slow" has three causes that need opposite fixes — the warm did
+    not happen (Streamlit), the candle query is slow (database), or the JSON/HTML
+    build is (CPU). Guessing at this cost two rounds, so the render path now says
+    which one it was: a "warmed page"/"cached page" that is still slow is NOT a
+    database problem.
+    """
+    total_ms = (time.perf_counter() - started) * 1000.0
+    if total_ms < float(settings.dash_switch_report_ms):
+        return
+    build_ms = (time.perf_counter() - build_started) * 1000.0
+    print(
+        f"[switch] {ticker} {tf_label}: {total_ms:.0f} ms — {build_ms:.0f} ms of it "
+        f"query+build, source: {source}",
+        flush=True,
+    )
+
+
 def _stitched_candle_count(txt: str) -> int:
     """How many candles the stitch caption reports (0 when there is no caption).
     The caption is produced a few lines below in this same module, so the
@@ -2192,6 +2218,8 @@ def _render_chart_html_cached(
     instead of a DB round-trip + JSON build for two charts. Returns
     (html, stitch_caption_text) or None when the table has no usable candles.
     """
+    global _CHART_BUILDS
+    _CHART_BUILDS += 1
     frame = load_candles_cached(db_host, db_port, db_user, db_pass, db_name, table_name, limit)
     if frame is None or frame.empty:
         return None
@@ -2771,6 +2799,8 @@ with tab_charts:
                 poller_js, hist_js, bool(flat_fill),
             )
 
+            _t_start = time.perf_counter()
+            _t_build = _t_start       # before this: Streamlit, widgets, the summary
             # Progressive paint. The DB page renders NOW (one query, no
             # network to the exchange); the gap stitch — which pages the
             # exchange for up to DASH_STITCH_BUDGET_SEC and was previously the
@@ -2788,8 +2818,16 @@ with tab_charts:
                 entry = _STITCHED_PAGES[store_key]
                 html_code, stitch_txt = entry["html"], entry["txt"]
                 _remember(_DISPLAYED_HASH, store_key, entry.get("hash"))
+                _report_switch(sym_ticker, tf_label, "warmed page", _t_start, _t_build)
             else:
+                _built_before = _CHART_BUILDS
+                _t_build = time.perf_counter()
                 res = _render_chart_html_cached(**page_kwargs, stitch_enabled=False)
+                _report_switch(
+                    sym_ticker, tf_label,
+                    "built from DB" if _CHART_BUILDS != _built_before else "cached page",
+                    _t_start, _t_build,
+                )
                 if res is None:
                     st.info(f"No {tf_label} candles available for {sym_ticker} ({sym_ex}).")
                     return
