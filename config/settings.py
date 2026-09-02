@@ -244,6 +244,18 @@ class Settings(BaseSettings):
     # legacy TEXT-typed column no longer costs the whole batch its batching.
     dash_scan_chunk_size: int = Field(default=120, alias="DASH_SCAN_CHUNK_SIZE")
     dash_scan_pool_size: int = Field(default=6, alias="DASH_SCAN_POOL_SIZE")
+    # Databases scanned at the same time INSIDE one summary scan. 1 (default)
+    # walks HIGH then LOW; the two timeframes never overlap either, because the
+    # whole scan holds a process-wide gate. Parallel sweeps looked faster on an
+    # idle box and were several times slower on a loaded one: each extra
+    # connection is a query the collector has to wait for.
+    dash_scan_max_parallel_dbs: int = Field(default=1, alias="DASH_SCAN_MAX_PARALLEL_DBS")
+    # When a chunk query fails on a SCHEMA/type problem it is retried table by
+    # table; this caps how many tables of that chunk may be probed that way. A
+    # chunk that merely TIMED OUT is skipped instead (the tables are just as
+    # slow one by one, and 120 extra queries per chunk is what turned a 25 s
+    # scan into a 300 s one). 0 = never fall back to per-table reads.
+    dash_scan_recovery_max_tables: int = Field(default=24, alias="DASH_SCAN_RECOVERY_MAX_TABLES")
     # How often the table/column inventory of a database is re-read from
     # pg_catalog. New listings and engine column migrations land here, so this
     # is a freshness knob for the PAIR LIST only (candles and live data are
@@ -265,6 +277,11 @@ class Settings(BaseSettings):
     # slow the database, the slower scans hit their budget and return a
     # shorter pair list, and that list is re-scanned just as eagerly.
     dash_snapshot_refresh_sec: float = Field(default=120.0, alias="DASH_SNAPSHOT_REFRESH_SEC")
+    # Ceiling for that gap once scans keep coming back truncated: the delay
+    # doubles per consecutive partial scan (120 -> 240 -> 480 … ) so a busy
+    # database is retried a few times and then left alone, instead of every
+    # retry making the next scan truncate as well.
+    dash_scan_retry_max_sec: float = Field(default=1800.0, alias="DASH_SCAN_RETRY_MAX_SEC")
 
     priority_lane_enabled: bool = Field(default=True, alias="PRIORITY_LANE_ENABLED")
     priority_lane_interval_sec: float = Field(default=1.0, alias="PRIORITY_LANE_INTERVAL_SEC")

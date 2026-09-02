@@ -1635,3 +1635,57 @@ def snapshot_refresh_due(last_started: float, now: float, min_interval_sec: floa
     if not last_started:
         return True
     return (float(now) - float(last_started)) >= float(min_interval_sec)
+
+
+# Scan failures that mean "the server is busy", as opposed to "this chunk is
+# broken". Retrying the latter is useful; retrying the former is how a
+# dashboard turns a slow database into an overloaded one.
+_TRANSIENT_SCAN_MARKERS = (
+    "timeouterror", "cancellederror", "connectionerror", "connectionrefusederror",
+    "interfaceerror", "too many connections", "server closed the connection",
+    "could not serialize", "deadlock detected", "tuple concurrently",
+    "remaining connection slots", "memory", "shared memory",
+    # asyncpg/uvloop noise when a connection is cancelled mid-handshake: the
+    # transport is gone, the query never ran, and the tables are as reachable
+    # as they were — nothing here says "this chunk is broken".
+    "tcptransport", "invalid state", "connection reset", "connection was closed",
+    "connection lost", "connection is closed",
+)
+
+
+def scan_failure_is_transient(exc) -> bool:
+    """Is this scan error "the database is under load" rather than "broken"?
+
+    A DatatypeMismatchError on a legacy TEXT column needs the all-TEXT retry
+    and the per-table recovery. A TimeoutError needs neither: the same tables
+    are just as slow one by one, and the recovery fan-out (120 extra queries
+    per chunk, each waiting behind the same saturated pool) is what turned a
+    25 s scan into a 300 s one and made the NEXT scan slower still.
+    Accepts an exception or an already-formatted error string.
+    """
+    if isinstance(exc, str):
+        text = exc.lower()
+    else:
+        if isinstance(exc, (TimeoutError, ConnectionError)):   # asyncio.TimeoutError is TimeoutError
+            return True
+        text = f"{type(exc).__name__} {exc}".lower()
+    return any(m in text for m in _TRANSIENT_SCAN_MARKERS)
+
+
+def scan_retry_delay_sec(base_sec: float, attempts: int, cap_sec: float) -> float:
+    """How long to wait before rescanning after `attempts` truncated scans.
+
+    A truncated pair list must be retried — that is the only way the dashboard
+    ever shows the full list — but retrying it at a fixed short interval is
+    what produced the rescan storm: each retry added load, so the next scan
+    was truncated too. The delay doubles per consecutive partial scan and is
+    capped, so a busy collector is retried a few times and then left alone
+    (the data already in memory keeps rendering), while a database that
+    recovered is picked up within one base interval.
+    """
+    base = max(1.0, float(base_sec))
+    n = int(attempts or 0)
+    if n <= 0:
+        return base
+    delay = base * float(2 ** min(n, 10))
+    return min(delay, max(base, float(cap_sec)))

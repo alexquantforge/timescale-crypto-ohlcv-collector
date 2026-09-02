@@ -67,6 +67,8 @@ from dashboard.helpers import (
     coerce_summary_types,
     feed_should_use,
     snapshot_refresh_due,
+    scan_failure_is_transient,
+    scan_retry_delay_sec,
     chunked,
     snapshot_path,
     save_summary_snapshot,
@@ -140,14 +142,20 @@ _EXPECTED_SUMMARY_KEYS = [
 
 
 async def _summary_row_for_table(
-    pool, tbl: str, sem: asyncio.Semaphore, errors: list, timeout_sec: float = None
+    pool, tbl: str, sem: asyncio.Semaphore, errors: list, timeout_sec: float = None,
+    acquire_timeout: float = 10.0,
 ):
     """Last row of one candle table normalized to the summary schema; missing
     columns are padded with None. Returns None for empty/broken tables (broken
     ones are REPORTED into `errors`, never silently skipped)."""
     async with sem:
         try:
-            async with pool.acquire(timeout=10.0) as conn:
+            # The wait for a connection is bounded by the SAME budget as the
+            # query. With a hard 10 s here and 120 tables to walk, the recovery
+            # loop kept queueing doomed work long after the scan's deadline:
+            # the budget cut the sweep but not its tail, and that tail is the
+            # load the collector had to compete with.
+            async with pool.acquire(timeout=max(0.2, float(acquire_timeout))) as conn:
                 fetch = conn.fetchrow(
                     f'SELECT * FROM "{tbl}" ORDER BY "Timestamp" DESC LIMIT 1'
                 )
@@ -177,11 +185,28 @@ async def _summary_row_for_table(
 # refresh thread share one process, while st.cache_data would pickle away
 # anything attached to the frame itself.
 _SCAN_META: dict = {}
-# When a timeframe was last (re)scanned — the throttle for the background
-# revalidation, so a page that reruns every second does not rescan every
-# second. Written before the thread starts, not after it finishes: a slow
-# scan must not invite a second one on top of it.
+# When a timeframe was last (re)scanned — the throttle for the revalidation,
+# so a page that reruns every second does not rescan every second. Written
+# before the thread starts, not after it finishes: a slow scan must not invite
+# a second one on top of it.
 _LAST_SCAN_AT: dict = {}
+# Consecutive TRUNCATED scans per timeframe, driving the retry backoff (see
+# scan_retry_delay_sec). A pair list cut short by the budget has to be retried
+# or the dashboard never shows the full list — but at a FIXED interval every
+# retry adds load and guarantees the next scan is truncated too.
+_SCAN_ATTEMPTS: dict = {}
+# Last scan result per timeframe, in memory: {"df":…, "meta":…, "at":…}.
+# A partial scan lives HERE and never on disk (the "last good snapshot" file
+# must stay complete, or a busy collector shrinks the pair list from launch to
+# launch). Serving it is what keeps a rerun off the database entirely.
+_SUMMARY_STORE: dict = {}
+# One scan per process. Before this, a scan of "15m" and a scan of "1d" each
+# fanned out over both of their databases, i.e. up to 8 concurrent pools ×
+# `dash_scan_pool_size` connections of UNION-ALL MAX() queries — against the
+# same Postgres the collector is writing to. The scans then timed out, retried,
+# and slowed each other down: measured on a production run, the same 116-chunk
+# sweep took 19.9 s alone and 105 s when three other sweeps overlapped it.
+_SCAN_GATE = threading.BoundedSemaphore(1)
 
 
 # table -> {column: data_type}, per (host, port, database), read from
@@ -271,43 +296,95 @@ async def _scan_database(
     the page renders, instead of the user staring at a spinner. The result is
     flagged in `_SCAN_META` so a truncated scan is never cached as the last
     good snapshot.
+
+    A budget that only decides when to STOP LOGGING is not a budget: the sweep
+    used to keep going through retries and per-table recovery for minutes after
+    it expired (250–310 s per database on a loaded box), because a chunk already
+    in flight waited 15 s for a pool connection and 30 s for its query. So the
+    remaining budget is now threaded through every wait, a chunk that fails on
+    LOAD is skipped instead of retried table by table, and recovery is capped by
+    `dash_scan_recovery_max_tables`.
     """
     started = time.time()
     budget_sec = settings.dash_scan_budget_sec if budget_sec is None else budget_sec
     pool_size = settings.dash_scan_pool_size if pool_size is None else pool_size
     chunk_size = settings.dash_scan_chunk_size if chunk_size is None else chunk_size
+    catalog_secs = 0.0
     try:
         pool = await asyncpg.create_pool(
             host=db_host, port=db_port, user=db_user, password=db_pass,
             database=db_name, min_size=1, max_size=pool_size, command_timeout=30,
+            timeout=15,
         )
-    except Exception:
+    except Exception as e:
+        # A database the dashboard cannot even connect to is not an empty
+        # database: say so, and mark the scan partial so nothing downstream
+        # treats the shorter list as the truth.
+        why = f"{type(e).__name__}: {e}"
+        print(f"[scan] {db_name}: connect failed — {why}", flush=True)
+        _SCAN_META[db_name] = {"tables": 0, "rows": 0, "chunks": 0, "skipped_chunks": 0,
+                               "fallback_chunks": 0, "seconds": time.time() - started,
+                               "sweep_seconds": 0.0, "catalog_seconds": 0.0,
+                               "partial": True, "error": why}
         return []
 
+    # asyncpg opens pool connections LAZILY, inside the first acquire().
+    # The sweep cancels an acquire as soon as its budget is gone, and a
+    # cancellation that lands mid-TLS-handshake is the asyncpg/uvloop race
+    # behind "Fatal error on transport TCPTransport / InvalidStateError"
+    # in the dashboard log. Opening the pool up front (uncancelled) means
+    # the budget can only ever interrupt a QUERY. A warm-up failure is not
+    # fatal: the connections are then simply created lazily as before.
     try:
+        conns = await asyncio.wait_for(
+            asyncio.gather(*[pool.acquire() for _ in range(max(1, int(pool_size)))],
+                           return_exceptions=True),
+            timeout=15.0,
+        )
+        for c in conns:
+            if not isinstance(c, BaseException):
+                await pool.release(c)
+    except Exception:
+        pass      # lazy creation as before — a warm-up is an optimization
+
+    try:
+        t_catalog = time.time()
         tables = await _table_inventory(pool, db_name, db_host, db_port)
+        catalog_secs = max(catalog_secs, time.time() - t_catalog)
         if not tables:
             return []
 
-        sem = asyncio.Semaphore(pool_size)
+        sem = asyncio.Semaphore(max(1, int(pool_size)))
+        # The budget covers the DATA sweep. The catalog read above is cached
+        # and was charged to the sweep before, which made the "25s budget
+        # exhausted … in 76.0s" lines unreadable (76 s of catalog, 25 s of
+        # budget, no contradiction after all).
         deadline = time.time() + float(budget_sec)
         errors: list = []
+        skipped: list = []
         out: list = []
+        recovery_cap = max(0, int(settings.dash_scan_recovery_max_tables))
 
         async def _fetch_union(sql: str, timeout: float) -> list:
-            # The query itself is bounded by the SCAN budget, not only by the
-            # pool's command_timeout: with 45 slow chunks and 6 connections,
-            # 30s-per-query stalls alone add up to minutes while the page
-            # renders nothing (asyncpg implements command_timeout the same
-            # way, so cancelling here is a supported path, not a hack).
-            left = max(0.5, float(timeout))
+            # Bounded by the SCAN budget, not only by the pool's
+            # command_timeout: with 45 slow chunks and 6 connections,
+            # 30s-per-query stalls add up to minutes while the page renders
+            # nothing (asyncpg implements command_timeout the same way, so
+            # cancelling here is a supported path, not a hack). A chunk that
+            # cannot fit in what is left is not queued at all — a 0.5 s query
+            # against a loaded server is a guaranteed TimeoutError that still
+            # occupies a connection while it fails.
+            left = float(timeout)
+            if left < 1.0:
+                raise asyncio.TimeoutError("scan budget exhausted")
             async with sem:
-                async with pool.acquire(timeout=min(15.0, left)) as conn:
+                async with pool.acquire(timeout=min(5.0, left)) as conn:
                     rows = await asyncio.wait_for(conn.fetch(sql), timeout=left)
             return [dict(r) for r in rows]
 
         async def run_chunk(chunk: dict):
             if time.time() > deadline:
+                skipped.append(len(chunk))
                 return []
             sql = build_summary_union_sql(chunk, _EXPECTED_SUMMARY_KEYS)
             if not sql:
@@ -315,11 +392,18 @@ async def _scan_database(
             try:
                 return await _fetch_union(sql, deadline - time.time())
             except Exception as e:
+                errors.append((f"chunk[{len(chunk)}]", f"{type(e).__name__}: {e}"))
+                if scan_failure_is_transient(e):
+                    # LOADED, not broken. The all-TEXT retry and the per-table
+                    # recovery would ask the same saturated pool for 120 more
+                    # queries and answer nothing; the tables that did not make
+                    # it stay one pass behind, which is visible in the
+                    # "pair list incomplete" badge.
+                    return []
                 # A type mismatch (or a table the collector just dropped mid
                 # -scan) must not cost the chunk its batching: retry ONCE with
                 # every column flattened to TEXT. That query is type-stable by
                 # construction, and the values are converted back in Python.
-                errors.append((f"chunk[{len(chunk)}]", f"{type(e).__name__}: {e}"))
                 retry_sql = build_summary_union_sql(
                     chunk, _EXPECTED_SUMMARY_KEYS, force_text=True
                 )
@@ -327,16 +411,20 @@ async def _scan_database(
                     return await _fetch_union(retry_sql, deadline - time.time())
                 except Exception as e2:
                     errors.append((f"chunk[{len(chunk)}]:text", f"{type(e2).__name__}: {e2}"))
-            # Last resort: per-table reads, but bounded by the remaining budget
-            # — an unbounded 120-query recovery is what turned a slow startup
-            # into a minutes-long one.
+                    if scan_failure_is_transient(e2):
+                        return []
+            # Last resort: per-table reads, bounded by the remaining budget AND
+            # by a table cap — an unbounded 120-query recovery is what turned a
+            # slow startup into a minutes-long one.
             recovered = []
-            for tbl in chunk:
-                if time.time() > deadline:
+            for tbl in list(chunk)[:recovery_cap]:
+                left = deadline - time.time()
+                if left < 1.0:
                     break
                 d = await _summary_row_for_table(
                     pool, tbl, sem, errors,
-                    timeout_sec=min(8.0, max(0.5, deadline - time.time())),
+                    timeout_sec=min(8.0, max(0.5, left)),
+                    acquire_timeout=min(3.0, max(0.2, left)),
                 )
                 if d:
                     d["table_name"] = tbl
@@ -352,36 +440,43 @@ async def _scan_database(
             d["volume_tier"] = tier_label
 
         secs = time.time() - started
+        sweep_secs = max(0.0, secs - catalog_secs)
         # 'partial' means "this frame is NOT the truth about the database":
         # either the budget cut the sweep short, or tables reported errors while
         # rows are missing. Empty tables alone never set it — they are normal.
-        partial = time.time() > deadline or (
+        partial = bool(skipped) or time.time() > deadline or (
             bool(errors) and len(out) < len(tables)
         )
         _SCAN_META[db_name] = {
             "tables": len(tables),
             "rows": len(out),
             "chunks": len(chunks),
+            "skipped_chunks": len(skipped),
             "fallback_chunks": len([t for t, _ in errors if t.startswith("chunk[")]),
             "seconds": secs,
+            "sweep_seconds": sweep_secs,
+            "catalog_seconds": catalog_secs,
             "partial": partial,
         }
+        tail = f" (+catalog {catalog_secs:.1f}s)" if catalog_secs > 1.0 else ""
         if errors:
             preview = "; ".join(f"{t}: {e}" for t, e in errors[:3])
             print(
                 f"[scan] {db_name}: {len(set(t for t, _ in errors))} chunk(s) needed a "
-                f"retry/per-table fallback ({secs:.1f}s): {preview}",
+                f"retry/per-table fallback ({sweep_secs:.1f}s): {preview}{tail}",
                 flush=True,
             )
-        elif secs > 3.0:
+        elif sweep_secs > 3.0:
             print(
-                f"[scan] {db_name}: {len(chunks)} chunk(s) / {len(out)} tables in {secs:.1f}s",
+                f"[scan] {db_name}: {len(chunks)} chunk(s) / {len(out)} tables in "
+                f"{sweep_secs:.1f}s{tail}",
                 flush=True,
             )
         if partial:
             print(
                 f"[scan] {db_name}: {budget_sec:.0f}s budget exhausted — rendering "
-                f"{len(out)}/{len(tables)} tables (collector is probably writing hard)",
+                f"{len(out)}/{len(tables)} tables ({len(skipped)} chunk(s) skipped on "
+                f"budget/busy db); the list will be retried with backoff",
                 flush=True,
             )
         return out
@@ -395,9 +490,24 @@ async def _load_summary(db_host, db_port, db_user, db_pass, timeframe: str) -> p
     else:
         dbs = [("HIGH", settings.db_high_1d), ("LOW", settings.db_low_1d)]
 
-    scans = await asyncio.gather(
-        *[_scan_database(db, tier, db_host, db_port, db_user, db_pass) for tier, db in dbs]
-    )
+    # `dash_scan_max_parallel_dbs` = 1 (the default) walks the two databases of
+    # a timeframe one after the other. Fanning them out halved the wall time of
+    # an idle scan and multiplied it on a loaded one — every sweep was competing
+    # with the others for the same Postgres the collector writes to.
+    par = max(1, int(settings.dash_scan_max_parallel_dbs))
+    if par == 1 or len(dbs) == 1:
+        scans = [
+            await _scan_database(db, tier, db_host, db_port, db_user, db_pass)
+            for tier, db in dbs
+        ]
+    else:
+        gate = asyncio.Semaphore(par)
+
+        async def _one(tier, db):
+            async with gate:
+                return await _scan_database(db, tier, db_host, db_port, db_user, db_pass)
+
+        scans = await asyncio.gather(*[_one(tier, db) for tier, db in dbs])
     all_rows = [r for scan in scans for r in scan]
     metas = [_SCAN_META.get(db, {}) for _, db in dbs]
     _SCAN_META[timeframe] = {
@@ -413,27 +523,85 @@ async def _load_summary(db_host, db_port, db_user, db_pass, timeframe: str) -> p
     return coerce_summary_types(pd.DataFrame(all_rows))
 
 
-def _scan_summary_now(db_host, db_port, db_user, db_pass, timeframe: str) -> pd.DataFrame:
+def _rescan_delay_sec(timeframe: str) -> float:
+    """Backoff for this timeframe right now, from its truncated-scan streak."""
+    return scan_retry_delay_sec(
+        settings.dash_snapshot_refresh_sec, _SCAN_ATTEMPTS.get(timeframe, 0),
+        settings.dash_scan_retry_max_sec,
+    )
+
+
+def _rescan_due(timeframe: str, now: float) -> bool:
+    return snapshot_refresh_due(
+        _LAST_SCAN_AT.get(timeframe, 0.0), now, _rescan_delay_sec(timeframe)
+    )
+
+
+def _scan_summary_now(db_host, db_port, db_user, db_pass, timeframe: str,
+                      gate_sec: float = 0.0) -> pd.DataFrame:
     """Full scan + snapshot persist (used by both the sync and the background path).
 
-    A scan cut short by the time budget is NOT persisted: caching a truncated
-    pair list as the 'last good snapshot' is how a busy collector quietly
-    shrinks the dashboard from one launch to the next.
+    A scan cut short by the time budget is NOT persisted to disk: caching a
+    truncated pair list as the 'last good snapshot' is how a busy collector
+    quietly shrinks the dashboard from one launch to the next. It IS kept in
+    `_SUMMARY_STORE` for the session — serving an incomplete list beats
+    re-asking the database every rerun, which is the loop that was hammering
+    the collector.
+
+    `_SCAN_GATE` holds one scan per process. `gate_sec` says how long a caller
+    on the render path may wait for it; the background path passes 0 and walks
+    away, because a scan that could not start is exactly the load the app is
+    trying not to add.
     """
-    df = asyncio.run(_load_summary(db_host, db_port, db_user, db_pass, timeframe))
-    if settings.dash_snapshot_enabled and not _SCAN_META.get(timeframe, {}).get("partial"):
-        save_summary_snapshot(
-            snapshot_path(settings.dash_snapshot_dir, timeframe), df
-        )
-    return df
+    waited_before = (_SUMMARY_STORE.get(timeframe) or {}).get("at", 0.0)
+    if not _SCAN_GATE.acquire(timeout=max(0.0, float(gate_sec))):
+        ent = _SUMMARY_STORE.get(timeframe)
+        print(f"[scan] {timeframe}: skipped — another scan holds the database", flush=True)
+        return ent["df"] if ent else pd.DataFrame()
+    if gate_sec and (_SUMMARY_STORE.get(timeframe) or {}).get("at", 0.0) > waited_before:
+        # Somebody finished a scan while we were queueing for the gate: that IS
+        # the answer, and scanning again would only add the load we waited for.
+        _SCAN_GATE.release()
+        return _SUMMARY_STORE[timeframe]["df"]
+    try:
+        df = asyncio.run(_load_summary(db_host, db_port, db_user, db_pass, timeframe))
+        meta = dict(_SCAN_META.get(timeframe, {}))
+        _SUMMARY_STORE[timeframe] = {"df": df, "meta": meta, "at": time.time()}
+        # The streak decides when we dare to try again.
+        _SCAN_ATTEMPTS[timeframe] = _SCAN_ATTEMPTS.get(timeframe, 0) + 1 if meta.get("partial") else 0
+        if settings.dash_snapshot_enabled and not meta.get("partial"):
+            save_summary_snapshot(
+                snapshot_path(settings.dash_snapshot_dir, timeframe), df
+            )
+        return df
+    finally:
+        _SCAN_GATE.release()
+
+
+def _scan_is_better(timeframe: str, before: dict) -> bool:
+    """Whether the scan just stored deserves a rerun of the cached summary.
+
+    Clearing the cache after EVERY scan is what re-armed the storm: the next
+    rerun found no cache, scanned on the render path, got truncated again and
+    launched another background scan. Only progress may cost a rerun.
+    """
+    after = (_SUMMARY_STORE.get(timeframe) or {}).get("meta") or {}
+    if not after:
+        return False
+    if (before or {}).get("rows", -1) < after.get("rows", 0):
+        return True
+    return bool((before or {}).get("partial")) and not after.get("partial")
 
 
 def _refresh_summary_in_background(db_host, db_port, db_user, db_pass, timeframe: str) -> None:
     """Rescans off the UI thread and drops the cache so the next rerun picks it up."""
     def _run():
+        before = (_SUMMARY_STORE.get(timeframe) or {}).get("meta") or {}
         try:
             _scan_summary_now(db_host, db_port, db_user, db_pass, timeframe)
         except Exception:
+            return
+        if not _scan_is_better(timeframe, before):
             return
         try:
             load_summary_cached.clear()
@@ -453,33 +621,49 @@ def load_summary_cached(db_host, db_port, db_user, db_pass, timeframe: str) -> p
     opened while the collector is mid-cycle then paints instantly instead of
     blocking on a full scan of every table.
     """
+    now = time.time()
+
+    def _serve(df, meta, age):
+        """Paint what we have; retry later, always throttled."""
+        st.session_state[f"_snap_age_{timeframe}"] = age
+        if (meta or {}).get("partial"):
+            st.session_state[f"_partial_scan_{timeframe}"] = (now, dict(meta))
+        if _rescan_due(timeframe, now):
+            # Marked at LAUNCH: a scan that takes 20 s must not invite a second
+            # one 20 s later. This gate used to guard only the snapshot branch,
+            # so on a box where scans kept coming back truncated (the usual
+            # case while the collector writes) every rerun re-scanned.
+            _LAST_SCAN_AT[timeframe] = now
+            _refresh_summary_in_background(db_host, db_port, db_user, db_pass, timeframe)
+        return df
+
+    ent = _SUMMARY_STORE.get(timeframe)
+    # An EMPTY frame is still an answer as long as the scan completed: without
+    # this, a database that genuinely holds no pair tables would be re-scanned
+    # on every rerun instead of rendering the "no tables" diagnostic.
+    if ent is not None and (not ent["df"].empty or not (ent.get("meta") or {}).get("partial")):
+        return _serve(ent["df"], ent.get("meta") or {}, now - float(ent.get("at", now)))
+
     if settings.dash_snapshot_enabled:
         snap, age = load_summary_snapshot(
             snapshot_path(settings.dash_snapshot_dir, timeframe),
             settings.dash_snapshot_max_age_sec,
         )
         if snap is not None and not snap.empty:
-            # Throttled: a valid snapshot means the list is USABLE, so the
-            # rescan is a background nicety, not something to re-launch on
-            # every rerun (see settings.dash_snapshot_refresh_sec).
-            if snapshot_refresh_due(
-                _LAST_SCAN_AT.get(timeframe, 0.0), time.time(),
-                settings.dash_snapshot_refresh_sec,
-            ):
-                _LAST_SCAN_AT[timeframe] = time.time()
-                _refresh_summary_in_background(db_host, db_port, db_user, db_pass, timeframe)
-            st.session_state[f"_snap_age_{timeframe}"] = age
-            return snap
+            _SUMMARY_STORE[timeframe] = {"df": snap, "meta": {}, "at": now - float(age or 0)}
+            return _serve(snap, {}, age)
 
+    # Nothing in memory and nothing on disk: this first scan is the one case
+    # where the render path does wait for the database, bounded by its own
+    # budget and by whoever holds the gate.
     try:
-        df = _scan_summary_now(db_host, db_port, db_user, db_pass, timeframe)
-        if _SCAN_META.get(timeframe, {}).get("partial"):
-            # A truncated scan is what the user would otherwise live with for
-            # the full 10-minute cache TTL: render it now, rescan behind.
-            st.session_state[f"_partial_scan_{timeframe}"] = (
-                time.time(), dict(_SCAN_META.get(timeframe, {}))
-            )
-            _refresh_summary_in_background(db_host, db_port, db_user, db_pass, timeframe)
+        df = _scan_summary_now(
+            db_host, db_port, db_user, db_pass, timeframe,
+            # The cold path may wait for an in-flight scan — for at most the
+            # budget that scan itself was given, and then it serves whatever
+            # exists rather than starting a third sweep.
+            gate_sec=float(settings.dash_scan_budget_sec),
+        )
         return df
     except Exception as e:
         st.error(f"Database connection error: {e}")
@@ -2028,6 +2212,8 @@ if st.sidebar.button("🔄 Refresh data (clear caches)"):
     _SCAN_INVENTORY.clear()
     _STITCHED_PAGES.clear()
     _LAST_SCAN_AT.clear()
+    _SUMMARY_STORE.clear()
+    _SCAN_ATTEMPTS.clear()
     st.rerun()
 
 # Compact layout: no big page title — charts come first with minimal top padding

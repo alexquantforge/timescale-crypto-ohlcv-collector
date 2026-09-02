@@ -381,7 +381,8 @@ class _FakeScanPool:
 
     def __init__(self, schema, *, break_unions=False, break_rows=False):
         # break_unions: False | "first" (only the native projection dies, the
-        # all-TEXT retry works) | True (the chunk is simply unqueryable).
+        # all-TEXT retry works) | True (the chunk is simply unqueryable) |
+        # "timeout" (the server is LOADED — the chunk is skipped, not retried).
         self.schema = schema
         self.break_unions = break_unions
         self.break_rows = break_rows
@@ -408,6 +409,9 @@ class _FakeScanPool:
                         for c, dt in cols.items()
                     ]
                 outer.union_queries.append(query)
+                if outer.break_unions == "timeout":
+                    import asyncio as _a
+                    raise _a.TimeoutError()
                 if outer.break_unions is True or (
                     outer.break_unions == "first" and len(outer.union_queries) == 1
                 ):
@@ -974,3 +978,252 @@ def test_chart_page_actually_builds_from_those_kwargs(tmp_path, monkeypatch):
     )
     _, txt_stale = dapp._render_chart_html_cached.__wrapped__(**stale_kwargs, stitch_enabled=False)
     assert "collector" in txt_stale and "behind" in txt_stale
+
+
+# ---------------------------------------------------------------------------
+# The scan must never become the load it is scanning around.
+#
+# A production session showed the dashboard issuing a 4-database UNION sweep
+# every ~30 s for minutes, chunks timing out, each timed-out chunk then being
+# re-read table by table (250–313 s per database), and asyncpg printing
+# "Fatal error on transport TCPTransport" for the connections cancelled at the
+# deadline. All of it was the dashboard fighting the collector for the same
+# Postgres — so the fixes below are about admission, retry policy and backoff.
+# ---------------------------------------------------------------------------
+
+
+def _summary_stores(monkeypatch, dapp):
+    """Module stores + a fake `st`, so load_summary_cached can be driven without
+    an app or a database. `types` is imported here because the tests below are
+    the only ones that reach into the module's state."""
+    import types as _types
+
+    for name in ("_SUMMARY_STORE", "_SCAN_ATTEMPTS", "_LAST_SCAN_AT", "_SCAN_META",
+                 "_SCAN_INVENTORY"):
+        monkeypatch.setattr(dapp, name, {}, raising=False)
+    monkeypatch.setattr(dapp, "st", _types.SimpleNamespace(
+        session_state={}, error=lambda *a, **k: None))
+    return dapp
+
+
+def test_truncated_scan_is_served_from_memory_not_rescanned(monkeypatch):  # noqa: E301
+    """THE rescan-storm regression.
+
+    A truncated scan is deliberately never persisted to disk, so the snapshot
+    branch (and the throttle inside it) never applies on a loaded database:
+    the partial path used to (a) run a blocking scan on EVERY rerun and (b)
+    clear the whole Streamlit cache after every background scan, so the next
+    rerun scanned again. Serve the in-memory result and retry at most once per
+    backoff window.
+    """
+    import pandas as pd
+
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_enabled", False)
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_refresh_sec", 120.0)
+    scans, launched = [], []
+
+    async def fake_load(*a, **k):
+        scans.append(1)
+        dapp._SCAN_META["15m"] = {"partial": True, "rows": 5, "tables": 40, "seconds": 25.0}
+        return pd.DataFrame({"ticker": [f"p{i}" for i in range(5)]})
+
+    monkeypatch.setattr(dapp, "_load_summary", fake_load)
+    monkeypatch.setattr(
+        dapp, "_refresh_summary_in_background",
+        lambda *a, **k: launched.append(1),
+    )
+
+    for _ in range(20):
+        df = dapp.load_summary_cached.__wrapped__("h", 1, "u", "p", "15m")
+
+    assert len(df) == 5
+    assert len(scans) == 1, f"the render path scanned {len(scans)} times"
+    assert len(launched) == 1, "a truncated scan must not re-arm a rescan per rerun"
+    assert dapp._SCAN_ATTEMPTS["15m"] == 1          # the streak drives the delay
+    assert dapp._rescan_delay_sec("15m") == 240.0   # … and it backs off
+    assert dapp.st.session_state["_partial_scan_15m"][1]["tables"] == 40  # badge data
+
+
+def test_a_complete_scan_resets_the_backoff(monkeypatch):
+    import pandas as pd
+
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_enabled", False)
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_refresh_sec", 120.0)
+    dapp._SCAN_ATTEMPTS["15m"] = 4
+
+    async def complete(*a, **k):
+        dapp._SCAN_META["15m"] = {"partial": False, "rows": 40, "tables": 40, "seconds": 3.0}
+        return pd.DataFrame({"ticker": ["a"]})
+
+    monkeypatch.setattr(dapp, "_load_summary", complete)
+    dapp._scan_summary_now("h", 1, "u", "p", "15m")
+    assert dapp._SCAN_ATTEMPTS["15m"] == 0
+    assert dapp._rescan_delay_sec("15m") == 120.0
+    assert dapp._SUMMARY_STORE["15m"]["meta"]["partial"] is False
+
+
+def test_two_scans_never_hold_the_database_at_once(monkeypatch, capsys):
+    """One scan per process — the two timeframes used to fan out over both of
+    their databases, i.e. up to 8 pools of heavy UNION queries at once."""
+    import pandas as pd
+    import threading
+
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    held = threading.BoundedSemaphore(1)
+    held.acquire()
+    monkeypatch.setattr(dapp, "_SCAN_GATE", held)
+    called = []
+
+    async def fake_load(*a, **k):
+        called.append(1)
+        return pd.DataFrame()
+
+    monkeypatch.setattr(dapp, "_load_summary", fake_load)
+    monkeypatch.setattr(dapp, "_SUMMARY_STORE", {
+        "15m": {"df": pd.DataFrame({"ticker": ["OLD"]}), "meta": {}, "at": 1.0}
+    })
+
+    df = dapp._scan_summary_now("h", 1, "u", "p", "15m")     # background path: no waiting
+    assert list(df["ticker"]) == ["OLD"]
+    assert called == [], "the second scan must not start while the first holds the gate"
+    assert "holds the database" in capsys.readouterr().out
+
+
+def test_databases_are_swept_one_at_a_time_by_default(monkeypatch):
+    import asyncio
+
+    from dashboard import app as dapp
+
+    seen = []
+
+    async def fake_scan(db, tier, *a, **k):
+        seen.append(("start", db))
+        await asyncio.sleep(0)
+        seen.append(("end", db))
+        return []
+
+    monkeypatch.setattr(dapp, "_scan_database", fake_scan)
+    monkeypatch.setattr(dapp, "_SCAN_META", {}, raising=False)
+    monkeypatch.setattr(dapp.settings, "dash_scan_max_parallel_dbs", 1)
+    monkeypatch.setattr(dapp.settings, "db_high_15m", "hi")
+    monkeypatch.setattr(dapp.settings, "db_low_15m", "lo")
+    asyncio.run(dapp._load_summary("h", 1, "u", "p", "15m"))
+    assert seen == [("start", "hi"), ("end", "hi"), ("start", "lo"), ("end", "lo")]
+
+    seen.clear()
+    monkeypatch.setattr(dapp.settings, "dash_scan_max_parallel_dbs", 2)
+    asyncio.run(dapp._load_summary("h", 1, "u", "p", "15m"))
+    assert seen[:2] == [("start", "hi"), ("start", "lo")]        # opt-in concurrency
+
+
+def test_a_busy_database_does_not_get_a_query_per_table(monkeypatch):
+    """Timeout ⇒ skip the chunk. Type/schema error ⇒ recover, but bounded."""
+    from dashboard import app as dapp
+
+    schema = {
+        f"p{i}_usdt_on_bybit": {"Timestamp": "bigint", "ticker": "text", "close": "numeric"}
+        for i in range(30)
+    }
+
+    # (1) the server is loaded: no all-TEXT retry, no per-table recovery
+    pool = _FakeScanPool(schema, break_unions="timeout")
+    rows = _run_scan(monkeypatch, pool)
+    assert rows == []
+    assert len(pool.union_queries) == 1, "a timed-out chunk must not be re-queried"
+    assert pool.per_table_reads == 0
+
+    # (2) a broken chunk: recovered, but at most dash_scan_recovery_max_tables
+    monkeypatch.setattr(dapp.settings, "dash_scan_recovery_max_tables", 7)
+    pool2 = _FakeScanPool(schema, break_unions=True, break_rows=False)
+    rows2 = _run_scan(monkeypatch, pool2)
+    assert len(pool2.union_queries) == 2                 # native + all-TEXT retry
+    assert pool2.per_table_reads == 7                    # capped, not 30
+    assert len(rows2) == 7
+    assert dapp._SCAN_META["db_test"]["partial"] is True  # 23 tables are unknown
+
+
+def test_scan_budget_excludes_the_catalog_read(monkeypatch):
+    """`in 76.0s` next to `25s budget exhausted` is not a contradiction, and
+    pretending otherwise cost two rounds of tuning: the sweep and the catalog
+    read are now timed and reported separately."""
+    from dashboard import app as dapp
+
+    schema = {
+        f"p{i}_usdt_on_bybit": {"Timestamp": "bigint", "ticker": "text"} for i in range(2)
+    }
+    pool = _FakeScanPool(schema)
+    _run_scan(monkeypatch, pool)
+    meta = dapp._SCAN_META["db_test"]
+    assert "sweep_seconds" in meta and "catalog_seconds" in meta
+    assert meta["skipped_chunks"] == 0 and meta["partial"] is False
+
+
+def test_a_database_that_refuses_connection_is_reported_not_empty(monkeypatch, capsys):
+    """`return []` on a failed connect is the silence this app keeps having to
+    unlearn: an unreachable database and a database with no pairs both render
+    as an empty pair list, and only one of them is true."""
+    import asyncio
+
+    from dashboard import app as dapp
+
+    async def boom(**kw):
+        raise OSError("could not connect to server: Connection timed out")
+
+    monkeypatch.setattr(dapp.asyncpg, "create_pool", boom)
+    monkeypatch.setattr(dapp, "_SCAN_INVENTORY", {}, raising=False)
+    rows = asyncio.run(dapp._scan_database("db_dead", "HIGH", "h", 1, "u", "p",
+                                           pool_size=2, chunk_size=120, budget_sec=5.0))
+    assert rows == []
+    assert "connect failed" in capsys.readouterr().out
+    meta = dapp._SCAN_META["db_dead"]
+    assert meta["partial"] is True and "Connection timed out" in meta["error"]
+
+
+def test_the_cold_path_waits_for_an_in_flight_scan_instead_of_joining_it(monkeypatch):  # noqa: E302
+    """Queueing on the gate is allowed to pay off: if a scan lands while the
+    render path waits, that result is the answer — starting a second sweep of
+    the same database would be the exact behaviour this is here to remove."""
+    import threading
+    import time as _time
+
+    import pandas as pd
+
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    gate = threading.BoundedSemaphore(1)
+    gate.acquire()
+    monkeypatch.setattr(dapp, "_SCAN_GATE", gate)
+    scans = []
+
+    async def fake_load(*a, **k):
+        scans.append(1)
+        return pd.DataFrame({"ticker": ["X"]})
+
+    monkeypatch.setattr(dapp, "_load_summary", fake_load)
+
+    def finish_someone_elses_scan():
+        dapp._SUMMARY_STORE["15m"] = {
+            "df": pd.DataFrame({"ticker": ["FROM_BG"]}), "meta": {},
+            "at": _time.time(),
+        }
+        gate.release()
+
+    timer = threading.Timer(0.05, finish_someone_elses_scan)
+    timer.start()
+    try:
+        df = dapp._scan_summary_now("h", 1, "u", "p", "15m", gate_sec=2.0)
+    finally:
+        timer.cancel()
+    assert list(df["ticker"]) == ["FROM_BG"]
+    assert scans == [], "the queued caller must not launch a second scan"
+    assert gate.acquire(blocking=False), "the gate was not returned"
+    gate.release()

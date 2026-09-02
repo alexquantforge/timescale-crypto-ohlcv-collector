@@ -1044,3 +1044,53 @@ def test_feed_should_use_rejects_missing_and_stale_only():
     assert feed_should_use({"value": None, "at": 999.0}, 1000.0, 20.0) is True
     assert feed_should_use({"value": None, "at": 900.0}, 1000.0, 20.0) is False
     assert feed_should_use({}, 1000.0, 20.0) is False          # no timestamp at all
+
+
+def test_transient_scan_errors_are_not_retried_harder():
+    """The scan must tell "database is busy" from "this chunk is broken".
+
+    Retrying a timeout as 120 individual queries is how the dashboard turned a
+    slow Postgres into an overloaded one; retrying a type mismatch is the
+    recovery that made legacy TEXT columns work again.
+    """
+    import asyncio
+
+    from dashboard.helpers import scan_failure_is_transient
+
+    busy = [
+        asyncio.TimeoutError(),
+        TimeoutError(),
+        ConnectionRefusedError("[Errno 111] Connection refused"),
+        "TimeoutError: ",
+        "ConnectionRefusedError: connection failed",
+        "asyncpg.exceptions.TooManyConnectionsError: remaining connection "
+        "slots are reserved",
+        "Fatal error on transport TCPTransport",
+        "InterfaceError: connection is closed",
+    ]
+    for b in busy:
+        assert scan_failure_is_transient(b) is True, b
+
+    broken = [
+        "DatatypeMismatchError: UNION types double precision and text cannot be matched",
+        "UndefinedTableError: relation \"btc_usdt_on_bybit\" does not exist",
+        "InvalidTextRepresentationError: invalid input syntax for integer: \"abc\"",
+        RuntimeError("relation disappeared mid-scan"),
+    ]
+    for b in broken:
+        assert scan_failure_is_transient(b) is False, b
+
+
+def test_retry_delay_backs_off_while_scans_stay_truncated():
+    """Backoff for the rescan: retry, but not at a cost that guarantees the
+    next retry fails the same way."""
+    from dashboard.helpers import scan_retry_delay_sec
+
+    assert scan_retry_delay_sec(120, 0, 1800) == 120      # first retry: base gap
+    assert scan_retry_delay_sec(120, 1, 1800) == 240
+    assert scan_retry_delay_sec(120, 2, 1800) == 480
+    assert scan_retry_delay_sec(120, 3, 1800) == 960
+    assert scan_retry_delay_sec(120, 4, 1800) == 1800     # capped
+    assert scan_retry_delay_sec(120, 99, 1800) == 1800
+    # a base of 0 (throttle disabled) must not lock up or divide by zero
+    assert scan_retry_delay_sec(0, 5, 1800) == 32.0
