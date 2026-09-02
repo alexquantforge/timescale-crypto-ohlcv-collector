@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import asyncio
 import math
-import re
 import time
 from typing import Any, Iterable, Optional
 
@@ -274,11 +273,15 @@ def plan_pruning(
     tables: dict[str, int],
     counts: dict[str, dict],
     stale_sec: float = 24 * 3600,
+    now: Optional[float] = None,
 ) -> list[dict]:
     """The full decision list from a catalog snapshot + measured counts.
 
     `tables` maps every pair table → estimated bars (used only to report what
     was not measured); `counts` maps table → {"bars": int|None, "last_ts": …}.
+    `now` fixes the clock the ages are measured against (tests; production
+    leaves it None and gets `time.time()`, because an age that drifts while a
+    9 000-table sweep runs is a different age from the one that decided).
     Returns one record per CANDIDATE pair (a spot whose perp exists), each with
     a verdict; non-candidate tables are not listed — they are not up for
     discussion.
@@ -287,7 +290,14 @@ def plan_pruning(
     for spot, perp in sorted(spot_perp_pairs(tables).items()):
         s_c, p_c = counts.get(spot) or {}, counts.get(perp) or {}
         spot_bars, perp_bars = s_c.get("bars"), p_c.get("bars")
-        idle = normalize_last_ts(s_c.get("last_ts"))
+        idle = normalize_last_ts(s_c.get("last_ts"), now)
+        # Reported, not decided with: the freshness rule is about the SPOT table
+        # (is it still collected?), but the operator reading a 200-line report
+        # needs the perp's age next to it to tell "the switch retired this spot"
+        # (perp fresh, spot months old) from "this whole database stopped being
+        # collected" (both old) — the first is a leftover, the second is a
+        # collector problem that pruning will not fix.
+        perp_idle = normalize_last_ts(p_c.get("last_ts"), now)
         verdict, reason = zombie_verdict(spot_bars, perp_bars, idle, stale_sec)
         out.append({
             "db_table": spot,
@@ -298,6 +308,7 @@ def plan_pruning(
             "spot_est_bars": tables.get(spot),
             "perp_est_bars": tables.get(perp),
             "spot_idle_sec": None if idle is None else round(idle, 1),
+            "perp_idle_sec": None if perp_idle is None else round(perp_idle, 1),
             "verdict": verdict,
             "reason": reason,
         })

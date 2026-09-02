@@ -201,6 +201,22 @@ _SCAN_ATTEMPTS: dict = {}
 # must stay complete, or a busy collector shrinks the pair list from launch to
 # launch). Serving it is what keeps a rerun off the database entirely.
 _SUMMARY_STORE: dict = {}
+# Per-database progress of the sweeps: {"start": chunk index to begin with,
+# "rows": {table: (when, row)}}. A budget cuts a sweep at its TAIL, and the tail
+# is the same tail every time, so a 8271-table database with ~12 of 69 chunks
+# answered per sweep re-read those same 12 chunks forever: the pair list stayed
+# at "1318/8271 tables" through dozens of retries, and every retry cost the busy
+# database the queries it had already answered. Remembering where a sweep stopped
+# and what it read makes successive sweeps cover new ground instead.
+_SCAN_SWEEP_STATE: dict = {}
+# Timeframes whose last scan attempt never got `_SCAN_GATE`. Another tier holds
+# the gate for the whole of its own sweep, so a tier that is only unlucky about
+# timing used to wait out the FULL backoff for nothing — the log line
+# "1d: skipped — another scan holds the database" then repeated for hours and the
+# 1D pair list never refreshed. A skip costs the database nothing, so it is
+# retried soon instead (bounded number of tries, see `_SCAN_DEFER_TRIES`).
+_SCAN_DEFERRED_AT: dict = {}
+_SCAN_DEFER_TRIES: dict = {}
 # One scan per process. Before this, a scan of "15m" and a scan of "1d" each
 # fanned out over both of their databases, i.e. up to 8 concurrent pools ×
 # `dash_scan_pool_size` connections of UNION-ALL MAX() queries — against the
@@ -281,9 +297,43 @@ async def _table_inventory(pool, db_name: str, db_host: str = "", db_port: int =
     return tables
 
 
+def _merge_carried_rows(out: list, sweep: dict, live, *, now: float, ttl: float) -> int:
+    """Add the rows an earlier sweep of this database already answered.
+
+    `ttl <= 0` turns carrying off (the fresh rows are still remembered, so the
+    switch only affects what is served). Returns how many rows were carried.
+
+    Only tables that still exist are kept, and only rows younger than `ttl`: the
+    point of carrying them is a pair list that CONVERGES to the truth, not one
+    that looks complete while quietly ageing. Rows read this sweep replace the
+    carried ones for the same table, so a table is never listed twice or shown
+    by its older value.
+    """
+    seen = {d.get("table_name") for d in out}
+    stored = sweep.get("rows") or {}
+    live = set(live)
+    kept: dict = {}
+    added = 0
+    for tbl, entry in list(stored.items()):
+        at, row = entry
+        if (ttl <= 0 or tbl not in live or tbl in seen
+                or now - float(at) > float(ttl)):
+            continue
+        kept[tbl] = entry
+        out.append(row)
+        added += 1
+    for d in out:
+        tbl = d.get("table_name")
+        if tbl:
+            kept[tbl] = (now, d)
+    sweep["rows"] = kept
+    return added
+
+
 async def _scan_database(
     db_name: str, tier_label: str, db_host, db_port, db_user, db_pass,
     pool_size: int = None, chunk_size: int = None, budget_sec: float = None,
+    sweep: dict = None,
 ):
     """
     Last-row summary of every %_on_% table of one database.
@@ -302,6 +352,10 @@ async def _scan_database(
     information_schema TYPES as well, so `build_summary_union_sql` can flatten
     only the offending column, and a chunk that still fails retries once as an
     all-TEXT query before any per-table recovery is attempted.
+
+    `sweep` is this database's `_SCAN_SWEEP_STATE` entry: where the last partial
+    sweep stopped and the rows it answered. Passing None (the tests, and any
+    caller that wants a plain one-shot sweep) disables rotation and carry-over.
 
     Bounded by `budget_sec`: whatever chunks answered in time are returned and
     the page renders, instead of the user staring at a spinner. The result is
@@ -467,8 +521,25 @@ async def _scan_database(
             return recovered
 
         chunks = list(chunked(tables, chunk_size))
+
+        # Rotate, do not restart: see `_SCAN_SWEEP_STATE`. `start` is the chunk a
+        # previous sweep reached, so this one asks about the tables it has not
+        # seen since then instead of re-reading the same cheap prefix forever.
+        n_chunks = len(chunks)
+        start = int(sweep.get("start", 0)) % n_chunks if (sweep is not None and n_chunks) else 0
+        if start:
+            chunks = chunks[start:] + chunks[:start]
         for result in await asyncio.gather(*[run_chunk(c) for c in chunks]):
             out.extend(result)
+
+        answered_chunks = max(0, n_chunks - len(skipped))
+        # Carry the rows earlier sweeps of THIS database answered: a sweep cut
+        # short by the budget then ADDS to the pair list instead of replacing it
+        # with a different slice of it.
+        carried = _merge_carried_rows(
+            out, sweep, tables, now=time.time(),
+            ttl=float(settings.dash_scan_carryover_ttl_sec),
+        ) if sweep is not None else 0
 
         for d in out:
             d["db_name"] = db_name
@@ -482,6 +553,19 @@ async def _scan_database(
         partial = bool(skipped) or time.time() > deadline or (
             bool(errors) and len(out) < len(tables)
         )
+        if sweep is not None and n_chunks:
+            # Remember where to continue. A sweep that answered nothing keeps its
+            # position (those tables still have to be read); one that answered
+            # everything yet is still partial — an error in the tail — moves by a
+            # chunk, so the retry cannot sit still.
+            if partial:
+                nxt = (start + answered_chunks) % n_chunks
+                sweep["start"] = (start + 1) % n_chunks if nxt == start else nxt
+            else:
+                # A complete sweep needs no carry-over to keep the list whole, but
+                # its rows stay remembered: if the NEXT sweep is cut short, the
+                # list the user sees stays the complete one instead of shrinking.
+                sweep.pop("start", None)
         _SCAN_META[db_name] = {
             "tables": len(tables),
             "rows": len(out),
@@ -492,6 +576,9 @@ async def _scan_database(
             "sweep_seconds": sweep_secs,
             "catalog_seconds": catalog_secs,
             "partial": partial,
+            "carried_rows": carried,
+            "answered_chunks": answered_chunks,
+            "chunk_start": start,
         }
         tail = f" (+catalog {catalog_secs:.1f}s)" if catalog_secs > 1.0 else ""
         if errors:
@@ -514,10 +601,16 @@ async def _scan_database(
                 flush=True,
             )
         if partial:
+            resume = ""
+            if sweep is not None and n_chunks:
+                resume = (
+                    f"; next sweep continues at chunk {sweep.get('start', 0)}/{n_chunks}"
+                    + (f" ({carried} row(s) carried)" if carried else "")
+                )
             print(
                 f"[scan] {db_name}: {budget_sec:.0f}s budget exhausted — rendering "
                 f"{len(out)}/{len(tables)} tables ({len(skipped)} chunk(s) skipped on "
-                f"budget/busy db); the list will be retried with backoff",
+                f"budget/busy db); the list will be retried with backoff{resume}",
                 flush=True,
             )
         return out
@@ -536,9 +629,14 @@ async def _load_summary(db_host, db_port, db_user, db_pass, timeframe: str) -> p
     # an idle scan and multiplied it on a loaded one — every sweep was competing
     # with the others for the same Postgres the collector writes to.
     par = max(1, int(settings.dash_scan_max_parallel_dbs))
+
+    def _sweep_of(db):
+        return _SCAN_SWEEP_STATE.setdefault(db, {})
+
     if par == 1 or len(dbs) == 1:
         scans = [
-            await _scan_database(db, tier, db_host, db_port, db_user, db_pass)
+            await _scan_database(db, tier, db_host, db_port, db_user, db_pass,
+                                 sweep=_sweep_of(db))
             for tier, db in dbs
         ]
     else:
@@ -546,7 +644,8 @@ async def _load_summary(db_host, db_port, db_user, db_pass, timeframe: str) -> p
 
         async def _one(tier, db):
             async with gate:
-                return await _scan_database(db, tier, db_host, db_port, db_user, db_pass)
+                return await _scan_database(db, tier, db_host, db_port, db_user, db_pass,
+                                            sweep=_sweep_of(db))
 
         scans = await asyncio.gather(*[_one(tier, db) for tier, db in dbs])
     all_rows = [r for scan in scans for r in scan]
@@ -556,6 +655,7 @@ async def _load_summary(db_host, db_port, db_user, db_pass, timeframe: str) -> p
         "seconds": max((m.get("seconds") or 0.0) for m in metas) if metas else 0.0,
         "rows": sum(m.get("rows", 0) for m in metas),
         "tables": sum(m.get("tables", 0) for m in metas),
+        "carried_rows": sum(m.get("carried_rows", 0) for m in metas),
     }
     if not all_rows:
         return pd.DataFrame()
@@ -564,12 +664,23 @@ async def _load_summary(db_host, db_port, db_user, db_pass, timeframe: str) -> p
     return coerce_summary_types(pd.DataFrame(all_rows))
 
 
+_SCAN_DEFER_TRIES_MAX = 3
+
+
 def _rescan_delay_sec(timeframe: str) -> float:
     """Backoff for this timeframe right now, from its truncated-scan streak."""
-    return scan_retry_delay_sec(
+    delay = scan_retry_delay_sec(
         settings.dash_snapshot_refresh_sec, _SCAN_ATTEMPTS.get(timeframe, 0),
         settings.dash_scan_retry_max_sec,
     )
+    deferred = _SCAN_DEFERRED_AT.get(timeframe)
+    if deferred and _SCAN_DEFER_TRIES.get(timeframe, 0) < _SCAN_DEFER_TRIES_MAX:
+        # The last attempt was pushed aside by another tier's scan, not by the
+        # database. Retrying it soon is free for Postgres (a skip runs no query)
+        # and is the difference between "the 1D list refreshes" and a line in the
+        # log about it being skipped, forever.
+        delay = min(delay, float(settings.dash_scan_defer_retry_sec))
+    return delay
 
 
 def _rescan_due(timeframe: str, now: float) -> bool:
@@ -597,8 +708,16 @@ def _scan_summary_now(db_host, db_port, db_user, db_pass, timeframe: str,
     waited_before = (_SUMMARY_STORE.get(timeframe) or {}).get("at", 0.0)
     if not _SCAN_GATE.acquire(timeout=max(0.0, float(gate_sec))):
         ent = _SUMMARY_STORE.get(timeframe)
-        print(f"[scan] {timeframe}: skipped — another scan holds the database", flush=True)
+        _SCAN_DEFERRED_AT[timeframe] = time.time()
+        _SCAN_DEFER_TRIES[timeframe] = _SCAN_DEFER_TRIES.get(timeframe, 0) + 1
+        print(
+            f"[scan] {timeframe}: skipped — another scan holds the database, "
+            f"retrying in {settings.dash_scan_defer_retry_sec:.0f}s",
+            flush=True,
+        )
         return ent["df"] if ent else pd.DataFrame()
+    _SCAN_DEFERRED_AT.pop(timeframe, None)
+    _SCAN_DEFER_TRIES.pop(timeframe, None)
     if gate_sec and (_SUMMARY_STORE.get(timeframe) or {}).get("at", 0.0) > waited_before:
         # Somebody finished a scan while we were queueing for the gate: that IS
         # the answer, and scanning again would only add the load we waited for.
@@ -2446,6 +2565,7 @@ if st.sidebar.button("🔄 Refresh data (clear caches)"):
     # clear them by hand: without this, "show me the NEW pair" would keep
     # answering from a 10-minute-old pg_catalog snapshot.
     _SCAN_INVENTORY.clear()
+    _SCAN_SWEEP_STATE.clear()
     _STITCHED_PAGES.clear()
     _LAST_SCAN_AT.clear()
     _SUMMARY_STORE.clear()
@@ -2507,10 +2627,18 @@ else:
                 _when = f"first retry within {int(_delay)} s"
             else:
                 _when = f"retry in ~{max(0, int(_delay - _since))} s (backoff)"
+            _fresh = _pm.get("rows", 0) - _pm.get("carried_rows", 0)
+            _carried = (
+                f", {_pm['carried_rows']} of them carried from the previous sweeps "
+                f"of this database (for up to {settings.dash_scan_carryover_ttl_sec:.0f}s)"
+                if _pm.get("carried_rows") else ""
+            )
             st.warning(
                 f"⏳ {_tf} pair list is incomplete this frame: {_pm.get('rows', 0)}/"
-                f"{_pm.get('tables', 0)} tables fit in the {settings.dash_scan_budget_sec:.0f}s "
-                f"scan budget — {_when}. The charts are unaffected (they query the "
+                f"{_pm.get('tables', 0)} tables have an answer — the budget read "
+                f"{_fresh} of them this sweep{_carried} "
+                f"({settings.dash_scan_budget_sec:.0f}s scan budget) — {_when}. "
+                f"The charts are unaffected (they query the "
                 f"tables directly). Raise DASH_SCAN_BUDGET_SEC if your collector "
                 f"keeps the DB busy."
             )

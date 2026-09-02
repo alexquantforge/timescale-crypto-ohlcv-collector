@@ -154,18 +154,46 @@ def test_plan_reports_every_pair_with_its_reason():
         "b_usdt_on_bybit": {"bars": 90, "last_ts": NOW - 40 * 3600},
         "b_usdt:usdt_on_bybit": {"bars": 40, "last_ts": NOW},
     }
-    plan = plan_pruning(tables, counts, stale_sec=24 * 3600)
+    plan = plan_pruning(tables, counts, stale_sec=24 * 3600, now=NOW)
     assert len(plan) == 2                                  # c has no perp → not discussed
     by_table = {r["spot"]: r for r in plan}
     assert by_table["a_usdt_on_bybit"]["verdict"] == "prune"
     assert by_table["b_usdt_on_bybit"]["verdict"] == "keep"
     assert by_table["a_usdt_on_bybit"]["perp"] == "a_usdt:usdt_on_bybit"
     assert summarize(plan) == {"prune": 1, "keep": 1, "unknown": 0, "candidates": 2}
+    # both ages are reported: a 40 h-old spot against a just-written perp is the
+    # perp-first leftover, and the report has to say so without being asked
+    assert by_table["a_usdt_on_bybit"]["spot_idle_sec"] == 40 * 3600
+    assert by_table["a_usdt_on_bybit"]["perp_idle_sec"] == 0
 
     # a count that failed on one table makes that pair unknown, not prune
     counts["a_usdt_on_bybit"] = {"bars": None, "last_ts": None, "error": "TimeoutError: "}
     plan2 = plan_pruning(tables, counts, stale_sec=24 * 3600)
     assert {r["spot"]: r["verdict"] for r in plan2}["a_usdt_on_bybit"] == "unknown"
+
+
+def test_the_perps_age_is_shown_but_never_decides():
+    """`stale_hours` is about the SPOT table; the perp's freshness is context."""
+    spot = {"x_usdt_on_bybit": 10, "x_usdt:usdt_on_bybit": 500}
+    fresh_perp = plan_pruning(spot, {
+        "x_usdt_on_bybit": {"bars": 10, "last_ts": NOW - 40 * 3600},
+        "x_usdt:usdt_on_bybit": {"bars": 500, "last_ts": NOW},
+    }, stale_sec=24 * 3600, now=NOW)
+    stale_perp = plan_pruning(spot, {
+        "x_usdt_on_bybit": {"bars": 10, "last_ts": NOW - 40 * 3600},
+        "x_usdt:usdt_on_bybit": {"bars": 500, "last_ts": NOW - 500 * 3600},
+    }, stale_sec=24 * 3600, now=NOW)
+    assert [r["verdict"] for r in fresh_perp] == [r["verdict"] for r in stale_perp] == ["prune"]
+    assert fresh_perp[0]["perp_idle_sec"] == 0
+    assert stale_perp[0]["perp_idle_sec"] == 500 * 3600
+
+    # a perp we cannot date (no Timestamp column, failed read) costs the report
+    # a column, not the decision: the spot side is what has to be fresh
+    undated = plan_pruning(spot, {
+        "x_usdt_on_bybit": {"bars": 10, "last_ts": NOW - 40 * 3600},
+        "x_usdt:usdt_on_bybit": {"bars": 500, "last_ts": None},
+    }, stale_sec=24 * 3600, now=NOW)
+    assert undated[0]["verdict"] == "prune" and undated[0]["perp_idle_sec"] is None
 
 
 def test_statements_move_rather_than_drop_unless_told_otherwise():
@@ -243,8 +271,6 @@ class _FakeConn:
         return "OK"
 
     def transaction(self):
-        conn = self
-
         class _T:
             async def __aenter__(self):
                 return None

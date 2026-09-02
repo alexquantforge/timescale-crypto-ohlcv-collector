@@ -525,7 +525,6 @@ def prune_zombie_spots(
         over_prune_guard,
         plan_pruning,
         read_pair_tables,
-        statements_for,
         summarize,
     )
 
@@ -599,15 +598,19 @@ def prune_zombie_spots(
                 f"{summ['unknown']} unknown"
             )
             if plan:
-                out = Table("spot table", "spot bars", "perp bars", "idle", "verdict", "why",
+                out = Table("spot table", "spot bars", "perp bars", "spot idle",
+                            "perp idle", "verdict", "why",
                             title=f"{label}: decisions (first 20 of {len(plan)})")
                 for row in plan[:20]:
                     idle = "—" if row["spot_idle_sec"] is None else f"{row['spot_idle_sec'] / 3600:.1f}h"
+                    p_idle = ("—" if row.get("perp_idle_sec") is None
+                              else f"{row['perp_idle_sec'] / 3600:.1f}h")
                     out.add_row(
                         row["spot"],
                         "?" if row["spot_bars"] is None else f"{row['spot_bars']}",
                         "?" if row["perp_bars"] is None else f"{row['perp_bars']}",
                         idle,
+                        p_idle,
                         row["verdict"],
                         row["reason"][:70],
                     )

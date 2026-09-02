@@ -300,6 +300,16 @@ class Settings(BaseSettings):
     # database is retried a few times and then left alone, instead of every
     # retry making the next scan truncate as well.
     dash_scan_retry_max_sec: float = Field(default=1800.0, alias="DASH_SCAN_RETRY_MAX_SEC")
+    # How long the rows an EARLIER sweep answered stay usable. A 25 s budget
+    # covers ~12 of an 8271-table database's 69 chunks, so the full list takes a
+    # few sweeps; carrying their rows is what makes the pair list grow towards
+    # complete instead of showing a different slice each time. Rows older than
+    # this are re-read rather than shown stale — 0 disables carry-over.
+    dash_scan_carryover_ttl_sec: float = Field(default=900.0, alias="DASH_SCAN_CARRYOVER_TTL_SEC")
+    # Retry delay when a scan could not start because ANOTHER timeframe holds the
+    # scan gate. A skip queries nothing, so waiting it out on the full backoff
+    # only left one tier unscanned for hours; 3 quick tries, then normal backoff.
+    dash_scan_defer_retry_sec: float = Field(default=8.0, alias="DASH_SCAN_DEFER_RETRY_SEC")
 
     priority_lane_enabled: bool = Field(default=True, alias="PRIORITY_LANE_ENABLED")
     priority_lane_interval_sec: float = Field(default=1.0, alias="PRIORITY_LANE_INTERVAL_SEC")

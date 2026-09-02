@@ -999,7 +999,8 @@ def _summary_stores(monkeypatch, dapp):
     import types as _types
 
     for name in ("_SUMMARY_STORE", "_SCAN_ATTEMPTS", "_LAST_SCAN_AT", "_SCAN_META",
-                 "_SCAN_INVENTORY"):
+                 "_SCAN_INVENTORY", "_SCAN_SWEEP_STATE", "_SCAN_DEFERRED_AT",
+                 "_SCAN_DEFER_TRIES"):
         monkeypatch.setattr(dapp, name, {}, raising=False)
     monkeypatch.setattr(dapp, "st", _types.SimpleNamespace(
         session_state={}, error=lambda *a, **k: None))
@@ -1549,3 +1550,152 @@ def test_the_build_counter_tells_a_cache_hit_from_a_query(monkeypatch):
     )
     assert out is None                      # no candles → the caller's empty-state path
     assert dapp._CHART_BUILDS == before + 1
+
+
+# ---------------------------------------------------------------------------
+# a budget-limited sweep has to make progress, not repeat itself
+# ---------------------------------------------------------------------------
+class _BusyPool:
+    """Answers only the chunks whose tables are in `allow`.
+
+    The rest hit the wall the way the rest of a sweep does when the budget runs
+    out on a loaded database: a timeout, i.e. skipped, not retried.
+    """
+
+    def __init__(self, schema, allow):
+        self.schema = schema
+        self.allow = set(allow)
+        self.union_tables: list = []
+
+    def acquire(self, *a, **kw):
+        outer = self
+
+        class _Conn:
+            async def fetch(self, query, *args):
+                if "pg_catalog" in query:
+                    return [
+                        {"table_name": t, "column_name": c, "data_type": dt}
+                        for t, cols in outer.schema.items() for c, dt in cols.items()
+                    ]
+                hit = [t for t in outer.schema if f"'{t}'::text" in query]
+                outer.union_tables.append(tuple(hit))
+                if not hit or not set(hit) <= outer.allow:
+                    import asyncio as _a
+                    raise _a.TimeoutError()
+                return [{"table_name": t, "max_ts": 1_787_700_000,
+                         "Timestamp": 1_787_700_000} for t in hit]
+
+        class _Acq:
+            async def __aenter__(self):
+                return _Conn()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Acq()
+
+    async def close(self):
+        pass
+
+
+def test_a_partial_sweep_resumes_and_carries_what_it_already_read(monkeypatch):
+    import asyncio
+
+    from dashboard import app as dapp
+
+    names = [f"t{i}_usdt_on_bybit" for i in range(6)]
+    schema = {n: {"Timestamp": "timestamptz"} for n in names}
+    state: dict = {}
+    monkeypatch.setattr(dapp, "_SCAN_INVENTORY", {}, raising=False)
+    monkeypatch.setattr(dapp.settings, "dash_scan_carryover_ttl_sec", 3600.0)
+
+    def sweep(allow):
+        """One budget-limited sweep: only `allow`'s tables get answered."""
+        pool = _BusyPool(schema, allow)
+
+        async def fake_create_pool(**kw):
+            return pool
+
+        monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool)
+        rows = asyncio.run(dapp._scan_database(
+            "db_rot", "HIGH", "h", 1, "u", "p",
+            pool_size=1, chunk_size=2, budget_sec=10.0, sweep=state,
+        ))
+        return {r["table_name"] for r in rows}, rows, pool
+
+    # 6 tables, 3 chunks, one chunk answerable per sweep
+    seen, rows, pool = sweep(names[0:2])
+    assert seen == set(names[0:2]) and state["start"] == 1
+    assert pool.union_tables[0] == tuple(names[0:2])
+
+    seen, rows, pool = sweep(names[2:4])
+    # resumed at chunk 1 instead of restarting, and the first chunk's rows are
+    # still in the list — the pair list only ever grows
+    assert pool.union_tables[0] == tuple(names[2:4]), "the sweep must continue, not restart"
+    assert seen == set(names[0:4]), seen
+    assert state["start"] == 2
+
+    seen, rows, pool = sweep(names[4:6])
+    assert seen == set(names) and state["start"] == 0
+    # carried rows are complete rows: they know their database and tier, so the
+    # table they are painted into needs no special case
+    assert all(r["db_name"] == "db_rot" and r["volume_tier"] == "HIGH" for r in rows)
+
+    meta = dapp._SCAN_META["db_rot"]
+    assert meta["answered_chunks"] == 1 and meta["carried_rows"] == 4
+
+
+def test_carried_rows_expire_and_follow_the_inventory():
+    from dashboard.app import _merge_carried_rows
+
+    now = 1000.0
+    sweep = {"rows": {"a": (990.0, {"table_name": "a"}),      # read this sweep
+                      "g": (960.0, {"table_name": "g"}),      # 40 s old, within ttl
+                      "b": (50.0, {"table_name": "b"}),       # older than the ttl
+                      "c": (999.0, {"table_name": "c"})}}     # dropped from the db
+    out = [{"table_name": "a"}, {"table_name": "d"}]
+    added = _merge_carried_rows(out, sweep, ["a", "b", "d", "g"], now=now, ttl=60.0)
+    # 'a' is not duplicated, 'b' is too old to show, 'c' no longer exists
+    assert [r["table_name"] for r in out] == ["a", "d", "g"]
+    assert added == 1
+    assert set(sweep["rows"]) == {"a", "d", "g"}
+    assert all(at == now for at, _ in sweep["rows"].values())
+
+    # ttl=0 means "carry nothing": the knob in .env.example
+    out2 = [{"table_name": "e"}]
+    assert _merge_carried_rows(out2, {"rows": {"f": (now, {"table_name": "f"})}},
+                              ["e", "f"], now=now, ttl=0.0) == 0
+    assert [r["table_name"] for r in out2] == ["e"]
+
+
+def test_a_scan_pushed_aside_by_another_tier_retries_soon_then_gives_up(monkeypatch):
+    import threading
+
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_refresh_sec", 120.0)
+    monkeypatch.setattr(dapp.settings, "dash_scan_defer_retry_sec", 8.0)
+    held = threading.BoundedSemaphore(1)
+    held.acquire()                      # another timeframe's sweep, for the whole thing
+    monkeypatch.setattr(dapp, "_SCAN_GATE", held)
+
+    assert dapp._scan_summary_now("h", 1, "u", "p", "1d").empty
+    assert dapp._SCAN_DEFER_TRIES["1d"] == 1 and dapp._SCAN_DEFERRED_AT["1d"]
+    # the truncated-scan backoff would say 240 s; a skipped scan queries nothing
+    assert dapp._rescan_delay_sec("1d") == 8.0
+
+    dapp._SCAN_ATTEMPTS["1d"] = 2        # a real streak of truncated scans: 480 s
+    assert dapp._rescan_delay_sec("1d") == 8.0
+
+    for _ in range(3):
+        dapp._scan_summary_now("h", 1, "u", "p", "1d")
+    assert dapp._SCAN_DEFER_TRIES["1d"] == 4
+    # after a bounded number of quick tries, patience resumes: the other tier is
+    # not momentarily busy, it IS busy, and retrying is how that becomes load
+    assert dapp._rescan_delay_sec("1d") == 480.0
+
+    # once a scan gets through, both markers are gone
+    held.release()
+    dapp._scan_summary_now("h", 1, "u", "p", "1d")
+    assert "1d" not in dapp._SCAN_DEFERRED_AT and "1d" not in dapp._SCAN_DEFER_TRIES
