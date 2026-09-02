@@ -974,8 +974,8 @@ def _feed_refresh(kind: str, ccxt_id: str, symbol: str) -> None:
     }[kind]
     try:
         value = fn(ccxt_id, symbol)
-    except Exception:
-        value = None
+    except BaseException:      # CancelledError included: a dead exchange must
+        value = None           # cost a None, not the whole warm thread
     _FEEDS[(kind, ccxt_id, symbol)] = {"value": value, "at": time.time()}
 
 
@@ -1825,8 +1825,15 @@ def _bg(key, fn, *args, **kwargs) -> None:
     def _run():
         try:
             fn(*args, **kwargs)
-        except Exception:
-            pass
+        except BaseException as e:
+            # BaseException, not Exception: `asyncio.run` re-raises the
+            # CancelledError of its inner task, and ccxt's `load_markets` lets
+            # one escape — so a neighbour whose exchange call was cut off by a
+            # hard timeout used to print a traceback and die mid-way, taking the
+            # chart-page priming with it. The click still rendered; the warming
+            # that was supposed to make the NEXT click instant silently did not
+            # happen, which is what "не быстрее" looked like from the outside.
+            print(f"[bg] {key}: {type(e).__name__}: {e}", flush=True)
         finally:
             with _BG_LOCK:
                 _BG_RUNNING.discard(key)
@@ -1839,9 +1846,74 @@ def _warm_live_snapshot(ticker: str, exchange_name: str, ccxt_id: str, atr_val: 
     key = (ticker, exchange_name, round(float(atr_val or 0.0), 10))
     try:
         snap = fetch_live_cached(ticker, exchange_name, ccxt_id, float(atr_val or 0.0))
-    except Exception:
+    except BaseException:      # CancelledError included — see _bg
         snap = None
     _LIVE_SNAP[key] = (snap, time.time())
+
+
+_WARMED_AT: dict = {}
+
+
+def _warm_pair_due(ticker: str, exchange_name: str, now: float) -> bool:
+    """Whether this pair deserves a background warm right now.
+
+    Warming used to be re-armed by EVERY rerun of the script (pair click, 60 s
+    auto-reload, fragment tick): the `_bg` key only dedupes while a warm is
+    running, so a warm that finished in 2 s started again a second later, and
+    ten neighbours × {2 candle queries, up to 20 exchange range fetches, 3 feed
+    calls, 2 chart builds} became the dominant load on the machine — the app got
+    slower to click, exactly because of the code meant to make clicking instant.
+    One warm per pair per page lifetime (CHART_PAGE_TTL_SEC) is all the
+    freshness a pre-built page needs: after that the entry is expired anyway.
+    """
+    key = (ticker, exchange_name)
+    if now - float(_WARMED_AT.get(key, 0.0)) < CHART_PAGE_TTL_SEC:
+        return False
+    _WARMED_AT[key] = now
+    return True
+
+
+def _warm_yield_to_clicks(ticker: str = "", exchange_name: str = "") -> bool:
+    """Delay a warm so the click that scheduled it wins, and abort it when the
+    user has clicked again meanwhile (the next run warms what matters now).
+    Returns False when the caller should stop — and un-marks the pair in that
+    case, because nothing was actually prepared for it."""
+    seen = _LAST_INTERACTION_AT
+    left = float(settings.dash_warm_delay_sec)
+    while left > 0.0:
+        step = min(0.25, left)
+        time.sleep(step)
+        left -= step
+        if _LAST_INTERACTION_AT > seen:
+            if ticker:
+                _WARMED_AT.pop((ticker, exchange_name), None)
+            return False
+    return True
+
+
+def _pair_is_frozen(row_15m, row_1d, now: float = None) -> bool:
+    """True when the collector stopped writing this pair long ago.
+
+    These are the leftovers of the spot→perp migration: pairs whose dead spot
+    table still holds hundreds of missing candles. Fetching that history in the
+    background is pure waste — nobody is about to look at it, and the exchange
+    round trips stall the live pool the charts need. The pair still opens
+    normally (its DB data, its own on-click stitch), it is just not speculatively
+    prepared.
+    """
+    now = time.time() if now is None else float(now)
+    ts = 0
+    for row in (row_15m, row_1d):
+        if row:
+            try:
+                ts = max(ts, int(row.get("max_ts") or 0))
+            except (TypeError, ValueError):
+                pass
+    if ts <= 0:
+        return True
+    if ts > 1e11:
+        ts //= 1000            # milliseconds table
+    return now - ts > float(settings.dash_warm_stale_skip_sec)
 
 
 def _warm_pair_caches(
@@ -1860,8 +1932,14 @@ def _warm_pair_caches(
     the very first flip to a neighbour skips the DB round-trip, the exchange
     stitch AND the JSON/HTML build: the render path becomes a memory lookup.
     """
+    if not _warm_yield_to_clicks(ticker, exchange_name):
+        return
+
+    # A frozen pair gets its chart page primed from the DB (cheap, and it is the
+    # one thing that makes opening it instant) but no exchange traffic at all.
+    frozen = _pair_is_frozen(row_15m, row_1d)
     for tf, row, lim in (("15m", row_15m, lim15), ("1d", row_1d, lim1d)):
-        if not row:
+        if not row or frozen:
             continue
         frame = load_candles_cached(
             db_host, db_port, db_user, db_pass, row["db_name"], row["table_name"], lim
@@ -1874,12 +1952,15 @@ def _warm_pair_caches(
         now_bucket = int(time.time()) // step
         if buckets and buckets[-1] < now_bucket and now_bucket - buckets[-1] <= 2000:
             ranges.append((buckets[-1] + 1, now_bucket))  # closed tail
-        for r0, r1 in ranges[:10]:
+        # 3 ranges, not 10: this is a head start on the stitch, not the stitch.
+        # Whatever is left is fetched when the pair is actually opened.
+        for r0, r1 in ranges[:3]:
             _fetch_missing_candles_cached(ccxt_id, ticker, tf, r0, r1)
-    _fetch_ticker_cached(ccxt_id, ticker)
-    _fetch_orderbook_top(ccxt_id, ticker)
-    _fetch_trade_tape(ccxt_id, ticker)
-    if full_live and row_1d is not None:
+    if not frozen:
+        _fetch_ticker_cached(ccxt_id, ticker)
+        _fetch_orderbook_top(ccxt_id, ticker)
+        _fetch_trade_tape(ccxt_id, ticker)
+    if full_live and row_1d is not None and not frozen:
         atr_nb = 0.0
         try:
             fr = load_candles_cached(
@@ -1899,13 +1980,18 @@ def _warm_pair_caches(
             pass
         _warm_live_snapshot(ticker, exchange_name, ccxt_id, atr_nb)
 
+    # skip_stitch for a frozen pair: building the PATCHED page means running the
+    # gap stitch from the warm thread, i.e. the hundreds of exchange pages the
+    # stale table is missing — the very thing being skipped above.
     _warm_chart_pages(
-        chart_ctx, ticker, exchange_name, ccxt_id, row_15m, row_1d, lim15, lim1d
+        chart_ctx, ticker, exchange_name, ccxt_id, row_15m, row_1d, lim15, lim1d,
+        skip_stitch=frozen,
     )
+    _WARMED_AT[(ticker, exchange_name)] = time.time()
 
 
 def _warm_chart_pages(chart_ctx, ticker, exchange_name, ccxt_id,
-                      row_15m, row_1d, lim15, lim1d) -> list:
+                      row_15m, row_1d, lim15, lim1d, skip_stitch: bool = False) -> list:
     """Pre-builds both neighbour chart pages, with keys identical to the render path.
 
     The keys MUST match exactly (same primitives, same order), or the flip
@@ -1949,7 +2035,7 @@ def _warm_chart_pages(chart_ctx, ticker, exchange_name, ccxt_id,
             chart_ctx["volume"], poller, hist,
             chart_ctx.get("flat_fill", True),
         )
-        if chart_ctx["stitch"]:
+        if chart_ctx["stitch"] and not skip_stitch:
             # The neighbour flip must find the PATCHED page ready in the store
             # (built here, off the render path). It must ALSO find the plain
             # page in st.cache_data: a flip that happens before the stitch
@@ -3066,6 +3152,8 @@ with tab_charts:
                     continue
                 if abs(delta) > settings.dash_warm_neighbors:
                     continue  # low-resource mode: fewer background warm bursts
+                if not _warm_pair_due(nb_ticker, sym_ex, time.time()):
+                    continue     # warmed within this page's lifetime already
                 _bg(
                     ("pair", nb_ticker, sym_ex),
                     lambda t=nb_ticker, r15=nb_15, r1=nb_1d, fl=abs(delta) <= 2, ctx=_chart_ctx:

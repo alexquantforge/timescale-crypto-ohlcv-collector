@@ -1386,3 +1386,114 @@ def test_candles_use_the_live_pool_and_fall_back_on_error(monkeypatch, capsys):
     # and an infra that is not up at all (demo mode, startup race) is quiet
     monkeypatch.setattr(dapp, "_live_infra_or_none", lambda: None)
     assert dapp.load_candles_cached.__wrapped__("h", 1, "u", "p", "db1", "t1", 1) is sentinel
+
+
+# ---------------------------------------------------------------------------
+# Warming: a head start for the next click, never a competitor with this one.
+#
+# The prefetch was the load: it was re-armed by every rerun, and it fetched
+# hundreds of missing candles for the dead spot tables left by the spot→perp
+# migration. See _warm_pair_due / _pair_is_frozen.
+# ---------------------------------------------------------------------------
+
+
+def test_a_pair_is_warmed_once_per_page_lifetime(monkeypatch):
+    import time as _time
+
+    from dashboard import app as dapp
+
+    monkeypatch.setattr(dapp, "_WARMED_AT", {}, raising=False)
+    monkeypatch.setattr(dapp, "CHART_PAGE_TTL_SEC", 0.15)
+
+    assert dapp._warm_pair_due("BTC/USDT", "bybit", _time.time()) is True
+    assert dapp._warm_pair_due("BTC/USDT", "bybit", _time.time()) is False   # just done
+    assert dapp._warm_pair_due("ETH/USDT", "bybit", _time.time()) is True      # another pair
+    _time.sleep(0.2)
+    assert dapp._warm_pair_due("BTC/USDT", "bybit", _time.time()) is True      # expired
+
+
+def test_frozen_spot_leftovers_are_not_fetched_from_the_exchange(monkeypatch):
+    """Pairs the collector stopped writing get their page primed from the DB and
+    no exchange traffic: their missing history is pages of candles nobody is
+    about to look at, and every fetch steals a connection from a live click."""
+    import time as _time
+
+    from dashboard import app as dapp
+
+    now = int(_time.time())      # real clock: _pair_is_frozen compares against it
+    assert dapp._pair_is_frozen({"max_ts": now - 60}, None, now) is False
+    assert dapp._pair_is_frozen({"max_ts": now - 3 * 86400}, None, now) is True
+    assert dapp._pair_is_frozen(None, {"max_ts": (now - 60) * 1000}, now) is False   # ms table
+    assert dapp._pair_is_frozen(None, None, now) is True
+    assert dapp._pair_is_frozen({"max_ts": None}, {"max_ts": "junk"}, now) is True
+
+    calls = []
+    monkeypatch.setattr(dapp.settings, "dash_warm_delay_sec", 0.0)
+    monkeypatch.setattr(dapp, "_warm_yield_to_clicks", lambda *a, **k: True)
+    monkeypatch.setattr(dapp, "load_candles_cached", lambda *a, **k: __import__("pandas").DataFrame())
+    monkeypatch.setattr(dapp, "_fetch_missing_candles_cached", lambda *a, **k: calls.append(("range", a)))
+    for fn in ("_fetch_ticker_cached", "_fetch_orderbook_top", "_fetch_trade_tape"):
+        monkeypatch.setattr(dapp, fn, lambda *a, _n=fn: calls.append((_n, a)))
+    monkeypatch.setattr(dapp, "_warm_live_snapshot", lambda *a, **k: calls.append(("live", a)))
+    stitched_pages = []
+    monkeypatch.setattr(dapp, "_warm_stitched_page",
+                        lambda *a, **k: stitched_pages.append(a))
+    monkeypatch.setattr(
+        dapp, "_warm_chart_pages",
+        lambda *a, **k: calls.append(("pages", k.get("skip_stitch"))),
+    )
+    for k, v in {"db_host": "h", "db_port": 1, "db_user": "u", "db_pass": "p"}.items():
+        monkeypatch.setattr(dapp, k, v)
+
+    frozen = {"db_name": "db1", "table_name": "old_spot_usdt_on_gateio", "max_ts": now - 9 * 86400}
+    dapp._warm_pair_caches("OLD/USDT", "gateio", "gateio", frozen, None, 700, 700, 14, True)
+    assert calls == [("pages", True)]               # primed, with the stitch skipped
+    assert stitched_pages == []                     # no exchange page-walk from the warm
+
+    # the same pair while it is still being written: ranges are pre-fetched, but
+    # only a few per timeframe — a head start on the stitch, not the stitch
+    calls.clear()
+    import pandas as pd
+
+    step = 900
+    holes = pd.DataFrame({"ts": [now - 40 * step, now - 30 * step, now - 20 * step,
+                                 now - 10 * step]})
+    monkeypatch.setattr(dapp, "load_candles_cached", lambda *a, **k: holes)
+    live = {"db_name": "db1", "table_name": "btc_usdt_on_bybit", "max_ts": now - 60}
+    dapp._warm_pair_caches("BTC/USDT", "bybit", "bybit", live, None, 700, 700, 14, False)
+    kinds = [c[0] for c in calls]
+    assert kinds.count("range") <= 3, "the warm must not become the whole stitch"
+    assert "live" not in kinds                    # full_live=False for far neighbours
+    assert ("pages", False) in calls              # and here the stitch IS prepared
+
+
+def test_warm_thread_reports_a_cancelled_exchange_call_and_survives(monkeypatch, capsys):
+    """`asyncio.run` re-raises the inner CancelledError, which is a
+    BaseException — so an ordinary `except Exception` let it kill the thread and
+    print a traceback instead of warming the page it was asked to warm."""
+    import asyncio
+    import time as _time
+
+    from dashboard import app as dapp
+
+    monkeypatch.setattr(dapp, "_BG_RUNNING", set(), raising=False)
+    done = []
+
+    def cancelled():
+        raise asyncio.CancelledError()
+
+    dapp._bg(("t", 1), cancelled)
+    for _ in range(100):
+        if ("t", 1) not in dapp._BG_RUNNING:
+            break
+        _time.sleep(0.01)
+    out = capsys.readouterr().out
+    assert "[bg]" in out and "CancelledError" in out
+    assert ("t", 1) not in dapp._BG_RUNNING          # the key was released, not leaked
+
+    dapp._bg(("t", 2), lambda: done.append(1))
+    for _ in range(100):
+        if done:
+            break
+        _time.sleep(0.01)
+    assert done == [1]                                # and _bg still works after

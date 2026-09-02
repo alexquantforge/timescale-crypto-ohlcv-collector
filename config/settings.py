@@ -160,7 +160,18 @@ class Settings(BaseSettings):
     # pre-warmed (candle loads + chart prebuilds) in background threads.
     # On low-RAM machines (16 GB, local Postgres) these bursts stutter the
     # whole desktop — set DASH_WARM_NEIGHBORS=0..2 to tame them. 5 = legacy.
-    dash_warm_neighbors: int = Field(default=5, alias="DASH_WARM_NEIGHBORS")
+    # How many pairs on each side get their charts prefetched. 2 (was 5): the
+    # neighbours beyond that were never clicked often enough to pay for 9 × the
+    # database and exchange traffic they generated.
+    dash_warm_neighbors: int = Field(default=2, alias="DASH_WARM_NEIGHBORS")
+    # Delay before a prefetch starts, so the click that scheduled it is served
+    # first. The app felt SLOWER while warming was unthrottled: the prefetch was
+    # competing with the render for the same connections.
+    dash_warm_delay_sec: float = Field(default=1.5, alias="DASH_WARM_DELAY_SEC")
+    # Pairs whose collector stopped writing this long ago (the dead spot tables
+    # left by a spot→perp migration) are pre-built from the database only — no
+    # exchange round trips for hundreds of missing candles nobody will watch.
+    dash_warm_stale_skip_sec: float = Field(default=172800.0, alias="DASH_WARM_STALE_SKIP_SEC")
     update_interval_seconds_1d: int = Field(default=3600, alias="UPDATE_INTERVAL_SECONDS_1D")
     update_interval_seconds_15m: int = Field(default=300, alias="UPDATE_INTERVAL_SECONDS_15M")  # 5 minutes for 15m
 
