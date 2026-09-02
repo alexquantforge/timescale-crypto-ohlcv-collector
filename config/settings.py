@@ -321,6 +321,15 @@ class Settings(BaseSettings):
     # scan gate. A skip queries nothing, so waiting it out on the full backoff
     # only left one tier unscanned for hours; 3 quick tries, then normal backoff.
     dash_scan_defer_retry_sec: float = Field(default=8.0, alias="DASH_SCAN_DEFER_RETRY_SEC")
+    # Floor on rescanning a tier whose LAST scan came back complete. One scan
+    # gate serves both tiers, so a tier that keeps succeeding (1D: 8235 tables
+    # in ~20 s) can hold it often enough that the other one never finishes a
+    # sweep — the pair list the user then sees is whatever the truncated passes
+    # happened to add up to. A complete answer is good for minutes: pair tables
+    # appear when a listing is added, not every 30 s, and the candles the user
+    # watches reload on their own path regardless. 0 = rescan on every refresh.
+    dash_scan_rescan_complete_sec: float = Field(
+        default=300.0, alias="DASH_SCAN_RESCAN_COMPLETE_SEC")
 
     priority_lane_enabled: bool = Field(default=True, alias="PRIORITY_LANE_ENABLED")
     priority_lane_interval_sec: float = Field(default=1.0, alias="PRIORITY_LANE_INTERVAL_SEC")

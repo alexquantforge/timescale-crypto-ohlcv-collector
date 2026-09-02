@@ -1328,6 +1328,40 @@ def build_live_poller_js(
 # In-memory gap stitching (dashboard-side, DB untouched)
 # ---------------------------------------------------------------------------
 
+def merge_summary_frames(new_rows, old_rows, key=("db_name", "table_name")):
+    """Union of a resumed scan and the list it must never shrink below.
+
+    A pair list is the dashboard's only answer to "which charts exist", so a
+    scan that read FEWER tables than the one before it must not replace it — that
+    is how every 15m chart disappeared from the selector at once: the sweep
+    resumed at its saved cursor, found the database busy, answered zero chunks,
+    and its zero rows became the truth because it was the newest.
+
+    The newer rows win per table (a pair may move tier, rename or die), and the
+    older rows are kept only for tables the new scan did not reach. So a partial
+    sweep can only ADD to what the user can open, never subtract.
+    """
+    import pandas as pd
+
+    if new_rows is None or (hasattr(new_rows, "empty") and new_rows.empty):
+        return old_rows if old_rows is not None else pd.DataFrame()
+    if old_rows is None or (hasattr(old_rows, "empty") and old_rows.empty):
+        return new_rows
+
+    new_df = new_rows if isinstance(new_rows, pd.DataFrame) else pd.DataFrame(new_rows)
+    old_df = old_rows if isinstance(old_rows, pd.DataFrame) else pd.DataFrame(old_rows)
+    if any(k not in new_df.columns or k not in old_df.columns for k in key):
+        return new_df
+    seen = {tuple(r) for r in new_df[list(key)].itertuples(index=False, name=None)}
+    keep = ~old_df[list(key)].apply(
+        lambda r: tuple(r) in seen, axis=1, result_type="reduce"
+    )
+    leftover = old_df[keep]
+    if leftover.empty:
+        return new_df
+    return pd.concat([new_df, leftover], ignore_index=True)
+
+
 def find_missing_bucket_ranges(buckets, step: int):
     """
     Given sorted unique bucket numbers (ts // step), returns the half-open

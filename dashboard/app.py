@@ -59,6 +59,7 @@ from dashboard.helpers import (
     HIST_STATUS_HEIGHT,
     build_series_arrays,
     find_missing_bucket_ranges,
+    merge_summary_frames,
     rows_to_compact_candles,
     stitch_candle_gaps,
     fill_missing_bars,
@@ -331,6 +332,61 @@ async def _table_inventory(pool, db_name: str, db_host: str = "", db_port: int =
     return tables
 
 
+def _carry_ttl_sec(sweep: dict = None) -> float:
+    """How old a carried row may be before this sweep is allowed to forget it.
+
+    `inf` while a sweep is still in progress (`sweep["start"]` exists exactly
+    then — a complete pass pops the cursor): rows this database already
+    answered are the only reason the pair list converges instead of jumping
+    around, and letting them expire mid-sweep is how the list shrinks to
+    nothing. `dash_scan_carryover_ttl_sec` applies once the sweep has wrapped,
+    where it does what it was written for — retiring rows that a full pass has
+    not confirmed in that many seconds (a pair that was deleted, a tier move).
+    """
+    if sweep is None:
+        return 0.0                      # no carry-over at all (one-shot scans)
+    if "start" in sweep:
+        return float("inf")
+    return float(settings.dash_scan_carryover_ttl_sec)
+
+
+_MISSING_RELATION_RE = re.compile(r'relation "([^"]+)" does not exist')
+
+
+def forget_missing_relations(db_name: str, db_host: str, db_port: int,
+                             tables: dict, err) -> list:
+    """Drop the tables a failed query proved are gone, from this scan and from
+    the cached inventory. Returns their names (empty list: nothing to forget).
+
+    `relation "wbtc_usdt_on_bitget" does not exist` is not a transient failure
+    and no retry will answer it: the catalog cached a table the collector has
+    since moved (HIGH<->LOW) or pruned away. Left in the inventory, every sweep
+    re-reads its chunk, fails again, and spends the retries and the budget on a
+    table that has no rows anywhere — three chunks of a 25 s pass on the
+    1D/LOW database. The inventory refreshes from the catalog on its own TTL,
+    so forgetting an entry costs at most that much lag for a table that is
+    genuinely recreated; `partial` stays set for this pass, so nothing pretends
+    the shortened list is the truth.
+    """
+    gone = [m.group(1) for m in _MISSING_RELATION_RE.finditer(str(err))]
+    if not gone:
+        return []
+    inv = (_SCAN_INVENTORY.get((db_host, db_port, db_name)) or {}).get("tables")
+    dropped = 0
+    for tbl in gone:
+        if tables is not None and tables.pop(tbl, None) is not None:
+            dropped += 1
+        if inv is not None:
+            inv.pop(tbl, None)
+    _market_log_once(
+        ("scan-gone", db_name),
+        f"[scan] {db_name}: {len(gone)} table(s) the catalog still lists are gone "
+        f"from the database ({', '.join(gone[:3])}{'…' if len(gone) > 3 else ''}) — "
+        f"dropped from the cached inventory, {dropped} row(s) left the pair list",
+    )
+    return gone
+
+
 def _merge_carried_rows(out: list, sweep: dict, live, *, now: float, ttl: float) -> int:
     """Add the rows an earlier sweep of this database already answered.
 
@@ -515,6 +571,11 @@ async def _scan_database(
                 return await _fetch_union(sql)
             except Exception as e:
                 errors.append((f"chunk[{len(chunk)}]", f"{type(e).__name__}: {e}"))
+                if forget_missing_relations(db_name, db_host, db_port, tables, e):
+                    # The chunk is not "slow", it is stale: nothing to retry, and
+                    # the tables it named are no longer part of the sweep.
+                    skipped.append(len(chunk))
+                    return []
                 if scan_failure_is_transient(e):
                     skipped.append(len(chunk))
                     # LOADED, not broken. The all-TEXT retry and the per-table
@@ -534,6 +595,8 @@ async def _scan_database(
                     return await _fetch_union(retry_sql)
                 except Exception as e2:
                     errors.append((f"chunk[{len(chunk)}]:text", f"{type(e2).__name__}: {e2}"))
+                    if forget_missing_relations(db_name, db_host, db_port, tables, e2):
+                        return []      # the TEXT retry said the same thing: no table
                     if scan_failure_is_transient(e2):
                         return []
             # Last resort: per-table reads, bounded by the remaining budget AND
@@ -571,8 +634,7 @@ async def _scan_database(
         # short by the budget then ADDS to the pair list instead of replacing it
         # with a different slice of it.
         carried = _merge_carried_rows(
-            out, sweep, tables, now=time.time(),
-            ttl=float(settings.dash_scan_carryover_ttl_sec),
+            out, sweep, tables, now=time.time(), ttl=_carry_ttl_sec(sweep),
         ) if sweep is not None else 0
 
         for d in out:
@@ -690,6 +752,14 @@ async def _load_summary(db_host, db_port, db_user, db_pass, timeframe: str) -> p
         "rows": sum(m.get("rows", 0) for m in metas),
         "tables": sum(m.get("tables", 0) for m in metas),
         "carried_rows": sum(m.get("carried_rows", 0) for m in metas),
+        # Two facts the rescan schedule needs: is this tier's sweep still mid
+        # -pass (a cursor that has not wrapped), and did the last pass answer any
+        # chunk at all. Together they tell "still converging" from "stuck": a
+        # sweep that ADDS tables must not be paced by the failure backoff, while
+        # one that gets nothing on a loaded server must be.
+        "answered_chunks": sum(m.get("answered_chunks", 0) for m in metas),
+        "sweep_incomplete": any("start" in _SCAN_SWEEP_STATE.get(db, {})
+                                for _, db in dbs),
     }
     if not all_rows:
         return pd.DataFrame()
@@ -707,6 +777,27 @@ def _rescan_delay_sec(timeframe: str) -> float:
         settings.dash_snapshot_refresh_sec, _SCAN_ATTEMPTS.get(timeframe, 0),
         settings.dash_scan_retry_max_sec,
     )
+    meta = _SCAN_META.get(timeframe) or {}
+    still_building = (
+        meta.get("partial") and meta.get("sweep_incomplete")
+        and int(meta.get("answered_chunks") or 0) > 0
+    )
+    if still_building:
+        # The list is still being BUILT: this tier's sweep has a resume cursor
+        # that has not wrapped, and the last pass answered chunks, so the next
+        # pass is what completes the pair list. Pacing that by the truncated-scan
+        # doubling (which exists for a database that cannot answer at all) is what
+        # left their 15m selector half-built for an hour: ~1 500 of 8 235 tables
+        # rendered, then a 15-minute wait, then the carried rows expired.
+        delay = min(delay, 2.0 * float(settings.dash_snapshot_refresh_sec))
+    if not meta.get("partial"):
+        # The last scan answered everything, so the list it produced is the
+        # truth for as long as anything can plausibly have changed. Re-asking
+        # for 8k tables every refresh tick is what starved the OTHER tier's
+        # scan into a 0-table answer (one scan gate per process): 1D completed
+        # every ~20 s and 15m never got the database. Candles — what the user
+        # watches — reload on their own path and do not wait for this.
+        delay = max(delay, float(settings.dash_scan_rescan_complete_sec))
     deferred = _SCAN_DEFERRED_AT.get(timeframe)
     if deferred and _SCAN_DEFER_TRIES.get(timeframe, 0) < _SCAN_DEFER_TRIES_MAX:
         # The last attempt was pushed aside by another tier's scan, not by the
@@ -760,6 +851,36 @@ def _scan_summary_now(db_host, db_port, db_user, db_pass, timeframe: str,
     try:
         df = asyncio.run(_load_summary(db_host, db_port, db_user, db_pass, timeframe))
         meta = dict(_SCAN_META.get(timeframe, {}))
+        prev = (_SUMMARY_STORE.get(timeframe) or {}).get("df")
+        # The second half of the condition is the case a truncated scan does not
+        # cover: a database whose cached catalog still names pair tables but that
+        # answered NONE of them (an empty inventory read, a tier whose rows all
+        # failed) reports no `partial` and would still empty the selector.
+        # "0 of 8235 tables" is a scan that got nothing, not a database with
+        # nothing in it — and only the latter is allowed to shrink the list.
+        nothing_but_tables = (
+            len(df) == 0 and int(meta.get("tables") or 0) > 0
+        )
+        if (meta.get("partial") or nothing_but_tables) and prev is not None and not prev.empty:
+            # MONOTONIC serving: a truncated scan adds to the pair list, it
+            # never replaces it. Without this the newest-but-partial answer won
+            # and a busy hour turned the 15m selector into an empty box — the
+            # charts were all still in the database, the dashboard just no
+            # longer knew their names. A complete scan does replace it, because
+            # then a shorter list means tables really are gone.
+            before = len(df)
+            df = merge_summary_frames(df, prev)
+            kept = len(df) - before
+            if kept > 0:
+                meta["kept_rows"] = int(kept)
+                if meta.get("rows") is not None:
+                    meta["rows"] = int(len(df))
+                df = coerce_summary_types(df)
+                print(
+                    f"[scan] {timeframe}: this pass read {before} table(s) and "
+                    f"{kept} more are kept from the last one — rendering {len(df)} "
+                    f"instead of a shorter list", flush=True,
+                )
         _SUMMARY_STORE[timeframe] = {"df": df, "meta": meta, "at": time.time()}
         # The streak decides when we dare to try again.
         _SCAN_ATTEMPTS[timeframe] = _SCAN_ATTEMPTS.get(timeframe, 0) + 1 if meta.get("partial") else 0
@@ -1297,6 +1418,24 @@ def _fetch_missing_candles_cached(ccxt_id: str, symbol: str, timeframe: str,
         rows, partial = _fetch_missing_candles(ccxt_id, symbol, timeframe, r0, r1)
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
+        if e.__class__.__name__ == "BadSymbol" or "does not have market symbol" in str(e):
+            # The exchange says it has no such market — a delisted pair or a
+            # leveraged token the collector still holds a table for. That is an
+            # ANSWER, not a hiccup: caching it as a failure made every chart page
+            # of that pair re-hit the exchange every DASH_STITCH_RETRY_SEC, print
+            # a red [stitch] line and blame the feed for a pair that simply has
+            # no catch-up candles. Draw the stored rows (the fill flattens the
+            # tail); the collector's own tables are untouched. The name goes
+            # stale only if the listing comes back, which the 1 h success TTL
+            # already tolerates for closed bars.
+            _market_log_once(
+                ("stitch-nosym", ccxt_id, symbol),
+                f"[stitch] {ccxt_id} {symbol} {timeframe}: not listed on the "
+                f"exchange any more ({err}) — nothing to catch up, drawing the "
+                f"stored candles as they are",
+            )
+            _STITCH_CACHE[key] = ([], "", now, _STITCH_OK_TTL)
+            return []
         if isinstance(e, MarketsUnavailable):
             # Not this range's problem — the whole exchange is not ready, so all
             # its ranges share one message, one log line and one longer pause.
@@ -2170,8 +2309,32 @@ def _live_db_for(row_1d, row_15m) -> Optional[str]:
     return getattr(settings, "db_high_1d", None)
 
 
+def _cached_read(fn, *args, **kwargs):
+    """Read through a short-lived Streamlit cache without letting the cache own
+    the page.
+
+    `@st.cache_data(ttl=1)` looks an entry up and then reads it, and an entry
+    evicted between those two steps raises `KeyError: <hash>` from
+    `streamlit/runtime/caching/ttl_cache.py` — a race inside Streamlit that the
+    `run_every` fragments refresh path walks straight into. It is not our
+    failure to fix, but it must not be the user's blank strip: `None` is what
+    every caller already means by "nothing new this tick", and one line says so
+    per minute. Any exception that is NOT that race propagates unchanged — a
+    broken feed is reported, not hidden.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except KeyError as e:
+        _market_log_once(
+            ("cache-race", getattr(fn, "__name__", "?")),
+            f"[live] {getattr(fn, '__name__', '?')}: the ~1s cache dropped its "
+            f"entry ({e!r}) — the strip keeps its previous value for this tick",
+        )
+        return None
+
+
 @st.cache_data(ttl=1, show_spinner=False)
-def _db_live_read(db_name: str, exchange: str, symbol: str):
+def _db_live_read_cached(db_name: str, exchange: str, symbol: str):
     """Latest live snapshot row for the pair (None when missing/stale)."""
     infra = _live_infra_or_none()
     if not infra or not db_name:
@@ -2180,6 +2343,10 @@ def _db_live_read(db_name: str, exchange: str, symbol: str):
         return infra["submit_select"](db_name, exchange, symbol, timeout=2.5)
     except Exception:
         return None
+
+
+def _db_live_read(db_name: str, exchange: str, symbol: str):
+    return _cached_read(_db_live_read_cached, db_name, exchange, symbol)
 
 
 def _live_tick_path(db_name: Optional[str], exchange: str, symbol: str) -> Optional[str]:

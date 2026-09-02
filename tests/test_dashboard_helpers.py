@@ -1107,3 +1107,29 @@ def test_scan_pause_only_applies_right_after_an_interaction():
     assert scan_pause_sec(1000.0, 999.4, 0.05, 3.0) == 0.0      # gap already passed
     assert scan_pause_sec(1000.0, 999.5, 1.2, 0.0) == 0.0       # no yield budget left
     assert scan_pause_sec(1000.0, 1000.5, 1.2, 3.0) == 0.0       # clock skew
+
+
+def test_merge_summary_frames_only_adds_for_a_partial_pass():
+    """The pair list is the dashboard's only answer to "which charts exist", so
+    a resumed scan that reached fewer tables than the pass before it must not
+    become the truth — that is how all 15m charts vanished at once."""
+    import pandas as pd
+
+    from dashboard.helpers import merge_summary_frames
+
+    new = pd.DataFrame({"db_name": ["low"], "table_name": ["t2"], "ticker": ["B/USDT"],
+                        "last_price": [2.0]})
+    old = pd.DataFrame({"db_name": ["high", "low"],
+                        "table_name": ["t1", "t2"],
+                        "ticker": ["A/USDT", "B/USDT"],
+                        "last_price": [1.0, 1.5]})
+    out = merge_summary_frames(new, old)
+    assert sorted(out["table_name"]) == ["t1", "t2"]
+    # the newer read of a table wins, the older is not kept alongside it
+    assert float(out[out["table_name"] == "t2"]["last_price"].iloc[0]) == 2.0
+
+    # an empty partial answer keeps the whole previous list
+    assert len(merge_summary_frames(pd.DataFrame(), old)) == 2
+    # and a table only the old pass saw is not resurrected by a complete one:
+    # that decision is the caller's (it only merges when the pass was truncated)
+    assert len(merge_summary_frames(new, pd.DataFrame())) == 1

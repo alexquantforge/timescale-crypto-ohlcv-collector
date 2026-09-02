@@ -7,6 +7,7 @@ st.session_state.sym_ticker after the selectbox was already instantiated
 (StreamlitAPIException) — the click must switch the pair cleanly.
 """
 import os
+import time
 
 import pytest
 
@@ -1366,10 +1367,278 @@ def test_a_complete_scan_resets_the_backoff(monkeypatch):
         return pd.DataFrame({"ticker": ["a"]})
 
     monkeypatch.setattr(dapp, "_load_summary", complete)
+    # the reset is about the BACKOFF streak, not the refresh interval: the
+    # complete-scan floor (next test) is allowed to exceed it deliberately.
+    monkeypatch.setattr(dapp.settings, "dash_scan_rescan_complete_sec", 0.0)
     dapp._scan_summary_now("h", 1, "u", "p", "15m")
     assert dapp._SCAN_ATTEMPTS["15m"] == 0
     assert dapp._rescan_delay_sec("15m") == 120.0
     assert dapp._SUMMARY_STORE["15m"]["meta"]["partial"] is False
+
+
+def test_a_complete_tier_is_not_re_scanned_while_another_is_starving(monkeypatch):
+    """One scan gate, two tiers: the tier that keeps FINISHING used to re-scan
+    every refresh tick and the other one never got the database. Their 18:xx log
+    is the picture — `1d: … 116 chunk(s) / 9094 tables in 20.5s` over and over,
+    while `15m_low_vol` decayed from 1560 rendered tables to 0.
+
+    A complete answer is therefore held for `dash_scan_rescan_complete_sec`;
+    a truncated one still follows the retry streak, because converging fast is
+    the whole point of carrying its rows."""
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_refresh_sec", 30.0)
+    monkeypatch.setattr(dapp.settings, "dash_scan_retry_max_sec", 1800.0)
+    monkeypatch.setattr(dapp.settings, "dash_scan_rescan_complete_sec", 300.0)
+
+    dapp._SCAN_META["15m"] = {"partial": False}
+    dapp._SCAN_ATTEMPTS["15m"] = 0
+    assert dapp._rescan_delay_sec("15m") == 300.0
+
+    dapp._SCAN_META["15m"] = {"partial": True}
+    assert dapp._rescan_delay_sec("15m") == 30.0
+
+
+def test_a_sweep_that_is_still_building_the_list_is_not_backed_off(monkeypatch):
+    """A truncated scan has two very different causes, and the schedule must
+    tell them apart: a sweep that ANSWERS chunks but runs out of budget is
+    converging and the next pass should come soon, while a database that answers
+    nothing needs the doubling backoff. Conflating them left an 8 235-table tier
+    rendering 1 560 pairs, then 600, then 120 — an hour of "the charts are
+    missing" on a healthy database."""
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_refresh_sec", 120.0)
+    monkeypatch.setattr(dapp.settings, "dash_scan_retry_max_sec", 1800.0)
+    monkeypatch.setattr(dapp.settings, "dash_scan_rescan_complete_sec", 300.0)
+    dapp._SCAN_ATTEMPTS["15m"] = 6
+
+    # converging: partial, cursor unwrapped, chunks answered
+    dapp._SCAN_META["15m"] = {"partial": True, "sweep_incomplete": True,
+                              "answered_chunks": 4}
+    assert dapp._rescan_delay_sec("15m") == 240.0
+
+    # stuck: same streak, but the last pass answered nothing
+    dapp._SCAN_META["15m"] = {"partial": True, "sweep_incomplete": True,
+                              "answered_chunks": 0}
+    assert dapp._rescan_delay_sec("15m") > 240.0
+
+    # a sweep that wrapped and stayed truncated (errors in the tail): backoff too
+    dapp._SCAN_META["15m"] = {"partial": True, "sweep_incomplete": False,
+                              "answered_chunks": 69}
+    assert dapp._rescan_delay_sec("15m") > 240.0
+
+
+def test_a_partial_scan_never_shrinks_the_pair_list(monkeypatch):
+    """The bug the user reported as "пропали все 15ти минутные графики".
+
+    A resumed sweep read two chunks, the database was busy, and the pass
+    answered nothing; that empty answer became `_SUMMARY_STORE`, so the selector
+    had no 15m rows to render even though every table was still in Postgres.
+    Serving is now monotonic: while a sweep is incomplete it may only ADD."""
+    import pandas as pd
+
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_enabled", False)
+    old = pd.DataFrame({
+        "db_name": ["vol_15m_high", "vol_15m_high", "vol_15m_low"],
+        "table_name": ["btc_usdt_on_okx", "eth_usdt_on_okx", "sol_usdt_on_bybit"],
+        "ticker": ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+    })
+    dapp._SUMMARY_STORE["15m"] = {"df": old, "meta": {"partial": True}, "at": 0.0}
+
+    async def one_row(*a, **k):
+        dapp._SCAN_META["15m"] = {"partial": True, "rows": 1, "tables": 8235}
+        return pd.DataFrame({
+            "db_name": ["vol_15m_low"],
+            "table_name": ["sol_usdt_on_bybit"],
+            "ticker": ["SOL/USDT"],
+            # the row the sweep DID read is newer, so it must win per table
+            "last_price": [11.5],
+        })
+
+    monkeypatch.setattr(dapp, "_load_summary", one_row)
+    dapp._scan_summary_now("h", 1, "u", "p", "15m")
+
+    served = dapp._SUMMARY_STORE["15m"]["df"]
+    assert len(served) == 3
+    assert sorted(served["table_name"]) == [
+        "btc_usdt_on_okx", "eth_usdt_on_okx", "sol_usdt_on_bybit"]
+    assert served[served["table_name"] == "sol_usdt_on_bybit"]["last_price"].iloc[0] == 11.5
+    meta = dapp._SUMMARY_STORE["15m"]["meta"]
+    assert meta["kept_rows"] == 2 and meta["rows"] == 3
+
+
+def test_a_scan_that_answered_nothing_but_lists_tables_does_not_blank_it(monkeypatch):
+    """`rendering 0/8235 tables` without a `partial` flag: the catalog cache
+    names 8235 pair tables and the sweep read none of them. That is a scan that
+    got nothing, not a database with nothing in it, so the previous list stays
+    on screen — the user must not lose their charts to a busy minute."""
+    import pandas as pd
+
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_enabled", False)
+    dapp._SUMMARY_STORE["15m"] = {
+        "df": pd.DataFrame({"db_name": ["a", "a"], "table_name": ["t1", "t2"],
+                            "ticker": ["A/USDT", "B/USDT"]}),
+        "meta": {"partial": True}, "at": 0.0}
+
+    async def nothing(*a, **k):
+        dapp._SCAN_META["15m"] = {"partial": False, "rows": 0, "tables": 8235}
+        return pd.DataFrame()
+
+    monkeypatch.setattr(dapp, "_load_summary", nothing)
+    df = dapp._scan_summary_now("h", 1, "u", "p", "15m")
+    assert len(df) == 2
+
+
+def test_a_complete_scan_may_shrink_the_pair_list(monkeypatch):
+    """The other half: monotonic serving is about TRUNCATED passes. A scan that
+    read the whole database and found fewer tables is the truth — deleted pairs
+    must leave the selector, or the dashboard would list ghosts forever."""
+    import pandas as pd
+
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_enabled", False)
+    dapp._SUMMARY_STORE["15m"] = {
+        "df": pd.DataFrame({"db_name": ["a", "a"],
+                            "table_name": ["t1", "t2"], "ticker": ["A/USDT", "B/USDT"]}),
+        "meta": {"partial": True}, "at": 0.0}
+
+    async def complete(*a, **k):
+        dapp._SCAN_META["15m"] = {"partial": False, "rows": 1, "tables": 1}
+        return pd.DataFrame({"db_name": ["a"], "table_name": ["t1"], "ticker": ["A/USDT"]})
+
+    monkeypatch.setattr(dapp, "_load_summary", complete)
+    df = dapp._scan_summary_now("h", 1, "u", "p", "15m")
+    assert len(df) == 1
+    assert "kept_rows" not in dapp._SUMMARY_STORE["15m"]["meta"]
+
+
+def test_a_sweep_in_progress_does_not_expire_its_own_rows(monkeypatch):
+    """`dash_scan_carryover_ttl_sec` retires rows a COMPLETE pass failed to
+    confirm; it must never be what deletes rows a pass has not finished reading.
+
+    With the sweep at chunk 23 of 69 and the 15m tier 15 minutes from finishing,
+    the TTL aged out everything chunks 0..22 had answered, `all_rows` came back
+    empty, and `_load_summary` served an empty frame as the pair list."""
+    from dashboard import app as dapp
+
+    monkeypatch.setattr(dapp.settings, "dash_scan_carryover_ttl_sec", 900.0)
+    assert dapp._carry_ttl_sec(None) == 0.0          # one-shot scan: no carrying
+    assert dapp._carry_ttl_sec({}) == 900.0          # last sweep wrapped: TTL rules
+    assert dapp._carry_ttl_sec({"start": 23}) == float("inf")   # mid-sweep: never
+
+    stale = {"t1": (time.time() - 100000.0, {"table_name": "t1", "ticker": "A/USDT"})}
+    out = []
+    n = dapp._merge_carried_rows(out, {"start": 23, "rows": stale}, {"t1"},
+                                 now=time.time(), ttl=dapp._carry_ttl_sec({"start": 23}))
+    assert n == 1 and out[0]["table_name"] == "t1"
+    out = []
+    n = dapp._merge_carried_rows(out, {"rows": stale}, {"t1"},
+                                 now=time.time(), ttl=dapp._carry_ttl_sec({}))
+    assert n == 0 and out == []
+    # a table the catalog no longer has is dropped even mid-sweep
+    out = []
+    n = dapp._merge_carried_rows(out, {"start": 1, "rows": stale}, set(),
+                                 now=time.time(), ttl=float("inf"))
+    assert n == 0
+
+
+def test_a_gone_table_leaves_the_cached_inventory(monkeypatch, capsys):
+    """`relation "wbtc_usdt_on_bitget" does not exist` (1d/LOW, 3 chunks) is not
+    a slow chunk: the pair was pruned or moved tier and the cached catalog is
+    naming a table that is gone. Retrying it spends budget every pass; the entry
+    has to leave the inventory until the catalog is re-read."""
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    monkeypatch.setattr(dapp, "_MARKET_LOG_AT", {})
+    tables = {"wbtc_usdt_on_bitget": {}, "btc_usdt_on_okx": {}}
+    inventory = {"at": time.time(), "tables": tables}
+    dapp._SCAN_INVENTORY[("h", 1, "liq_1d_low")] = inventory
+
+    err = RuntimeError('relation "wbtc_usdt_on_bitget" does not exist')
+    assert dapp.forget_missing_relations("liq_1d_low", "h", 1, tables, err) == [
+        "wbtc_usdt_on_bitget"]
+    assert "wbtc_usdt_on_bitget" not in tables and "btc_usdt_on_okx" in tables
+    assert "wbtc_usdt_on_bitget" not in dapp._SCAN_INVENTORY[("h", 1, "liq_1d_low")]["tables"]
+    assert "[scan] liq_1d_low: 1 table(s)" in capsys.readouterr().out
+
+    # a TimeoutError mentions nothing: nothing is forgotten, the chunk retries
+    tables2 = {"a": {}, "b": {}}
+    assert dapp.forget_missing_relations("x", "h", 1, tables2, TimeoutError()) == []
+    assert set(tables2) == {"a", "b"}
+
+
+def test_a_dropped_cache_entry_does_not_blank_the_strip(monkeypatch, capsys):
+    """`KeyError: '903f84a38…'` from `streamlit/runtime/caching/ttl_cache.py:125`
+    was their console's red box: the ~1s live cache evicted an entry between
+    Streamlit's lookup and its read, and the exception escaped into the
+    `run_every` fragment, taking the whole health strip with it."""
+    from dashboard import app as dapp
+
+    monkeypatch.setattr(dapp, "_MARKET_LOG_AT", {})
+
+    def race(*a, **k):
+        raise KeyError("903f84a381ce6b5c396e5bfb00875bf1")
+
+    def broken(*a, **k):
+        raise ValueError("pool is closed")
+
+    assert dapp._cached_read(race, "db", "ex", "BTC/USDT") is None
+    out = capsys.readouterr().out
+    assert "[live] race: the ~1s cache dropped its entry" in out
+    with pytest.raises(ValueError):
+        dapp._cached_read(broken)          # a real failure is still a real failure
+
+
+def test_a_symbol_the_exchange_dropped_is_an_empty_answer(monkeypatch):
+    """`BadSymbol: gate does not have market symbol 1000000BABYDOGE/USDT:USDT`
+    printed one [stitch] line per chart page and cached a retry every
+    `DASH_STITCH_RETRY_SEC`. An exchange that does not list the symbol is not
+    failing to answer, it is answering "no candles" — so it is stored as the
+    (empty) answer and the caption stops blaming the feed for it."""
+    from dashboard import app as dapp
+
+    monkeypatch.setattr(dapp, "_STITCH_CACHE", {})
+    monkeypatch.setattr(dapp, "_MARKET_LOG_AT", {})
+    monkeypatch.setattr(dapp, "_MARKET_GATE", {})
+
+    class BadSymbol(Exception):
+        pass
+
+    def no_market(ccxt_id, symbol, timeframe, r0, r1):
+        raise BadSymbol("gate does not have market symbol 1000000BABYDOGE/USDT:USDT")
+
+    monkeypatch.setattr(dapp, "_fetch_missing_candles", no_market)
+    errors: list = []
+    out = dapp._fetch_missing_candles_cached(
+        "gate", "1000000BABYDOGE/USDT:USDT", "15m", 1987067, 1987070, errors)
+    assert out == []
+    assert errors == []      # no "retry in Ns": there is nothing to retry
+    ent = dapp._STITCH_CACHE[("gate", "1000000BABYDOGE/USDT:USDT", "15m", 1987067, 1987070)]
+    assert ent[1] == "" and ent[3] == dapp._STITCH_OK_TTL
+
+    # a timeout is still a failure, and is reported as one
+    dapp._STITCH_CACHE.clear()
+
+    def timed_out(ccxt_id, symbol, timeframe, r0, r1):
+        raise TimeoutError("stitch budget (4.0s) used up")
+
+    monkeypatch.setattr(dapp, "_fetch_missing_candles", timed_out)
+    errors = []
+    assert dapp._fetch_missing_candles_cached(
+        "gate", "BTC/USDT", "15m", 1, 2, errors) == []
+    assert errors and "used up" in errors[0]
 
 
 def test_two_scans_never_hold_the_database_at_once(monkeypatch, capsys):
