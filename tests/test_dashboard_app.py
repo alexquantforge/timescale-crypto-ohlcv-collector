@@ -304,6 +304,101 @@ def test_publish_is_throttled_and_never_blocks(monkeypatch):
     assert len(calls) == 2
 
 
+def test_a_failed_stitch_is_not_remembered_as_an_answer(monkeypatch):
+    """The bug this guards: `st.cache_data(ttl=3600)` cached the `[]` that a
+    failed fetch returned, so ONE hiccup left the chart gapped for an hour while
+    the caption blamed the exchange for a dashboard-side failure. A failure must
+    be visible to the caller and retried soon; a real answer stays cached."""
+    os.environ["DASHBOARD_DEMO"] = "1"
+    app = _load_app_module()
+
+    class _Flaky:
+        markets = {"X/USDT": {}}
+        calls = 0
+
+        def load_markets(self):
+            return self.markets
+
+        def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None):
+            type(self).calls += 1
+            if type(self).calls == 1:
+                raise RuntimeError("connection reset")
+            return [[since + i * 900_000, 1, 1, 1, 1, 1] for i in range(5)]
+
+    monkeypatch.setattr(app, "_get_sync_exchange", lambda ccxt_id: _Flaky())
+    monkeypatch.setattr(app, "_STITCH_CACHE", {}, raising=True)
+    monkeypatch.setattr(app.settings, "dash_stitch_retry_sec", 0.0)
+
+    errs = []
+    assert app._fetch_missing_candles_cached(
+        "bybit", "X/USDT", "15m", 10, 20, errors=errs) == []
+    assert errs and "connection reset" in errs[0]     # the caller was told
+    assert _Flaky.calls == 1
+
+    # ...and the same range is asked again instead of staying empty for an hour.
+    rows = app._fetch_missing_candles_cached("bybit", "X/USDT", "15m", 10, 20, errors=[])
+    assert rows and _Flaky.calls > 1          # retried, and it filled this time
+
+    # A real answer is cached: the same range is never asked again this hour.
+    calls = _Flaky.calls
+    again = app._fetch_missing_candles_cached("bybit", "X/USDT", "15m", 10, 20, errors=[])
+    assert again == rows and _Flaky.calls == calls
+
+
+def test_an_empty_answer_stays_an_empty_answer(monkeypatch):
+    """The other half of the rule: a pair the exchange genuinely has no candles
+    for must NOT be re-fetched on every rerun — silence is an answer, only a
+    refusal is not (otherwise this honesty fix would turn into hammering)."""
+    os.environ["DASHBOARD_DEMO"] = "1"
+    app = _load_app_module()
+
+    class _Empty:
+        markets = {"X/USDT": {}}
+        calls = 0
+
+        def load_markets(self):
+            return self.markets
+
+        def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None):
+            type(self).calls += 1
+            return []
+
+    monkeypatch.setattr(app, "_get_sync_exchange", lambda ccxt_id: _Empty())
+    monkeypatch.setattr(app, "_STITCH_CACHE", {}, raising=True)
+
+    errs = []
+    for _ in range(3):
+        assert app._fetch_missing_candles_cached(
+            "bybit", "X/USDT", "15m", 10, 20, errors=errs) == []
+    assert errs == []          # nothing failed → nothing to warn about
+    assert _Empty.calls == 1   # and one request for three renders
+
+
+def test_stitch_errors_tell_a_failed_fetch_from_an_empty_one():
+    """The helper must be able to report WHICH of the two it is: an empty
+    answer is drawn flat, a refused one is a hole in the chart."""
+    from dashboard.helpers import stitch_candle_gaps
+
+    import pandas as pd
+
+    base = 1_800_000_000 - (1_800_000_000 % 900)
+    df = pd.DataFrame({"ts": [base, base + 2 * 900], "open": [1.0, 2.0],
+                       "high": [1.0, 2.0], "low": [1.0, 2.0], "close": [1.0, 2.0],
+                       "volume": [1.0, 1.0]})
+
+    asked, errs = [], []
+    _, n = stitch_candle_gaps(df, lambda r0, r1: asked.append((r0, r1)) or [], 900,
+                              errors=errs)
+    assert n == 0 and len(asked) == 1 and errs == []      # empty answer: no complaint
+
+    def boom(r0, r1):
+        raise TimeoutError("stitch budget used up")
+
+    errs2 = []
+    _, n2 = stitch_candle_gaps(df, boom, 900, errors=errs2)
+    assert n2 == 0 and len(errs2) == 1 and "budget" in errs2[0]
+
+
 def test_stitch_fetch_honours_its_time_budget(monkeypatch):
     """A very stale table must not page an exchange forever on the chart's
     critical path."""
@@ -327,13 +422,14 @@ def test_stitch_fetch_honours_its_time_budget(monkeypatch):
     monkeypatch.setattr(app, "_get_sync_exchange", lambda ccxt_id: _SlowExchange())
     monkeypatch.setattr(app.settings, "dash_stitch_budget_sec", 0.12)
 
-    fetch = app._fetch_missing_candles_cached.__wrapped__  # bypass st.cache_data
+    fetch = app._fetch_missing_candles
     started = _time.perf_counter()
-    fetch("bybit", "X/USDT", "15m", 0, 40_000)
+    rows, partial = fetch("bybit", "X/USDT", "15m", 0, 40_000)
     elapsed = _time.perf_counter() - started
 
     assert elapsed < 2.0
     assert _SlowExchange.calls < 40  # stopped early instead of paging 40 times
+    assert rows and partial          # drawn AND admitted to be incomplete
 
 
 # ---------------------------------------------------------------------------

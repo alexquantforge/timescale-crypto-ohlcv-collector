@@ -44,6 +44,8 @@ from src.core.priority_pairs import (
     resolve_exchange_alias,
     PRIORITY_TABLE,
     due_pairs,
+    lane_since_sec,
+    lane_warn_due,
     read_priority_pairs,
 )
 from pytz import timezone as pytz_timezone
@@ -1770,9 +1772,12 @@ _LANE_INFLIGHT: Set[Tuple[str, str]] = set()
 
 async def refresh_priority_pair(ccxt_name: str, symbol: str) -> int:
     """
-    Tail refresh of ONE pair: fetch the last few 15m candles and persist them
-    through the same writer the main cycle uses. Deliberately light — no gap
-    scan, no history prefill, no tier moves; the full sweep still owns those.
+    Tail refresh of ONE pair: fetch the candles that are MISSING at the end of
+    the table (the last few when it is current, the whole hole when the
+    collector was off) and persist them through the same writer the main cycle
+    uses. Deliberately light — no gap scan of the interior, no history prefill,
+    no tier moves; the full sweep still owns those. See `lane_since_sec` for how
+    far back "missing at the end" reaches.
     Returns the number of candles written (0 on any failure).
     """
     # The dashboard may publish either spelling ("gateio" / "gate").
@@ -1793,27 +1798,33 @@ async def refresh_priority_pair(ccxt_name: str, symbol: str) -> int:
         # published by a dashboard must never spawn an empty junk table.
         return 0
 
-    # Start ONE BAR BEFORE the last stored candle, never at it.
-    #
-    # The last stored bar is almost always a FORMING bar frozen mid-flight
-    # (the lane wrote it a second ago), so it must be re-downloaded and
-    # replaced, not appended to. save_candles_to_table() does that by deleting
-    # everything >= the oldest fetched timestamp — which only covers the stale
-    # bar if the fetch actually returns it. `since` is inclusive on most
-    # exchanges but exclusive on some, and that difference is exactly what
-    # leaves a permanently half-finished candle in the table. Stepping back
-    # one bar makes the rewrite unconditional on every exchange.
-    step_ms = 900 * 1000
-    since_ms = clamp_ohlcv_since_ms(ccxt_name, (int(time.time()) - 4 * 900) * 1000)
-    if last_ts > 1:
-        since_ms = max(since_ms, clamp_ohlcv_since_ms(ccxt_name, last_ts * 1000 - step_ms))
+    # Where to start, and how many bars to ask for: `lane_since_sec` — the same
+    # rule the daily engine uses. The one-bar step back is what makes the forming
+    # bar get REPLACED (save_candles_to_table deletes everything >= the oldest
+    # fetched timestamp, and `since` is exclusive on some exchanges), and the
+    # hours-behind case is what makes the HOLE between that bar and `now` get
+    # written instead of refreshed around. With the old fixed `limit=10` a
+    # collector that had been off for a day left exactly that hole in the chart,
+    # because 10 bars near `now` are not 10 bars after the table's last row.
+    step = 900
+    now = int(time.time())
+    since_sec, want_bars = lane_since_sec(
+        last_ts, now, step, settings.priority_lane_catchup_max_bars
+    )
+    since_ms = clamp_ohlcv_since_ms(ccxt_name, since_sec * 1000)
+    limit = min(1000, max(10, int(want_bars)))
 
     try:
         cs = await asyncio.wait_for(
-            exchange.fetch_ohlcv(symbol, "15m", since=since_ms, limit=10),
+            exchange.fetch_ohlcv(symbol, "15m", since=since_ms, limit=limit),
             timeout=8.0,
         )
     except Exception as e:
+        # A failed fetch is WHY the chart is stale — say so instead of returning 0
+        # into the void (rate-limited: the lane ticks every few seconds per pair).
+        if lane_warn_due(("fetch", ccxt_name, symbol)):
+            log(f"  [LANE] ⚠️ {symbol} @{ccxt_name}: fetch failed ({type(e).__name__}: {e}) "
+                f"— the gap stays open until this works")
         _mark_dead_symbol_if_gone(e, ccxt_name, symbol)
         return 0
 
@@ -1825,6 +1836,12 @@ async def refresh_priority_pair(ccxt_name: str, symbol: str) -> int:
     except Exception as e:
         log(f"  [LANE] ⚠️ {symbol} @{ccxt_name}: write failed ({type(e).__name__}: {e})")
         return 0
+    if len(cs) > 6 and last_ts > 1:
+        # A bridge this long is worth a line: it is the difference between "the
+        # lane is refreshing" and "the lane is repairing the pair you are looking
+        # at", and without it the write looks like the ordinary 1-bar rewrite.
+        log(f"  [LANE] ⚡ {symbol} @{ccxt_name}: wrote {len(cs)} bar(s) across a "
+            f"{max(0, now - int(last_ts)) / 3600.0:.1f}h hole in {tbl}")
     return len(cs)
 
 

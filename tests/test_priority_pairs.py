@@ -165,6 +165,114 @@ async def test_refresh_priority_pair_skips_dead_and_filtered_symbols(monkeypatch
 
 
 # ---------------------------------------------------------------------------
+# The lane must BRIDGE a hole, not refresh around it
+# ---------------------------------------------------------------------------
+
+def test_lane_since_sec_anchors_at_the_hole():
+    """The "33 h gap on the chart" rule: with the collector behind, the fetch has
+    to start AT THE HOLE. A fixed tail of 10 bars near `now` refreshed around the
+    gap forever — and did so for 15m and 1D alike."""
+    from src.core.priority_pairs import lane_since_sec
+
+    now, step = 1_800_000_000, 900
+    # a bar or two behind (normal): one bar before the last row, small ask
+    assert lane_since_sec(now - 2 * step, now, step) == (now - 3 * step, 2 + 3 + 1)
+    # 33 h behind: start at the hole, and ask for the whole hole
+    hole = 134
+    since, want = lane_since_sec(now - hole * step, now, step)
+    assert since == now - (hole + 1) * step and want == hole + 4
+    # two YEARS behind: that is history, not a tail — the sweep owns it, and the
+    # lane must not spend an hour paging the exchange for a pair someone glanced at
+    since, want = lane_since_sec(now - 70_000 * step, now, step)
+    assert since == now - 4 * step and want == 5
+    # PRIORITY_LANE_CATCHUP_MAX_BARS=0 restores the old behaviour exactly
+    assert lane_since_sec(now - hole * step, now, step, catchup_max_bars=0)[0] == now - 4 * step
+    # empty table: the sweep creates it, the lane just keeps a tail anchor
+    assert lane_since_sec(0, now, step)[0] == now - 4 * step
+    # daily: two missing days are one fetch, same rule
+    d = 86400
+    assert lane_since_sec(now - 2 * d, now, d) == (now - 3 * d, 2 + 4)
+
+
+@pytest.mark.asyncio
+async def test_15m_lane_bridges_a_day_behind(monkeypatch):
+    """End-to-end for the visible bug: a table 33 h behind must be fetched from
+    its own last row, not from ~45 min ago, so the chart's hole gets closed."""
+    import src.core.updater_15m as u
+
+    last_ts = int(time.time()) - 33 * 3600
+    seen = {}
+
+    class _Ex:
+        async def fetch_ohlcv(self, symbol, tf, since=None, limit=None):
+            seen["since"], seen["limit"] = since, limit
+            return [[last_ts * 1000 + i * 900_000, 1, 2, 0.5, 1.5, 10] for i in range(limit)]
+
+    async def _persistent(name):
+        return _Ex()
+
+    async def _find(tbl):
+        return "db_low_15m", last_ts, 1_700_000_000
+
+    async def _save(db, tbl, symbol, ccxt_id, cs):
+        seen["saved"] = len(cs)
+        return db
+
+    monkeypatch.setattr(u, "get_persistent_exchange", _persistent)
+    monkeypatch.setattr(u, "find_table_in_dbs", _find)
+    monkeypatch.setattr(u, "save_candles_to_table", _save)
+
+    n = await u.refresh_priority_pair("bybit", "RARE/USDT")
+
+    assert n > 1                                   # more than a tail rewrite
+    assert seen["since"] <= (last_ts - 900) * 1000  # reached back to the hole
+    assert seen["limit"] >= 130                    # ~33 h of 15m bars in one request
+    assert seen["saved"] == n
+
+
+@pytest.mark.asyncio
+async def test_1d_lane_bridges_missing_days(monkeypatch):
+    """Same defect on the daily timeframe: bars close once a day, so a two-day
+    outage is two WHOLE missing candles that refreshing the forming bar never
+    fixes. The daily lane must start at the table's own last row."""
+    import src.core.updater as u1d
+
+    now = int(time.time())
+    last_ts = now - (now % 86400) - 3 * 86400      # three daily buckets behind
+    engine = u1d.MarketDataEngine(timeframe="1d")
+    seen = {}
+
+    class _Repo:
+        async def find_table(self, tbl):
+            return "db_low_1d", last_ts, 1_600_000_000
+
+        async def upsert_candles(self, db, tbl, df, timeframe="1d"):
+            seen["written"] = len(df)
+            seen["min_ts"] = int(df["Timestamp"].min())
+
+    class _Ex:
+        async def fetch_ohlcv(self, symbol, tf, since=None, limit=None):
+            seen["since"], seen["limit"] = since, limit
+            rows = [[(last_ts + i * 86400) * 1000, 1, 2, 0.5, 1.5, 10] for i in range(4)]
+            return [r for r in rows if r[0] >= since]
+
+    async def _persistent(ccxt_id, ccxt_name):
+        return _Ex()
+
+    engine.repository = _Repo()
+    monkeypatch.setattr(u1d, "get_persistent_exchange", _persistent)
+    monkeypatch.setattr(engine, "get_configured_exchanges", lambda: ["bybit"])
+
+    n = await engine.refresh_priority_pair("bybit", "RARE/USDT")
+
+    # The old code anchored at `now - 3*step`, i.e. at the LAST stored bucket and
+    # never one before it; the fix must reach one full bar behind that.
+    assert seen["since"] == (last_ts - 86400) * 1000
+    # the stale forming bar plus the three closed days: rewritten, not appended
+    assert n == 4 and seen["min_ts"] == last_ts      # oldest written row = the stale bar
+
+
+# ---------------------------------------------------------------------------
 # Exchange-label resolution (15m tables say "gateio", 1D tables say "gate")
 # ---------------------------------------------------------------------------
 

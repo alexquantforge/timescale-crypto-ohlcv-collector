@@ -20,6 +20,8 @@ from src.core.priority_pairs import (
     MAX_PRIORITY_PAIRS,
     PRIORITY_TABLE,
     due_pairs,
+    lane_since_sec,
+    lane_warn_due,
     read_priority_pairs,
     resolve_exchange_alias,
 )
@@ -843,9 +845,15 @@ class MarketDataEngine:
     async def refresh_priority_pair(self, published_exchange: str, symbol: str) -> int:
         """
         Tail refresh of ONE displayed pair on this engine's timeframe: refetch
-        the last few bars (the forming one included) and write them through
-        the repository the main cycle uses. Existing tables only — creating
-        tables stays the sweep's job.
+        the bars missing at the end of the table — the last few when it is
+        current, the whole hole when it is not — and write them through the
+        repository the main cycle uses. Existing tables only — creating tables
+        stays the sweep's job.
+
+        A daily table needs the hole case at least as much as a 15m one: its
+        bars close once a day, so an engine that was off for two days leaves two
+        WHOLE candles missing, and the chart's daily series has a gap in it that
+        no amount of refreshing the forming bar will close.
         """
         if not self.repository:
             return 0
@@ -868,19 +876,32 @@ class MarketDataEngine:
         if exchange is None:
             return 0
 
-        # One bar BEFORE the last stored candle: that candle is a forming bar
+        # One bar BEFORE the last stored candle (that candle is a forming bar
         # frozen mid-flight, and upsert_candles() replaces everything from the
-        # oldest fetched timestamp on — so the stale partial bar is rewritten
-        # even on exchanges whose `since` is exclusive.
+        # oldest fetched timestamp on), extended back over the whole hole when
+        # the table is further behind than a bar or two — see `lane_since_sec`.
         step = 900 if self.timeframe == "15m" else 86400
-        since_ms = max(int(last_ts or 0) - step, int(time.time()) - 3 * step) * 1000
+        now = int(time.time())
+        since_sec, want_bars = lane_since_sec(
+            last_ts, now, step, settings.priority_lane_catchup_max_bars
+        )
+        since_ms = since_sec * 1000
+        limit = min(1000, max(10, int(want_bars)))
         try:
             cs = await hard_wait_for(
-                exchange.fetch_ohlcv(symbol, self.timeframe, since=since_ms, limit=10),
-                8.0,
+                exchange.fetch_ohlcv(symbol, self.timeframe, since=since_ms, limit=limit),
+                10.0,
                 label=f"{symbol}@{ccxt_id} lane",
             )
-        except Exception:
+        except Exception as e:
+            # Not silently: a lane that cannot fetch is the reason a chart is
+            # stale, and "return 0" alone leaves no trace of why. Rate-limited per
+            # pair, because the lane ticks every few seconds.
+            if lane_warn_due(("fetch", ccxt_id, symbol)):
+                logger.warning(
+                    f"[{self.timeframe.upper()}] [LANE] {symbol}@{ccxt_id}: fetch failed "
+                    f"({type(e).__name__}: {e}) — the chart hole stays open until it works"
+                )
             return 0
         if not cs:
             return 0
@@ -896,6 +917,11 @@ class MarketDataEngine:
                 f"({type(e).__name__}: {e})"
             )
             return 0
+        if len(cs) > 6 and last_ts and int(last_ts) > 1:
+            logger.info(
+                f"[{self.timeframe.upper()}] [LANE] ⚡ {symbol}@{ccxt_id}: wrote {len(cs)} "
+                f"bar(s) across a {max(0, now - int(last_ts)) / 86400.0:.1f}d hole in {tbl_name}"
+            )
         return len(cs)
 
     async def _lane_pool(self):

@@ -41,6 +41,59 @@ CREATE_SQL = (
 )
 
 
+def lane_since_sec(
+    last_ts: int, now: int, step: int, catchup_max_bars: int = 2000, tail_bars: int = 3
+) -> Tuple[int, int]:
+    """Where the priority lane starts fetching for one pair, and how many bars to ask for.
+
+    Returns `(since_sec, want_bars)`.
+
+    Three cases, deliberately different:
+
+    * The table is a bar or two behind (normal). Start ONE BAR BEFORE its last
+      row: that row is a forming bar frozen mid-flight, and the writer replaces
+      everything from the oldest fetched timestamp on, which only covers the
+      stale bar if the fetch actually returns it.
+    * The table is HOURS behind — the collector was off, the symbol was filtered
+      out and came back, an engine restarted. Anchoring near `now` (what this
+      used to do, with `limit=10`) refreshes the tail *around* the hole and the
+      chart keeps the gap forever. So the fetch starts at the hole itself and the
+      response length grows to cover it; one request per lane tick, so a big hole
+      walks closed over a few ticks instead of turning the lane into a
+      history-backfill job.
+    * A hole deeper than `catchup_max_bars` is history, not a tail — the full
+      sweep owns that, and the lane must not spend an hour paging the exchange
+      for a pair somebody glanced at. Tail-only again.
+    """
+    tail = max(1, int(tail_bars))
+    if last_ts and int(last_ts) > 1 and step > 0:
+        hole = max(0, (int(now) - int(last_ts)) // step)
+        cap = max(0, int(catchup_max_bars))
+        if hole <= cap:
+            return int(last_ts) - step, hole + tail + 1
+    return int(now) - (tail + 1) * step, tail + 2
+
+
+# Rate limiter for "the lane could not do its job" lines. Both engines tick every
+# few seconds per watched pair, so an unbounded warning would bury the log (and a
+# silent `return 0` was the other failure mode: a stale chart with no reason
+# recorded). One line per pair per interval is enough to spot a pattern.
+_LANE_WARN_AT: dict = {}
+
+
+def lane_warn_due(key, min_interval_sec: float = 600.0) -> bool:
+    """True when a warning for `key` has not been printed recently (and records it)."""
+    now = time.time()
+    last = _LANE_WARN_AT.get(key)
+    if last is not None and now - last < min_interval_sec:
+        return False
+    _LANE_WARN_AT[key] = now
+    if len(_LANE_WARN_AT) > 2000:
+        for k, _ in sorted(_LANE_WARN_AT.items(), key=lambda kv: kv[1])[:1000]:
+            _LANE_WARN_AT.pop(k, None)
+    return True
+
+
 def normalize_pairs(
     pairs: Iterable, limit: int = MAX_PRIORITY_PAIRS
 ) -> List[Tuple[str, str]]:

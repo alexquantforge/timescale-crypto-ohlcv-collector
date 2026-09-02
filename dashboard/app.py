@@ -1012,17 +1012,24 @@ def _get_sync_exchange(ccxt_id: str):
     return getattr(_ccxt, ccxt_id)({"enableRateLimit": True, "timeout": 8000})
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_missing_candles_cached(ccxt_id: str, symbol: str, timeframe: str, r0: int, r1: int):
-    """Fetches a missing candle range from the exchange (closed bars only -> cache 1h)."""
+def _fetch_missing_candles(ccxt_id: str, symbol: str, timeframe: str, r0: int, r1: int):
+    """Fetches a missing candle range from the exchange → (closed bars, partial).
+
+    Raises on a failure instead of returning an empty list. The difference is the
+    whole point: `[]` means "this pair genuinely has no candles in this range"
+    (an illiquid pair — draw them flat), a raise means "we do not know" (the
+    chart is missing data and has to say so). It used to return `[]` for both.
+
+    `partial` is True when the range was only answered in part — the budget ran
+    out, or the endpoint failed after some pages had arrived. Partial answers are
+    drawn AND retried: caching them as a complete answer for an hour is how a
+    chart stayed gapped after one slow minute.
+    """
     step = 900 if timeframe == "15m" else 86400
     step_ms = step * 1000
     ex = _get_sync_exchange(ccxt_id)
-    try:
-        if not ex.markets:
-            ex.load_markets()
-    except Exception:
-        return []
+    if not ex.markets:
+        ex.load_markets()
 
     # Pages needed for the requested span (+1 slack), bounded so a very stale
     # table (weeks behind) is still bridged completely instead of stopping
@@ -1031,30 +1038,85 @@ def _fetch_missing_candles_cached(ccxt_id: str, symbol: str, timeframe: str, r0:
     # Hard wall-clock budget: this runs on the chart's critical path, and a
     # very stale table could otherwise page the exchange for a minute while
     # the user waits for a pair flip. Whatever arrived in time is drawn; the
-    # rest streams in on the next render (the result is cached 1 h).
+    # rest is retried on the next render (see `_STITCH_CACHE`).
     deadline = time.time() + settings.dash_stitch_budget_sec
     out = []
     cursor = r0 * step_ms
-    try:
-        for _ in range(pages):  # paged catch-up over the requested gap
-            if time.time() > deadline:
-                break
+    partial = False
+    for _ in range(pages):  # paged catch-up over the requested gap
+        if time.time() > deadline:
+            partial = True
+            break
+        try:
             batch = ex.fetch_ohlcv(symbol, timeframe, since=cursor, limit=1000)
-            if not batch:
+        except Exception:
+            if out:
+                partial = True          # what arrived is still worth drawing
                 break
-            for c in batch:
-                b = int(c[0]) // step_ms
-                if r0 <= b < r1:
-                    out.append(c)
-            if batch[-1][0] >= (r1 - 1) * step_ms:
-                break
-            nxt = batch[-1][0] + step_ms
-            if nxt <= cursor:  # exchange ignored `since` → no progress, stop
-                break
-            cursor = nxt
-    except Exception:
-        pass
-    return out
+            raise                       # caller decides what a refusal means
+        if not batch:
+            break
+        for c in batch:
+            b = int(c[0]) // step_ms
+            if r0 <= b < r1:
+                out.append(c)
+        if batch[-1][0] >= (r1 - 1) * step_ms:
+            break
+        nxt = batch[-1][0] + step_ms
+        if nxt <= cursor:  # exchange ignored `since` → no progress, stop
+            break
+        cursor = nxt
+    if partial and not out:
+        raise TimeoutError(f"stitch budget ({settings.dash_stitch_budget_sec:.1f}s) used up "
+                           f"before the exchange answered")
+    return out, partial
+
+
+# `_fetch_missing_candles` results, keyed per range. An hour for a success (closed
+# bars never change); `DASH_STITCH_RETRY_SEC` for a failure — and the failure is
+# remembered only to stop a broken endpoint from being re-hit on every rerun.
+# With `st.cache_data(ttl=3600)` the FIRST hiccup was cached as if it were the
+# answer, so a chart stayed gapped for an hour after one timeout and the caption
+# blamed the exchange.
+_STITCH_CACHE: dict = {}
+_STITCH_OK_TTL = 3600.0
+
+
+def _fetch_missing_candles_cached(ccxt_id: str, symbol: str, timeframe: str,
+                                  r0: int, r1: int, errors: list = None) -> list:
+    key = (ccxt_id, symbol, timeframe, int(r0), int(r1))
+    now = time.time()
+    ent = _STITCH_CACHE.get(key)
+    if ent and now - ent[2] < ent[3]:
+        if ent[1]:
+            if errors is not None:
+                errors.append(f"range {r0}-{r1}: {ent[1]} (retry in "
+                              f"{max(0.0, ent[3] - (now - ent[2])):.0f}s)")
+            return []
+        return ent[0]
+
+    try:
+        rows, partial = _fetch_missing_candles(ccxt_id, symbol, timeframe, r0, r1)
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        print(f"[stitch] {ccxt_id} {symbol} {timeframe} {r0}-{r1}: {err}", flush=True)
+        _STITCH_CACHE[key] = ([], err, now, float(settings.dash_stitch_retry_sec))
+        if errors is not None:
+            errors.append(f"range {r0}-{r1}: {err}")
+        return []
+    if partial:
+        note = (f"range {r0}-{r1}: only part of it fitted in "
+                f"{settings.dash_stitch_budget_sec:.1f}s — retry in "
+                f"{float(settings.dash_stitch_retry_sec):.0f}s")
+        if errors is not None:
+            errors.append(note)
+    _STITCH_CACHE[key] = (rows, None, now,
+                          float(settings.dash_stitch_retry_sec) if partial else _STITCH_OK_TTL)
+    if len(_STITCH_CACHE) > 4000:      # one pair's chart page touches a handful
+        oldest = sorted(_STITCH_CACHE.items(), key=lambda kv: kv[1][2])[:1000]
+        for k, _ in oldest:
+            _STITCH_CACHE.pop(k, None)
+    return rows
 
 
 @st.cache_data(ttl=1, show_spinner=False)
@@ -2346,11 +2408,15 @@ def _render_chart_html_cached(
     tf_key = "15m" if tf_label == "15m" else "1d"
     step = 900 if tf_key == "15m" else 86400
 
+    stitch_errors: list = []
+
     def _stitch(fr):
         if stitch_enabled and fr is not None and len(fr) > 1:
             return stitch_candle_gaps(
                 fr,
-                lambda r0, r1: _fetch_missing_candles_cached(ccxt_id, sym_ticker, tf_key, r0, r1),
+                lambda r0, r1: _fetch_missing_candles_cached(
+                    ccxt_id, sym_ticker, tf_key, r0, r1, errors=stitch_errors
+                ),
                 step,
             )
         return fr, 0
@@ -2371,11 +2437,22 @@ def _render_chart_html_cached(
     stale = age_h is not None and age_h > thr
     if stitched and stale:
         stale_hint = f" · ⏳ collector {age_h:.1f}h behind"
+    # What the catch-up fetch refused to answer, said out loud: a hole the
+    # dashboard could not fetch has to look different from a hole the exchange
+    # reports as empty, or a network problem reads as "this pair has no trades".
+    _fail = ""
+    if stitch_errors:
+        _fail = (f"<span style='color:#ef5350'>⚠️ {len(stitch_errors)} {tf_label} catch-up "
+                 f"range(s) could not be fetched ({stitch_errors[0]}) — retrying; chart may "
+                 f"be missing candles here</span>")
     if stitched:
         stitch_txt = (
             f"🩹 {stitched} missing {tf_label} candles stitched from exchange "
             f"(in-memory){stale_hint}"
+            + (f"<br>{_fail}" if _fail else "")
         )
+    elif _fail:
+        stitch_txt = _fail
     elif stale:
         # Nothing could be stitched while the table is stale → the chart would
         # silently end weeks before the live price line. Say so out loud.
@@ -2391,11 +2468,16 @@ def _render_chart_html_cached(
         # Intervals without trades: draw them flat like the exchange chart
         # does instead of leaving a hole (illiquid pairs).
         frame, filled = fill_missing_bars(frame, step)
-        if filled and not stitched:
+        if filled and not stitched and not stitch_errors:
+            # "no trades on the exchange" is a fact only when that range was
+            # actually answered; over a failed fetch a flat bar is the
+            # dashboard's own guess and must be labelled as one.
             stitch_txt = (
                 f"🕳 {filled} empty {tf_label} interval(s) drawn flat "
                 f"(no trades on the exchange)"
             )
+        elif filled and stitch_errors:
+            stitch_txt = f"{_fail} · {filled} more drawn flat meanwhile"
 
     candles_arr, volume_arr = build_series_arrays(frame, with_volume=show_volume)
     dumps = lambda x: json.dumps(x, separators=(",", ":"))
@@ -2570,6 +2652,10 @@ if st.sidebar.button("🔄 Refresh data (clear caches)"):
     _LAST_SCAN_AT.clear()
     _SUMMARY_STORE.clear()
     _SCAN_ATTEMPTS.clear()
+    # the stitch results are a manual dict too (they must NOT be a Streamlit
+    # cache: see `_fetch_missing_candles_cached`), so clear them by hand — this
+    # button is exactly the "ask the exchange again NOW" action.
+    _STITCH_CACHE.clear()
     st.rerun()
 
 # Compact layout: no big page title — charts come first with minimal top padding
@@ -2976,13 +3062,17 @@ with tab_charts:
         # --- LEGACY PATH (demo mode / TradingView widget / Plotly) ----------
         hist_df = get_candles(tf_label, row, limit, demo_mode)
 
+        stitch_errors = []
+
         def _stitch(frame, timeframe):
             """Gap + closed-tail stitching from the exchange (in-memory)."""
             if stitch_gaps and not demo_mode and frame is not None and len(frame) > 1:
                 step = 900 if timeframe == "15m" else 86400
                 frame, added = stitch_candle_gaps(
                     frame,
-                    lambda r0, r1: _fetch_missing_candles_cached(ccxt_id, sym_ticker, timeframe, r0, r1),
+                    lambda r0, r1: _fetch_missing_candles_cached(
+                        ccxt_id, sym_ticker, timeframe, r0, r1, errors=stitch_errors
+                    ),
                     step,
                 )
                 return frame, added
@@ -3007,8 +3097,10 @@ with tab_charts:
                     stale_hint = f" · ⏳ collector {_age_h:.1f}h behind"
         stitch_txt = (
             f"🩹 {stitched} missing {tf_label} candles stitched from exchange (in-memory){stale_hint}"
+            + (f" · ⚠️ {len(stitch_errors)} range(s) could not be fetched" if stitch_errors else "")
             if stitched
-            else "&nbsp;"
+            else (f"⚠️ {len(stitch_errors)} {tf_label} catch-up range(s) could not be fetched "
+                  f"({stitch_errors[0]}) — retrying" if stitch_errors else "&nbsp;")
         )
         _render_stitch_caption(stitch_txt)
 

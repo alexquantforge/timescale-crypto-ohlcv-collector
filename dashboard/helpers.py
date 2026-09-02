@@ -1353,6 +1353,7 @@ def stitch_candle_gaps(
     include_tail: bool = True,
     now_sec: Optional[int] = None,
     max_tail_buckets: int = 40_000,
+    errors: Optional[list] = None,
 ):
     """
     Fills gaps in a candle frame by fetching the missing bars through `fetcher`
@@ -1367,6 +1368,12 @@ def stitch_candle_gaps(
     Pure data operation (fully
     testable with a fake fetcher); returns (new_df, added_count). The database
     itself is NOT modified.
+
+    `errors` (a list, optional) collects a line per range the fetcher refused to
+    answer. Without it a caller cannot tell "the exchange has no candles here"
+    (draw them flat, that is what its own chart does) from "the request timed
+    out / failed" (the chart is MISSING data and must say so in red) — those two
+    used to look identical, and the identical-looking one is the lie.
     """
     if df is None or df.empty:
         return df, 0
@@ -1392,7 +1399,9 @@ def stitch_candle_gaps(
     for r0, r1 in ranges:
         try:
             candles = fetcher(r0, r1) or []
-        except Exception:
+        except Exception as e:
+            if errors is not None:
+                errors.append(f"range {r0}-{r1}: {type(e).__name__}: {e}")
             candles = []
         for c in candles:
             b = int(c[0]) // (step * 1000)

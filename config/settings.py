@@ -246,6 +246,11 @@ class Settings(BaseSettings):
     # while the user waits for a chart, so it is bounded by time, not only
     # by page count.
     dash_stitch_budget_sec: float = Field(default=4.0, alias="DASH_STITCH_BUDGET_SEC")
+    # How soon a stitch range that FAILED (or came back only half-answered) is
+    # asked again. A successful answer is kept for an hour — closed bars do not
+    # change — but a failure is not an answer, and caching it for an hour is what
+    # left a chart with a hole long after the exchange was reachable again.
+    dash_stitch_retry_sec: float = Field(default=20.0, alias="DASH_STITCH_RETRY_SEC")
     # Wall-clock budget for the whole-database summary scan. Whatever came
     # back in time is rendered — the dashboard must stay usable while the
     # collector writes.
@@ -322,6 +327,17 @@ class Settings(BaseSettings):
     priority_lane_ttl_sec: float = Field(default=90.0, alias="PRIORITY_LANE_TTL_SEC")
     # Coordination database holding the tiny handshake table (empty = 15m HIGH).
     priority_lane_db: str = Field(default="", alias="PRIORITY_LANE_DB")
+    # How far back the lane may bridge a hole in the pair you are LOOKING at.
+    # The lane used to refetch the last bars only (a fixed `limit=10` anchored
+    # near `now`), so a collector that was off for a day left the chart with a
+    # hole that the lane re-refreshed around, never into. Now the fetch starts at
+    # the table's own last bar when the hole is at most this many bars — 2000 x
+    # 15m = ~20 days, 2000 x 1D = 5 years, so a restart or a filtered-out day is
+    # bridged in a few ticks while a two-year-old leftover stays the sweep's job.
+    # 0 restores the old tail-only behaviour.
+    priority_lane_catchup_max_bars: int = Field(
+        default=2000, alias="PRIORITY_LANE_CATCHUP_MAX_BARS"
+    )
 
 
 settings = Settings()
