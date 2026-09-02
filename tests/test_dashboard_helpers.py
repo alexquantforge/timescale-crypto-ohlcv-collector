@@ -1016,3 +1016,31 @@ def test_coerce_summary_types_never_invents_a_barcode_flag():
         {"ob_is_barcode": 1.0}, {"ob_is_barcode": 0.0}, {"ob_is_barcode": None},
     ]))
     assert list(numeric["ob_is_barcode"]) == [True, False, False]
+
+
+def test_chart_render_plan_paints_db_first_then_patches():
+    from dashboard.helpers import chart_render_plan
+
+    now, ttl = 1000.0, 45.0
+    # nothing warmed yet -> render what the DB has, and go build the patch
+    assert chart_render_plan(None, True, now, ttl) == ("plain", True)
+    # fresh stitched page -> render it; no refresh while it is clearly young
+    fresh = {"at": now - 5, "applied": True}
+    assert chart_render_plan(fresh, True, now, ttl) == ("stitched", False)
+    # fresh but ageing -> keep-warm, so the swap-in never has to rebuild inline
+    ageing = {"at": now - 40, "applied": True}
+    assert chart_render_plan(ageing, True, now, ttl) == ("stitched", True)
+    # expired -> back to the DB page while the background rebuilds
+    assert chart_render_plan({"at": now - 90}, True, now, ttl) == ("plain", True)
+    # stitch switched off by the user: nothing to patch, nothing to warm
+    assert chart_render_plan(None, False, now, ttl) == ("plain", False)
+    assert chart_render_plan({"at": now}, False, now, ttl) == ("plain", False)
+
+
+def test_feed_should_use_rejects_missing_and_stale_only():
+    from dashboard.helpers import feed_should_use
+
+    assert feed_should_use(None, 1000.0, 20.0) is False
+    assert feed_should_use({"value": None, "at": 999.0}, 1000.0, 20.0) is True
+    assert feed_should_use({"value": None, "at": 900.0}, 1000.0, 20.0) is False
+    assert feed_should_use({}, 1000.0, 20.0) is False          # no timestamp at all

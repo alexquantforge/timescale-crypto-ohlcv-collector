@@ -1559,3 +1559,52 @@ def sanitize_metric_points(rows, now_sec: int) -> list:
         out.append([ts, float(v)])
     out.sort(key=lambda p: p[0])
     return out
+
+
+# ---------------------------------------------------------------------------
+# Progressive chart rendering (paint from DB now, patch from the exchange later)
+# ---------------------------------------------------------------------------
+
+def chart_render_plan(entry, stitch_wanted: bool, now: float, ttl: float) -> Tuple[str, bool]:
+    """
+    Decides what ONE chart slot renders: ("plain", warm?) | ("stitched", warm?).
+
+    `entry` is the record of a previously background-built stitched page (None
+    when there is none); only its `at` build time matters here.
+
+    The chart page used to be built *synchronously*: candles from the DB, then
+    the gap/tail stitch, which pages the exchange under a wall-clock budget
+    (DASH_STITCH_BUDGET_SEC, 4 s by default). Every flip to a pair whose table
+    is stale therefore blocked the UI for exactly that budget — the user
+    watched a spinner instead of the candles that were already in the
+    database. The stitch is a PATCH (it fills holes and a stale tail), so it
+    belongs in the background: render the DB page now, swap in the stitched
+    page when the daemon thread has built it.
+
+    Returns (variant, should_warm):
+      * "stitched" — a fresh background page exists; render it (a memory
+        lookup, and the only case where the chart repaints after the initial
+        paint).
+      * "plain"    — nothing ready yet; render the DB-only page.
+      * should_warm — kick the background builder (deduped by key, so this is
+        also the keep-warm refresh that stops the stitched page from ever
+        being rebuilt on the UI thread when its cache expires).
+    """
+    if not stitch_wanted:
+        return "plain", False
+    if entry:
+        age = float(now) - float(entry.get("at") or 0.0)
+        if age <= ttl:
+            # fresh: render it; refresh ahead of expiry so the swap is invisible
+            return "stitched", age > ttl * 0.6
+        return "plain", True
+    return "plain", True
+
+
+def feed_should_use(entry, now: float, ttl: float) -> bool:
+    """A cached exchange feed may be displayed if it exists and is not older
+    than `ttl`. Stale-but-present beats blocking the render on a 8 s REST call;
+    the caller shows the DB snapshot values meanwhile."""
+    if not entry:
+        return False
+    return (float(now) - float(entry.get("at") or 0.0)) <= float(ttl)

@@ -659,3 +659,110 @@ def test_scan_aborts_chunks_that_never_answer(monkeypatch):
     assert rows == []
     assert elapsed < 3.0, f"budget did not bound the query: {elapsed:.1f}s"
     assert dapp._SCAN_META["db_slow"]["partial"] is True
+
+
+# ---------------------------------------------------------------------------
+# Progressive paint: DB page first, exchange data patched in afterwards.
+#
+# Flipping to the next pair cost ~4 s because the render path built the chart
+# page synchronously: candles from the DB, then the gap/tail stitch paging the
+# exchange under DASH_STITCH_BUDGET_SEC (4 s by default), plus inline ticker /
+# orderbook / trade-tape fetches for the live chips whenever the live DB row
+# for the new pair did not exist yet. The numbers the user could already see
+# were the last thing rendered.
+# ---------------------------------------------------------------------------
+
+
+def test_chart_page_args_identity_excludes_credentials():
+    from types import SimpleNamespace
+
+    from dashboard import app as dapp
+
+    row = {"db_name": "db1", "table_name": "btc_usdt_on_bybit"}
+    monkey_src = SimpleNamespace(db_host="h", db_port=1, db_user="u", db_pass="s3cret")
+    saved = {k: getattr(dapp, k) for k in ("db_host", "db_port", "db_user", "db_pass")}
+    for k, v in vars(monkey_src).items():
+        setattr(dapp, k, v)
+    try:
+        cache_args, store_key = dapp._chart_page_args(
+            row, "15m", 700, "", "", 0, "bybit", "BTC/USDT", "bybit",
+            "Candlesticks", 430, False, "POLLER_JS", "HIST_JS", True,
+        )
+    finally:
+        for k, v in saved.items():
+            setattr(dapp, k, v)
+
+    assert cache_args[:4] == ("h", 1, "u", "s3cret")   # the cache needs the DB
+    assert "s3cret" not in store_key                    # the store must not hold it
+    assert "btc_usdt_on_bybit" in store_key and "POLLER_JS" in store_key
+    # a different pair/exchange/style is a different page
+    other = list(store_key)
+    other[other.index("Candlesticks")] = "OHLCV Bars"
+    assert tuple(other) != store_key
+
+
+def test_warm_stitched_page_stores_patch_and_counts_candles(monkeypatch):
+    from types import SimpleNamespace
+
+    from dashboard import app as dapp
+
+    built = {"n": 0}
+
+    def fake_build(*args, stitch_enabled=False, **kw):
+        built["n"] += 1
+        built["stitch"] = stitch_enabled
+        return ("<html>patched</html>", "🩹 47 missing 15m candles stitched from exchange (in-memory)")
+
+    monkeypatch.setattr(dapp, "_render_chart_html_cached",
+                        SimpleNamespace(__wrapped__=fake_build), raising=False)
+    key, args = ("db1.t1.15m",), ("db1", "t1")
+
+    assert dapp._warm_stitched_page(key, args) == 47
+    # built UNCHACHED, with stitching on (the whole point: not on the UI path)
+    assert built == {"n": 1, "stitch": True}
+    entry = dapp._STITCHED_PAGES[key]
+    assert entry["html"] == "<html>patched</html>"
+    assert entry["hash"] == hash("<html>patched</html>")
+    # the store is bounded: browsing pairs must not pile up one HTML page each
+    for i in range(200):
+        dapp._remember(dapp._STITCHED_PAGES, f"k{i}", {"at": i})
+    assert len(dapp._STITCHED_PAGES) == dapp._PAGE_STORE_LIMIT
+
+
+def test_stitched_candle_count_parsing():
+    from dashboard import app as dapp
+
+    assert dapp._stitched_candle_count(
+        "🩹 12 missing 1D candles stitched from exchange (in-memory) · ⏳ collector 5.0h behind"
+    ) == 12
+    assert dapp._stitched_candle_count("&nbsp;") == 0          # nothing stitched
+    assert dapp._stitched_candle_count("") == 0
+    assert dapp._stitched_candle_count(None) == 0
+
+
+def test_feed_value_serves_cache_and_never_fetches_inline(monkeypatch):
+    from dashboard import app as dapp
+
+    calls, scheduled = [], []
+    monkeypatch.setattr(dapp, "_FEEDS", {}, raising=False)
+    monkeypatch.setattr(
+        dapp, "_fetch_ticker_cached",
+        lambda ccxt_id, symbol: calls.append((ccxt_id, symbol)) or {"last": 7.5},
+    )
+    # _bg is recorded, not executed: the render path must only SCHEDULE work
+    monkeypatch.setattr(dapp, "_bg", lambda key, fn, *a, **kw: scheduled.append((key, fn, a)))
+
+    # first view of a pair: nothing cached, no REST call, a warm is scheduled
+    assert dapp._feed_value("ticker", "bybit", "BTC/USDT") is None
+    assert calls == []
+    assert scheduled and scheduled[0][0] == ("feed", "ticker", "bybit", "BTC/USDT")
+
+    # the background thread fills it; now the widget renders it for free
+    scheduled[0][1](*scheduled[0][2])
+    assert calls == [("bybit", "BTC/USDT")]
+    assert dapp._feed_value("ticker", "bybit", "BTC/USDT") == {"last": 7.5}
+
+    # a value older than the LIVE window is not shown as live — but refreshed
+    dapp._FEEDS[("ticker", "bybit", "BTC/USDT")]["at"] -= 10_000
+    assert dapp._feed_value("ticker", "bybit", "BTC/USDT") is None
+    assert len(scheduled) == 2

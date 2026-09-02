@@ -63,7 +63,9 @@ from dashboard.helpers import (
     stitch_candle_gaps,
     fill_missing_bars,
     build_summary_union_sql,
+    chart_render_plan,
     coerce_summary_types,
+    feed_should_use,
     chunked,
     snapshot_path,
     save_summary_snapshot,
@@ -641,6 +643,57 @@ def _fetch_ticker_cached(ccxt_id: str, symbol: str):
         return None
 
 
+# ---------------------------------------------------------------------------
+# Exchange feeds: serve-then-refresh. The UI thread NEVER waits on REST.
+# ---------------------------------------------------------------------------
+
+_FEED_TTL_SEC = 1.0        # fresher than this -> no refresh needed
+_FEED_MAX_AGE_SEC = 20.0   # older than this -> do not present it as "LIVE"
+_FEEDS: dict = {}          # (kind, ccxt_id, symbol) -> {"value":…, "at":…}
+
+
+def _feed_refresh(kind: str, ccxt_id: str, symbol: str) -> None:
+    """Runs one feed fetch (in a daemon thread) and remembers the result —
+    including a None result, so a dead pair is not hammered every second."""
+    fn = {
+        "ticker": _fetch_ticker_cached,
+        "orderbook": _fetch_orderbook_top,
+        "tape": _fetch_trade_tape,
+    }[kind]
+    try:
+        value = fn(ccxt_id, symbol)
+    except Exception:
+        value = None
+    _FEEDS[(kind, ccxt_id, symbol)] = {"value": value, "at": time.time()}
+
+
+def _feed_entry(kind: str, ccxt_id: str, symbol: str):
+    """Latest known payload of a feed + schedules a background refresh."""
+    key = (kind, ccxt_id, symbol)
+    ent = _FEEDS.get(key)
+    if not ent or time.time() - ent["at"] >= _FEED_TTL_SEC:
+        _bg(("feed",) + key, lambda: _feed_refresh(kind, ccxt_id, symbol))
+    return ent
+
+
+def _feed_value(kind: str, ccxt_id: str, symbol: str, max_age_sec: float = _FEED_MAX_AGE_SEC):
+    """Value of a feed if one is known and fresh enough, else None (the callers
+    already fall back to the collector's DB snapshot).
+
+    Wrapping the raw fetchers in `st.cache_data(ttl=1)` looked like a cache but
+    behaved like a BLOCKING one: on the first view of a pair — whose live DB
+    row the writer daemon has not produced yet — the health strip ran the
+    orderbook and trade-tape fetches inline and the LIVE panel ran the ticker
+    fetch, each up to the 8 s ccxt timeout. That is the multi-second stall on
+    every Prev/Next click. Serving the previous value (or nothing) and patching
+    a second later is how the rest of this dashboard already works.
+    """
+    ent = _feed_entry(kind, ccxt_id, symbol)
+    if not feed_should_use(ent, time.time(), max_age_sec):
+        return None
+    return ent["value"]
+
+
 def _render_live_panel(ticker: str, exchange: str, demo: bool, db_name: str = None):
     """One-line LIVE chips: price, bid/ask, spread, 24h change.
 
@@ -669,12 +722,15 @@ def _render_live_panel(ticker: str, exchange: str, demo: bool, db_name: str = No
                 "pct": live_row.get("pct"),
             }
         if not data:
+            # Serve-then-refresh: ask what the background feed thread last saw
+            # instead of fetching here, so a pair switch never pays a ticker
+            # round trip before the first paint.
             exchange_map = settings.exchange_map_1d
             ccxt_id = exchange_map.get(exchange, exchange)
-            data = _fetch_ticker_cached(ccxt_id, ticker)
+            data = _feed_value("ticker", ccxt_id, ticker)
 
     if not data or not data.get("last"):
-        st.caption("🔴 LIVE: exchange unreachable")
+        st.caption("🔴 LIVE: waiting for the first tick…")
         return
 
     last = float(data["last"])
@@ -1352,7 +1408,8 @@ def _compute_live_health_row(sym_ticker, sym_ex, hist_1d, atr_val, db_row, db_na
             except (TypeError, ValueError):
                 pass
     else:
-        ob = _fetch_orderbook_top(ccxt_id, sym_ticker)
+        # Serve-then-refresh (see _feed_value): no REST call on the render path.
+        ob = _feed_value("orderbook", ccxt_id, sym_ticker)
         if ob and ob["bids"] and ob["asks"]:
             try:
                 bid = float(ob["bids"][0][0])
@@ -1378,7 +1435,7 @@ def _compute_live_health_row(sym_ticker, sym_ex, hist_1d, atr_val, db_row, db_na
         if live_row.get("is_barcode"):
             row["ob_is_barcode"] = True  # barcode market → DEAD tape chip
     else:
-        trades = _fetch_trade_tape(ccxt_id, sym_ticker)
+        trades = _feed_value("tape", ccxt_id, sym_ticker)
         if trades:
             now_ms = time.time() * 1000.0
             recent = [
@@ -1412,8 +1469,8 @@ _BG_RUNNING: set = set()
 _LIVE_SNAP: dict = {}  # (ticker, exchange, atr) -> (snapshot_or_None, fetched_at)
 
 
-def _bg(key, fn) -> None:
-    """Runs fn() in a daemon thread, deduplicated per key while running."""
+def _bg(key, fn, *args, **kwargs) -> None:
+    """Runs fn(*args) in a daemon thread, deduplicated per key while running."""
     with _BG_LOCK:
         if key in _BG_RUNNING:
             return
@@ -1421,7 +1478,7 @@ def _bg(key, fn) -> None:
 
     def _run():
         try:
-            fn()
+            fn(*args, **kwargs)
         except Exception:
             pass
         finally:
@@ -1452,9 +1509,10 @@ def _warm_pair_caches(
     immediate ±2 neighbours — the full live orderbook snapshot.
 
     With `chart_ctx` (style/height/volume/stitch/tick-port of the current
-    view) it also pre-builds BOTH chart pages into `_render_chart_html_cached`,
-    so the very first flip to a neighbour skips the DB round-trip AND the
-    JSON/HTML build — the render path becomes a pure memory lookup.
+    view) it also pre-builds BOTH chart pages — the stitched one into
+    `_STITCHED_PAGES`, the DB-only one into `_render_chart_html_cached` — so
+    the very first flip to a neighbour skips the DB round-trip, the exchange
+    stitch AND the JSON/HTML build: the render path becomes a memory lookup.
     """
     for tf, row, lim in (("15m", row_15m, lim15), ("1d", row_1d, lim1d)):
         if not row:
@@ -1526,18 +1584,117 @@ def _warm_pair_caches(
             if tf_label == "1D" and row_15m:
                 m_db, m_tbl = row_15m["db_name"], row_15m["table_name"]
                 m_lim = max(int(lim15), 200)
-            _render_chart_html_cached(
-                db_host, db_port, db_user, db_pass,
-                row["db_name"], row["table_name"], _safe_max_ts(row),
-                tf_label, int(lim), m_db, m_tbl, m_lim,
+            cache_args, store_key = _chart_page_args(
+                row, tf_label, int(lim), m_db, m_tbl, m_lim,
                 ccxt_id, ticker, exchange_name,
                 chart_ctx["style"], chart_ctx["height"],
-                chart_ctx["volume"], chart_ctx["stitch"],
-                poller, hist, chart_ctx.get("flat_fill", True),
+                chart_ctx["volume"], poller, hist,
+                chart_ctx.get("flat_fill", True),
             )
+            if chart_ctx["stitch"]:
+                # The neighbour flip must find the PATCHED page ready in the
+                # store (this thread), not build it on the render path.
+                _warm_stitched_page(store_key, cache_args)
+            else:
+                _render_chart_html_cached(*cache_args, stitch_enabled=False)
 
 
-@st.cache_data(ttl=45, show_spinner=False)
+# Lifetime of a built chart page — shared by the st.cache_data entry of the
+# plain (DB-only) page and the in-process store of the background-stitched
+# one, so the patched page can never outlive the page it replaces.
+CHART_PAGE_TTL_SEC = 45.0
+
+# Stitched chart pages, built OFF the render path (see _chart_page_args).
+# key -> {"html":…, "txt":…, "at":…, "hash":…}
+_STITCHED_PAGES: dict = {}
+# A chart-page key carries the pair, the timeframe and both JS blobs, and the
+# user can browse hundreds of pairs per session — so these stores are trimmed
+# to the most recent entries instead of holding an HTML page per visit.
+_PAGE_STORE_LIMIT = 48
+# Keys of the pair currently on screen: the watcher below reruns the app once
+# when a background page lands for one of them and has not been displayed yet.
+_CURRENT_CHART_KEYS: set = set()
+# hash() of the HTML actually shown per chart slot. A background stitch that
+# changed NOTHING must not repaint the iframe (that resets zoom/pan), so the
+# swap is decided by comparing content hashes, never by "a page exists now".
+_DISPLAYED_HASH: dict = {}
+# When a key was last swapped, to rate-limit repaints: the keep-warm rebuild
+# produces a slightly different page every cycle (live candles move), and an
+# unsuppressed watcher would reset the user's zoom every ~27 s forever. One
+# swap per CHART_SWAP_COOLDOWN_SEC is enough — the 60 s auto-reload repaints
+# with whatever is newest anyway.
+CHART_SWAP_COOLDOWN_SEC = 60.0
+_LAST_SWAP_AT: dict = {}
+
+
+def _chart_page_args(
+    row, tf_label, limit, m_db, m_tbl, m_lim, ccxt_id, sym_ticker, sym_ex,
+    chart_style, chart_height, show_volume, poller_js, hist_js, flat_fill,
+):
+    """
+    (cache_args, store_key) for one chart page, from ONE list of values.
+
+    The neighbour warm and the render path must agree on the identity of a
+    chart page bit for bit, or the flip misses and rebuilds — so both derive
+    their arguments here instead of spelling the same 20 parameters twice.
+    The store key is the same tuple without the DB credentials (they are not
+    part of a page's identity, and copying them into a long-lived dict would
+    keep a password alive for the process lifetime).
+    """
+    core = (
+        row["db_name"], row["table_name"], _safe_max_ts(row), tf_label, int(limit),
+        m_db, m_tbl, int(m_lim), ccxt_id, sym_ticker, sym_ex, chart_style,
+        int(chart_height), bool(show_volume), poller_js or "", hist_js or "",
+        bool(flat_fill),
+    )
+    return (db_host, db_port, db_user, db_pass) + core, core
+
+
+def _remember(store: dict, key, value, limit: int = _PAGE_STORE_LIMIT) -> None:
+    """Store and keep only the `limit` most recent entries (dict order is
+    insertion order, so re-storing a key must move it to the end)."""
+    store.pop(key, None)
+    store[key] = value
+    while len(store) > limit:
+        store.pop(next(iter(store)))
+
+
+def _stitched_candle_count(txt: str) -> int:
+    """How many candles the stitch caption reports (0 when there is no caption).
+    The caption is produced a few lines below in this same module, so the
+    pattern is intentionally loose: it counts, it does not validate."""
+    if not txt or "\U0001fa79" not in txt:
+        return 0
+    m = re.search(r"(\d+)\s+missing", txt)
+    try:
+        return int(m.group(1)) if m else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _warm_stitched_page(store_key, cache_args) -> int:
+    """
+    Builds the gap-stitched chart page in a BACKGROUND thread and stores it.
+
+    Runs the builder UNCACHED (.__wrapped__): a keep-warm refresh that read its
+    own 45 s cache entry would store a stale stitch and report it as fresh.
+    Returns how many candles the stitch added — 0 means the DB page was
+    already complete (the normal case for a healthy collector), which is also
+    the case where swapping it in must NOT repaint the iframe and reset the
+    user's zoom.
+    """
+    try:
+        res = _render_chart_html_cached.__wrapped__(*cache_args, stitch_enabled=True)
+    except Exception:
+        return 0
+    html, txt = (res or ("", ""))
+    _remember(_STITCHED_PAGES, store_key, {
+        "html": html, "txt": txt, "at": time.time(), "hash": hash(html or ""),
+    })
+    return _stitched_candle_count(txt)
+
+
+@st.cache_data(ttl=CHART_PAGE_TTL_SEC, show_spinner=False)
 def _render_chart_html_cached(
     db_host, db_port, db_user, db_pass,
     db_name: str, table_name: str, max_ts: int,
@@ -2103,18 +2260,47 @@ with tab_charts:
             if tf_label == "1D" and row_15m is not None:
                 m_db, m_tbl = row_15m["db_name"], row_15m["table_name"]
                 m_lim = max(limit_15m, 200)
-            res = _render_chart_html_cached(
-                db_host, db_port, db_user, db_pass,
-                row["db_name"], row["table_name"], _safe_max_ts(row),
-                tf_label, limit, m_db, m_tbl, m_lim,
+            cache_args, store_key = _chart_page_args(
+                row, tf_label, limit, m_db, m_tbl, m_lim,
                 ccxt_id, sym_ticker, sym_ex,
-                chart_style, chart_height, bool(show_volume), bool(stitch_gaps),
+                chart_style, chart_height, bool(show_volume),
                 poller_js, hist_js, bool(flat_fill),
             )
-            if res is None:
-                st.info(f"No {tf_label} candles available for {sym_ticker} ({sym_ex}).")
-                return
-            html_code, stitch_txt = res
+
+            # Progressive paint. The DB page renders NOW (one query, no
+            # network to the exchange); the gap stitch — which pages the
+            # exchange for up to DASH_STITCH_BUDGET_SEC and was previously the
+            # first thing the render path did — runs in a daemon thread and
+            # swaps its page in when it lands.
+            variant, should_warm = chart_render_plan(
+                _STITCHED_PAGES.get(store_key), bool(stitch_gaps),
+                time.time(), CHART_PAGE_TTL_SEC,
+            )
+            if should_warm:
+                _bg(("stitch", store_key), _warm_stitched_page, store_key, cache_args)
+                _CURRENT_CHART_KEYS.add(store_key)
+
+            if variant == "stitched":
+                entry = _STITCHED_PAGES[store_key]
+                html_code, stitch_txt = entry["html"], entry["txt"]
+                _remember(_DISPLAYED_HASH, store_key, entry.get("hash"))
+            else:
+                res = _render_chart_html_cached(
+                    *cache_args, stitch_enabled=False,
+                )
+                if res is None:
+                    st.info(f"No {tf_label} candles available for {sym_ticker} ({sym_ex}).")
+                    return
+                html_code, stitch_txt = res
+                _remember(_DISPLAYED_HASH, store_key, hash(html_code or ""))
+                if stitch_gaps:
+                    # APPENDED, never replaced: the plain page may be carrying
+                    # the red "collector Xh behind, chart tail may be missing"
+                    # warning, and hiding it behind a progress note would be
+                    # exactly the silence this app keeps having to unlearn.
+                    stitch_txt = (stitch_txt or "&nbsp;") + (
+                        " &nbsp;·&nbsp; 🩹 filling missing candles in the background"
+                    )
             _render_stitch_caption(stitch_txt)
             _html_component(html_code, chart_height + 10 + HIST_STATUS_HEIGHT)
             return
@@ -2209,6 +2395,10 @@ with tab_charts:
             _nav(delta)
         st.markdown("<div style='height:170px'></div>", unsafe_allow_html=True)
 
+    # Which chart slots this run rendered, and whether a background page is
+    # waiting to be swapped into them (see _stitch_swap_watcher below).
+    _CURRENT_CHART_KEYS.clear()
+
     if stacked_layout:
         # LARGE MODE: 15m on top, 1D below, nav buttons flanking each chart
         _slim_header("⏱", "15m")
@@ -2243,6 +2433,33 @@ with tab_charts:
         with c1d:
             _slim_header("📅", "1D")
             render_chart(row_1d, "1D", limit_1d, "D", chart_height=430)
+
+    # --- Swap a background-stitched chart in, once, and only if it differs --
+    # The stitch runs off the render path, so its page has to reach the screen
+    # somehow: this fragment (1 s, and its body is two dict lookups) triggers
+    # one app rerun when a landed page differs from what is displayed.
+    # Three reasons NOT to repaint: the stitch filled nothing (the healthy
+    # case — the DB page already matches), the page is byte-identical, or the
+    # last swap was too recent (a repaint resets zoom/pan and panning is the
+    # main thing a user does while looking at a chart).
+    if stitch_gaps and not demo_mode and hasattr(st, "fragment"):
+        @st.fragment(run_every=1.0)
+        def _stitch_swap_watcher():
+            now = time.time()
+            for _k in list(_CURRENT_CHART_KEYS):
+                _ent = _STITCHED_PAGES.get(_k)
+                if not _ent or _ent.get("hash") == _DISPLAYED_HASH.get(_k):
+                    continue
+                if _stitched_candle_count(_ent.get("txt") or "") <= 0:
+                    _CURRENT_CHART_KEYS.discard(_k)   # nothing to show, stop watching
+                    continue
+                if now - _LAST_SWAP_AT.get(_k, 0.0) < CHART_SWAP_COOLDOWN_SEC:
+                    continue
+                _remember(_LAST_SWAP_AT, _k, now)
+                st.rerun(scope="app")
+                return
+
+        _stitch_swap_watcher()
 
     # --- Open Interest, Funding Rate & Spread history ----------------------
     # Line panels under the two candle charts. OI points accumulate per engine
