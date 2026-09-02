@@ -1689,3 +1689,22 @@ def scan_retry_delay_sec(base_sec: float, attempts: int, cap_sec: float) -> floa
         return base
     delay = base * float(2 ** min(n, 10))
     return min(delay, max(base, float(cap_sec)))
+
+
+def scan_pause_sec(now: float, last_interaction_at: float, gap_sec: float,
+                   budget_left: float) -> float:
+    """How long the summary sweep should sit still so a click wins.
+
+    PostgreSQL has no query priority: while the scan walks thousands of tables,
+    the candle query of a Prev/Next click queues behind it, and "instant
+    switching" becomes however long a second or two feels like on that box. So
+    the sweep yields briefly right after an interaction — bounded in total per
+    sweep (`budget_left`), because a scan that never finishes is how the pair
+    list stays incomplete and gets rescanned.
+    """
+    if not last_interaction_at or budget_left <= 0 or gap_sec <= 0:
+        return 0.0
+    since = float(now) - float(last_interaction_at)
+    if since < 0.0 or since >= float(gap_sec):
+        return 0.0
+    return min(0.3, float(gap_sec) - since, float(budget_left))

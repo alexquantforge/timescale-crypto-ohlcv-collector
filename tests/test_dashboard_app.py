@@ -1227,3 +1227,162 @@ def test_the_cold_path_waits_for_an_in_flight_scan_instead_of_joining_it(monkeyp
     assert scans == [], "the queued caller must not launch a second scan"
     assert gate.acquire(blocking=False), "the gate was not returned"
     gate.release()
+
+
+def test_budget_is_measured_after_the_semaphore(monkeypatch):
+    """A queued chunk must not run a query authorized a minute earlier.
+
+    69 chunks behind 6 connections: the sweep checked the budget when the chunk
+    STARTED and then blocked on the semaphore, so every chunk that got a slot
+    late still issued its query with the allowance it had been given at queueing
+    time. That is how a 25 s sweep ran for 142 s while chart queries waited on
+    the same database.
+    """
+    import asyncio
+    import time as _time
+
+    from dashboard import app as dapp
+
+    schema = {
+        f"p{i}_usdt_on_bybit": {"Timestamp": "bigint", "ticker": "text"} for i in range(4)
+    }
+
+    class _SlowPool(_FakeScanPool):
+        def acquire(self, *a, **kw):
+            outer = self
+
+            class _Conn:
+                async def fetch(self, query, *args):
+                    if "pg_catalog" in query:
+                        return [
+                            {"table_name": t, "column_name": c, "data_type": dt}
+                            for t, cols in outer.schema.items() for c, dt in cols.items()
+                        ]
+                    outer.union_queries.append(query)
+                    await asyncio.sleep(1.5)      # the database is busy
+                    return [outer._row(t) for t in outer.schema if f"'{t}'::text" in query]
+
+                async def fetchrow(self, query, *args):  # pragma: no cover
+                    raise AssertionError("a chunk skipped on budget must not recover")
+
+            class _A:
+                async def __aenter__(self):
+                    return _Conn()
+
+                async def __aexit__(self, *exc):
+                    return False
+
+            return _A()
+
+    pool = _SlowPool(schema)
+
+    async def fake_create_pool(**kw):
+        return pool
+
+    monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool)
+    monkeypatch.setattr(dapp, "_SCAN_INVENTORY", {}, raising=False)
+    monkeypatch.setattr(dapp.settings, "dash_scan_yield_gap_sec", 0.0)
+    started = _time.time()
+    rows = asyncio.run(
+        dapp._scan_database("db_q", "HIGH", "h", 1, "u", "p",
+                            pool_size=1, chunk_size=2, budget_sec=2.0)
+    )
+    elapsed = _time.time() - started
+
+    assert len(rows) == 2                             # one chunk in, one not
+    assert len(pool.union_queries) == 1, "a chunk whose budget evaporated while " \
+                                         "queueing must never reach the database"
+    meta = dapp._SCAN_META["db_q"]
+    assert meta["skipped_chunks"] == 1 and meta["partial"] is True
+    assert elapsed < 3.5, f"the sweep outlived its budget: {elapsed:.1f}s"
+
+
+def test_neighbour_warm_primes_the_plain_page_too(monkeypatch):
+    """The store key and the cache key are two different lookups on the render
+    path: with stitching on, the warm used to fill only the first, so a flip
+    made before the stitch landed paid two queries + a full HTML build."""
+    from dashboard import app as dapp
+
+    plain, stitched = [], []
+    monkeypatch.setattr(dapp, "_render_chart_html_cached",
+                        lambda **kw: plain.append(kw))
+    monkeypatch.setattr(dapp, "_warm_stitched_page",
+                        lambda key, page_kwargs: stitched.append((key, page_kwargs)) or 0)
+    for k, v in {"db_host": "h", "db_port": 1, "db_user": "u", "db_pass": "p"}.items():
+        monkeypatch.setattr(dapp, k, v)
+
+    rows = {
+        "15m": {"db_name": "db15", "table_name": "btc_usdt_on_bybit", "max_ts": 1},
+        "1D": {"db_name": "db1d", "table_name": "btc_usdt_on_bybit", "max_ts": 2},
+    }
+    ctx = {"interval_ms": 0, "tick_port": None, "style": "Candlesticks", "height": 430,
+           "volume": False, "stitch": True, "flat_fill": True}
+    keys = dapp._warm_chart_pages(ctx, "BTC/USDT", "bybit", "bybit",
+                                  rows["15m"], rows["1D"], 700, 200)
+
+    assert len(plain) == 2 and len(stitched) == 2      # both charts, both pages
+    assert keys == [k for k, _ in stitched]            # and the same keys
+    assert all(p["stitch_enabled"] is False for p in plain)
+    assert all("db_pass" not in p or p.get("db_pass") for p in plain)
+
+    # the plain page must be keyed EXACTLY like the render path computes it,
+    # otherwise the warm is dead weight — so compare against the helper itself
+    page_kwargs, store_key = dapp._chart_page_args(
+        rows["15m"], "15m", 700, "", "", 0, "bybit", "BTC/USDT", "bybit",
+        "Candlesticks", 430, False, "", "", True,
+    )
+    assert store_key == keys[0]
+    assert {k: v for k, v in plain[0].items() if k != "stitch_enabled"} == page_kwargs
+
+    # with stitching off, only the page that will actually be shown is built
+    plain.clear(); stitched.clear()
+    dapp._warm_chart_pages({**ctx, "stitch": False}, "BTC/USDT", "bybit", "bybit",
+                           rows["15m"], rows["1D"], 700, 200)
+    assert len(plain) == 2 and stitched == []
+
+
+def test_candles_use_the_live_pool_and_fall_back_on_error(monkeypatch, capsys):
+    """First paint of a pair needs rows, not a fresh connection per row-set."""
+    import asyncio
+    import time as _time
+
+    import pandas as pd
+
+    from dashboard import app as dapp
+
+    now = int(_time.time())
+    rows = [{"ts": now - i * 900, "open": 1.0, "high": 1.1, "low": 0.9,
+             "close": 1.05, "volume": 10.0} for i in range(4)][::-1]
+
+    used = []
+    monkeypatch.setattr(dapp, "_live_infra_or_none", lambda: {
+        "submit_recent": lambda db, tbl, lim, timeout=8.0: used.append((db, tbl, lim)) or {"rows": rows}
+    })
+
+    async def never(*a, **k):  # pragma: no cover
+        raise AssertionError("the direct path must not run when the pool answered")
+
+    monkeypatch.setattr(dapp, "_load_candles", never)
+    df = dapp.load_candles_cached.__wrapped__("h", 1, "u", "p", "db1", "t1", 4)
+    assert len(df) == 4 and used == [("db1", "t1", 4)]
+    assert list(df["ts"]) == sorted(df["ts"])              # oldest first, as the chart wants
+
+    # a pool problem must never look like an empty table: fall back, and say so
+    monkeypatch.setattr(dapp, "_live_infra_or_none", lambda: {
+        "submit_recent": lambda *a, **k: {"err": "InterfaceError: connection is closed"}
+    })
+    sentinel = pd.DataFrame({"ts": [now], "open": [1.0], "high": [1.0], "low": [1.0],
+                             "close": [1.0], "volume": [1.0]})
+
+    async def direct(db_name, table_name, limit, *a):
+        return sentinel
+
+    monkeypatch.setattr(dapp, "_load_candles", direct)
+    df2 = dapp.load_candles_cached.__wrapped__("h", 1, "u", "p", "db1", "t1", 1)
+    assert df2 is sentinel
+    out = capsys.readouterr().out
+    assert "pool path failed" in out and "retrying directly" in out
+
+    # and an infra that is not up at all (demo mode, startup race) is quiet
+    monkeypatch.setattr(dapp, "_live_infra_or_none", lambda: None)
+    assert dapp.load_candles_cached.__wrapped__("h", 1, "u", "p", "db1", "t1", 1) is sentinel

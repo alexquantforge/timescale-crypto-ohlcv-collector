@@ -1094,3 +1094,16 @@ def test_retry_delay_backs_off_while_scans_stay_truncated():
     assert scan_retry_delay_sec(120, 99, 1800) == 1800
     # a base of 0 (throttle disabled) must not lock up or divide by zero
     assert scan_retry_delay_sec(0, 5, 1800) == 32.0
+
+
+def test_scan_pause_only_applies_right_after_an_interaction():
+    """The sweep yields to a click — briefly, and only right after one."""
+    from dashboard.helpers import scan_pause_sec
+
+    assert scan_pause_sec(1000.0, 0.0, 1.2, 3.0) == 0.0        # nobody clicked
+    assert scan_pause_sec(1000.0, 900.0, 1.2, 3.0) == 0.0      # long ago
+    assert scan_pause_sec(1000.0, 999.5, 1.2, 3.0) == 0.3      # just now: capped
+    assert scan_pause_sec(1000.0, 999.4, 1.2, 0.1) == 0.1      # budget-limited
+    assert scan_pause_sec(1000.0, 999.4, 0.05, 3.0) == 0.0      # gap already passed
+    assert scan_pause_sec(1000.0, 999.5, 1.2, 0.0) == 0.0       # no yield budget left
+    assert scan_pause_sec(1000.0, 1000.5, 1.2, 3.0) == 0.0       # clock skew

@@ -244,6 +244,10 @@ class Settings(BaseSettings):
     # legacy TEXT-typed column no longer costs the whole batch its batching.
     dash_scan_chunk_size: int = Field(default=120, alias="DASH_SCAN_CHUNK_SIZE")
     dash_scan_pool_size: int = Field(default=6, alias="DASH_SCAN_POOL_SIZE")
+    # How long the sweep stays out of the way after a pair switch. There is no
+    # query priority in PostgreSQL, so this is the mechanism by which a click
+    # beats a 69-chunk catalog sweep; 0 disables it.
+    dash_scan_yield_gap_sec: float = Field(default=1.2, alias="DASH_SCAN_YIELD_GAP_SEC")
     # Databases scanned at the same time INSIDE one summary scan. 1 (default)
     # walks HIGH then LOW; the two timeframes never overlap either, because the
     # whole scan holds a process-wide gate. Parallel sweeps looked faster on an

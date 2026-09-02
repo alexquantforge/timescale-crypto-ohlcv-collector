@@ -69,6 +69,7 @@ from dashboard.helpers import (
     snapshot_refresh_due,
     scan_failure_is_transient,
     scan_retry_delay_sec,
+    scan_pause_sec,
     chunked,
     snapshot_path,
     save_summary_snapshot,
@@ -207,6 +208,16 @@ _SUMMARY_STORE: dict = {}
 # and slowed each other down: measured on a production run, the same 116-chunk
 # sweep took 19.9 s alone and 105 s when three other sweeps overlapped it.
 _SCAN_GATE = threading.BoundedSemaphore(1)
+# When the user last asked for a different pair. The summary sweep yields for a
+# moment after it (scan_pause_sec), because a click must not queue behind
+# thousands of catalog queries.
+_LAST_INTERACTION_AT = 0.0
+
+
+def _mark_interaction() -> None:
+    global _LAST_INTERACTION_AT
+    _LAST_INTERACTION_AT = time.time()
+
 
 
 # table -> {column: data_type}, per (host, port, database), read from
@@ -364,8 +375,11 @@ async def _scan_database(
         skipped: list = []
         out: list = []
         recovery_cap = max(0, int(settings.dash_scan_recovery_max_tables))
+        # Total time this sweep may spend yielding to clicks. A cap, so
+        # interactivity never turns into "the pair list never completes".
+        yield_left = [min(3.0, 0.2 * max(1.0, float(budget_sec)))]
 
-        async def _fetch_union(sql: str, timeout: float) -> list:
+        async def _fetch_union(sql: str) -> list:
             # Bounded by the SCAN budget, not only by the pool's
             # command_timeout: with 45 slow chunks and 6 connections,
             # 30s-per-query stalls add up to minutes while the page renders
@@ -374,11 +388,21 @@ async def _scan_database(
             # cannot fit in what is left is not queued at all — a 0.5 s query
             # against a loaded server is a guaranteed TimeoutError that still
             # occupies a connection while it fails.
-            left = float(timeout)
-            if left < 1.0:
-                raise asyncio.TimeoutError("scan budget exhausted")
+            #
+            # The allowance is measured AFTER the semaphore, twice. With 69
+            # chunks behind 6 connections, a chunk authorized when it was
+            # queued used to run a 20 s query a minute and a half later: the
+            # "25 s" sweep then took 142 s, and every chart query on that
+            # database waited behind it — which is exactly the latency this
+            # round is trying to remove.
             async with sem:
+                left = deadline - time.time()
+                if left < 1.0:
+                    raise asyncio.TimeoutError("scan budget exhausted (queueing)")
                 async with pool.acquire(timeout=min(5.0, left)) as conn:
+                    left = deadline - time.time()
+                    if left < 0.5:
+                        raise asyncio.TimeoutError("scan budget exhausted (acquire)")
                     rows = await asyncio.wait_for(conn.fetch(sql), timeout=left)
             return [dict(r) for r in rows]
 
@@ -386,14 +410,25 @@ async def _scan_database(
             if time.time() > deadline:
                 skipped.append(len(chunk))
                 return []
+            pause = scan_pause_sec(
+                time.time(), _LAST_INTERACTION_AT,
+                settings.dash_scan_yield_gap_sec, yield_left[0],
+            )
+            if pause > 0.0:
+                yield_left[0] -= pause
+                await asyncio.sleep(pause)
+                if time.time() > deadline:
+                    skipped.append(len(chunk))
+                    return []
             sql = build_summary_union_sql(chunk, _EXPECTED_SUMMARY_KEYS)
             if not sql:
                 return []
             try:
-                return await _fetch_union(sql, deadline - time.time())
+                return await _fetch_union(sql)
             except Exception as e:
                 errors.append((f"chunk[{len(chunk)}]", f"{type(e).__name__}: {e}"))
                 if scan_failure_is_transient(e):
+                    skipped.append(len(chunk))
                     # LOADED, not broken. The all-TEXT retry and the per-table
                     # recovery would ask the same saturated pool for 120 more
                     # queries and answer nothing; the tables that did not make
@@ -408,7 +443,7 @@ async def _scan_database(
                     chunk, _EXPECTED_SUMMARY_KEYS, force_text=True
                 )
                 try:
-                    return await _fetch_union(retry_sql, deadline - time.time())
+                    return await _fetch_union(retry_sql)
                 except Exception as e2:
                     errors.append((f"chunk[{len(chunk)}]:text", f"{type(e2).__name__}: {e2}"))
                     if scan_failure_is_transient(e2):
@@ -460,10 +495,16 @@ async def _scan_database(
         }
         tail = f" (+catalog {catalog_secs:.1f}s)" if catalog_secs > 1.0 else ""
         if errors:
+            # Two very different things used to print as one alarming line: a
+            # chunk the server was too busy to answer (skipped on purpose, by
+            # design) and a chunk whose tables are actually broken (retried as
+            # TEXT, then recovered table by table). Only the second is a bug.
             preview = "; ".join(f"{t}: {e}" for t, e in errors[:3])
+            busy = len({t for t, e in errors if scan_failure_is_transient(str(e))})
+            broken = len({t for t, e in errors if not scan_failure_is_transient(str(e))})
             print(
-                f"[scan] {db_name}: {len(set(t for t, _ in errors))} chunk(s) needed a "
-                f"retry/per-table fallback ({sweep_secs:.1f}s): {preview}{tail}",
+                f"[scan] {db_name}: {sweep_secs:.1f}s — {busy} chunk(s) skipped (db busy), "
+                f"{broken} chunk(s) needed retry/recovery: {preview}{tail}",
                 flush=True,
             )
         elif sweep_secs > 3.0:
@@ -709,6 +750,15 @@ async def _load_candles(db_name: str, table_name: str, limit: int, db_host, db_p
     finally:
         await conn.close()
 
+    return candle_rows_to_frame(rows)
+
+
+def candle_rows_to_frame(rows) -> pd.DataFrame:
+    """Rows (ts/open/high/low/close/volume, newest first) → the candle frame.
+
+    Shared by the direct path and the pooled one so both sanitize identically
+    (future/garbage timestamps dropped, ms tables converted).
+    """
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame([dict(r) for r in rows])
@@ -722,7 +772,27 @@ async def _load_candles(db_name: str, table_name: str, limit: int, db_host, db_p
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_candles_cached(db_host, db_port, db_user, db_pass, db_name: str, table_name: str, limit: int) -> pd.DataFrame:
-    """Cached (60 s) candle frame per table, so pair switching is instant."""
+    """Cached (60 s) candle frame per table, so pair switching is instant.
+
+    Prefers the live API's PERSISTENT pool when it is up (`submit_recent`): the
+    first paint of a pair then costs no TCP+TLS+auth round trip per query, which
+    on a loaded server is 100–500 ms of what the user experiences as the switch.
+    Anything that goes wrong there — infra not started, table dropped mid-click,
+    timeout — falls through to the direct path and reports as it always did, so
+    a pool problem can never look like an empty table.
+    """
+    infra = _live_infra_or_none()
+    if infra is not None:
+        res = None
+        try:
+            res = infra["submit_recent"](db_name, table_name, limit)
+        except Exception:
+            res = None
+        if isinstance(res, dict) and "rows" in res:
+            return candle_rows_to_frame(res["rows"])
+        if isinstance(res, dict) and res.get("err"):
+            print(f"[candles] pool path failed for {db_name}.{table_name}: {res['err']} "
+                  f"— retrying directly", flush=True)
     try:
         return asyncio.run(_load_candles(db_name, table_name, limit, db_host, db_port, db_user, db_pass))
     except Exception as e:
@@ -1117,7 +1187,7 @@ def _live_infra() -> dict:
                 if pool is None:
                     pool = await asyncpg.create_pool(
                         host=db_host, port=db_port, user=db_user, password=db_pass,
-                        database=db_name, min_size=1, max_size=3, command_timeout=15,
+                        database=db_name, min_size=1, max_size=4, command_timeout=15,
                     )
                     async with pool.acquire() as conn:
                         await conn.execute(
@@ -1296,6 +1366,40 @@ def _live_infra() -> dict:
             except Exception:
                 return None
 
+        async def select_recent(db_name, table_name, limit):
+            """Newest `limit` rows of a table, newest-last, on the live pool.
+
+            Same SQL as `_load_candles`, just without a fresh connection per
+            call. Errors come back as {"err": …} rather than as an empty list:
+            the chart reads an empty chunk as 'start of history' and must never
+            be told that by a transport problem.
+            """
+            try:
+                pool = await get_pool(db_name)
+                async with pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        f'SELECT "Timestamp" AS ts, open, high, low, close, volume'
+                        f' FROM "{table_name}"'
+                        f' ORDER BY "Timestamp" DESC LIMIT $1',
+                        int(limit),
+                    )
+            except Exception as e:
+                return {"err": f"{type(e).__name__}: {e}"}
+            return {"rows": list(rows)[::-1]}
+
+        def submit_recent(db, table, limit, timeout=8.0):
+            """Runs select_recent on the live loop and waits for it — this IS
+            the render path, so unlike the publish helpers it must not return
+            before the rows are here. A timeout yields None and the caller
+            falls back to a direct connection."""
+            try:
+                return asyncio.run_coroutine_threadsafe(
+                    select_recent(db, table, limit), loop
+                ).result(timeout=timeout)
+            except Exception as e:
+                return {"err": f"{type(e).__name__}: {e}"}
+
+        infra["submit_recent"] = submit_recent
         infra["submit_publish"] = submit_publish
         infra["submit_upsert_nowait"] = submit_upsert_nowait
         infra["submit_upsert"] = submit_upsert
@@ -1795,50 +1899,68 @@ def _warm_pair_caches(
             pass
         _warm_live_snapshot(ticker, exchange_name, ccxt_id, atr_nb)
 
-    # --- Pre-build both neighbour chart pages into the HTML cache -----------
-    # Keys MUST match the render path exactly (same primitives in the same
-    # order), otherwise the flip would miss the cache and rebuild.
-    if chart_ctx:
-        for tf_label, row, lim in (("15m", row_15m, lim15), ("1D", row_1d, lim1d)):
-            if not row:
-                continue
-            step = 900 if tf_label == "15m" else 86400
-            nb_live_db = _live_db_for(row_1d, row_15m)
-            tick_path = (
-                _live_tick_path(nb_live_db, exchange_name, ticker)
-                if chart_ctx.get("interval_ms")
-                else None
+    _warm_chart_pages(
+        chart_ctx, ticker, exchange_name, ccxt_id, row_15m, row_1d, lim15, lim1d
+    )
+
+
+def _warm_chart_pages(chart_ctx, ticker, exchange_name, ccxt_id,
+                      row_15m, row_1d, lim15, lim1d) -> list:
+    """Pre-builds both neighbour chart pages, with keys identical to the render path.
+
+    The keys MUST match exactly (same primitives, same order), or the flip
+    misses the cache and rebuilds — which is what "not instant" means here.
+    Returns the store keys it primed, for tests and for the swap watcher.
+    """
+    if not chart_ctx:
+        return []
+    primed: list = []
+    for tf_label, row, lim in (("15m", row_15m, lim15), ("1D", row_1d, lim1d)):
+        if not row:
+            continue
+        step = 900 if tf_label == "15m" else 86400
+        nb_live_db = _live_db_for(row_1d, row_15m)
+        tick_path = (
+            _live_tick_path(nb_live_db, exchange_name, ticker)
+            if chart_ctx.get("interval_ms")
+            else None
+        )
+        poller = build_live_poller_js(
+            exchange_name, ticker, step,
+            chart_ctx.get("interval_ms", 0),
+            tick_path=tick_path,
+            tick_port=chart_ctx.get("tick_port"),
+        )
+        hist = ""
+        if chart_ctx.get("tick_port"):
+            hist = build_history_loader_js(
+                row["db_name"], row["table_name"], step,
+                chart_ctx["tick_port"], chunk=1200 if tf_label == "15m" else 700,
             )
-            poller = build_live_poller_js(
-                exchange_name, ticker, step,
-                chart_ctx.get("interval_ms", 0),
-                tick_path=tick_path,
-                tick_port=chart_ctx.get("tick_port"),
-            )
-            hist = ""
-            if chart_ctx.get("tick_port"):
-                hist = build_history_loader_js(
-                    row["db_name"], row["table_name"], step,
-                    chart_ctx["tick_port"], chunk=1200 if tf_label == "15m" else 700,
-                )
-            m_db = m_tbl = ""
-            m_lim = 0
-            if tf_label == "1D" and row_15m:
-                m_db, m_tbl = row_15m["db_name"], row_15m["table_name"]
-                m_lim = max(int(lim15), 200)
-            page_kwargs, store_key = _chart_page_args(
-                row, tf_label, int(lim), m_db, m_tbl, m_lim,
-                ccxt_id, ticker, exchange_name,
-                chart_ctx["style"], chart_ctx["height"],
-                chart_ctx["volume"], poller, hist,
-                chart_ctx.get("flat_fill", True),
-            )
-            if chart_ctx["stitch"]:
-                # The neighbour flip must find the PATCHED page ready in the
-                # store (this thread), not build it on the render path.
-                _warm_stitched_page(store_key, page_kwargs)
-            else:
-                _render_chart_html_cached(**page_kwargs, stitch_enabled=False)
+        m_db = m_tbl = ""
+        m_lim = 0
+        if tf_label == "1D" and row_15m:
+            m_db, m_tbl = row_15m["db_name"], row_15m["table_name"]
+            m_lim = max(int(lim15), 200)
+        page_kwargs, store_key = _chart_page_args(
+            row, tf_label, int(lim), m_db, m_tbl, m_lim,
+            ccxt_id, ticker, exchange_name,
+            chart_ctx["style"], chart_ctx["height"],
+            chart_ctx["volume"], poller, hist,
+            chart_ctx.get("flat_fill", True),
+        )
+        if chart_ctx["stitch"]:
+            # The neighbour flip must find the PATCHED page ready in the store
+            # (built here, off the render path). It must ALSO find the plain
+            # page in st.cache_data: a flip that happens before the stitch
+            # landed renders the DB-only page, and priming nothing for it meant
+            # paying two fresh queries plus a full HTML build on the click.
+            _render_chart_html_cached(**page_kwargs, stitch_enabled=False)
+            _warm_stitched_page(store_key, page_kwargs)
+        else:
+            _render_chart_html_cached(**page_kwargs, stitch_enabled=False)
+        primed.append(store_key)
+    return primed
 
 
 # Lifetime of a built chart page — shared by the st.cache_data entry of the
@@ -2260,11 +2382,23 @@ else:
         _entry = st.session_state.get(f"_partial_scan_{_tf}")
         _pm = _entry[1] if _entry and time.time() - _entry[0] < 180 else None
         if _pm:
+            # Honest about WHEN the list gets better: the retry is backed off
+            # while the database stays busy, so "refresh in a moment" would be
+            # a promise the app does not keep.
+            _since = time.time() - _LAST_SCAN_AT.get(_tf, 0.0)
+            _delay = _rescan_delay_sec(_tf)
+            if _since < 5.0:
+                _when = "a full rescan is running now"
+            elif not _LAST_SCAN_AT.get(_tf):
+                _when = f"first retry within {int(_delay)} s"
+            else:
+                _when = f"retry in ~{max(0, int(_delay - _since))} s (backoff)"
             st.warning(
                 f"⏳ {_tf} pair list is incomplete this frame: {_pm.get('rows', 0)}/"
                 f"{_pm.get('tables', 0)} tables fit in the {settings.dash_scan_budget_sec:.0f}s "
-                f"scan budget. A full rescan is running in the background — refresh in a "
-                f"moment. Raise DASH_SCAN_BUDGET_SEC if your collector keeps the DB busy."
+                f"scan budget — {_when}. The charts are unaffected (they query the "
+                f"tables directly). Raise DASH_SCAN_BUDGET_SEC if your collector "
+                f"keeps the DB busy."
             )
 
 # Keep only pairs of the exchanges enabled in the sidebar — charts tab,
@@ -2364,6 +2498,7 @@ def _nav(delta: int):
     instantiated on the next run — directly modifying st.session_state.sym_ticker
     after widget creation raises StreamlitAPIException.
     """
+    _mark_interaction()
     st.session_state.nav_ticker = shift_option(TICKER_OPTIONS, st.session_state.get("sym_ticker"), delta)
     st.rerun()
 
@@ -2388,6 +2523,11 @@ with tab_charts:
 
     with sel_c:
         sym_ticker = st.selectbox("Pair", options=TICKER_OPTIONS, key="sym_ticker", label_visibility="collapsed")
+        if st.session_state.get("_last_viewed_ticker") != sym_ticker:
+            # Picking a pair from the list is as much an interruption as Prev/
+            # Next; the sweep yields for a moment either way (scan_pause_sec).
+            st.session_state["_last_viewed_ticker"] = sym_ticker
+            _mark_interaction()
     with sel_e:
         ex_opts = _unique_sorted(exchanges_for_ticker(df_15m, sym_ticker) + exchanges_for_ticker(df_1d, sym_ticker))
         if not ex_opts or st.session_state.get("sym_ex") not in ex_opts:
