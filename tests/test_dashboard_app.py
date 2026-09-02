@@ -2199,6 +2199,9 @@ def test_a_partial_sweep_resumes_and_carries_what_it_already_read(monkeypatch):
     seen, rows, pool = sweep(names[0:2])
     assert seen == set(names[0:2]) and state["start"] == 1
     assert pool.union_tables[0] == tuple(names[0:2])
+    # a pass that cannot vouch for 4 of the 6 tables says so, and names them
+    assert dapp._SCAN_META["db_rot"]["partial"] is True
+    assert dapp._SCAN_META["db_rot"]["missing_tables"] == 4
 
     seen, rows, pool = sweep(names[2:4])
     # resumed at chunk 1 instead of restarting, and the first chunk's rows are
@@ -2208,13 +2211,81 @@ def test_a_partial_sweep_resumes_and_carries_what_it_already_read(monkeypatch):
     assert state["start"] == 2
 
     seen, rows, pool = sweep(names[4:6])
-    assert seen == set(names) and state["start"] == 0
+    assert seen == set(names)
+    # ...and THIS pass is complete, so the cursor is cleared: every table is
+    # vouched for (read now, or carried from a pass of the same sweep that is
+    # inside the carry window). `partial` used to be `bool(skipped)` — measured
+    # per pass — so a tier whose budget never covers the whole database stayed
+    # "incomplete" forever, kept the badge up, re-read 6 394 of 8 312 tables on
+    # every retry and never got the cheap rescan throttle.
+    assert "start" not in state, state
+    assert dapp._SCAN_META["db_rot"]["partial"] is False
+    assert dapp._SCAN_META["db_rot"]["missing_tables"] == 0
     # carried rows are complete rows: they know their database and tier, so the
     # table they are painted into needs no special case
     assert all(r["db_name"] == "db_rot" and r["volume_tier"] == "HIGH" for r in rows)
 
     meta = dapp._SCAN_META["db_rot"]
     assert meta["answered_chunks"] == 1 and meta["carried_rows"] == 4
+
+
+def test_a_stale_carry_may_not_claim_the_list_is_complete(monkeypatch):
+    """The other half of the same rule, and the reason `partial` is not simply
+    "the union is covered".
+
+    Rows read by a sweep in progress are kept however old, so the pair list can
+    only grow. But being KEPT is not being BELIEVED: a row may vouch for the
+    list only while it is younger than `DASH_SCAN_CARRYOVER_TTL_SEC`. Without
+    that bound a database busy for a day would call a frozen list complete,
+    drop to the 5-minute rescan floor and stop looking at the tables it has not
+    read — a quietly stale dashboard is worse than an honest "incomplete"."""
+    import asyncio
+
+    from dashboard import app as dapp
+
+    names = [f"t{i}_usdt_on_bybit" for i in range(4)]
+    schema = {n: {"Timestamp": "timestamptz"} for n in names}
+    state: dict = {}
+    monkeypatch.setattr(dapp, "_SCAN_INVENTORY", {}, raising=False)
+    # carrying stays ON mid-sweep (that is `_carry_ttl_sec`), but nothing counts
+    # as a fresh answer any more
+    monkeypatch.setattr(dapp.settings, "dash_scan_carryover_ttl_sec", 0.0)
+
+    def sweep(allow):
+        pool = _BusyPool(schema, allow)
+
+        async def fake_create_pool(**kw):
+            return pool
+
+        monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool)
+        rows = asyncio.run(dapp._scan_database(
+            "db_stale", "LOW", "h", 1, "u", "p",
+            pool_size=1, chunk_size=2, budget_sec=10.0, sweep=state,
+        ))
+        return {r["table_name"] for r in rows}
+
+    assert sweep(names[0:2]) == set(names[0:2])
+    # the list grows (rows are carried) while the CLAIM stays partial
+    assert sweep(names[2:4]) == set(names)
+    meta = dapp._SCAN_META["db_stale"]
+    assert meta["rows"] == 4 and meta["carried_rows"] == 2
+    assert meta["partial"] is True and meta["missing_tables"] == 2
+    assert "start" in state             # and the sweep keeps its place (unlike a
+    assert state["start"] == 0          # complete pass, which clears the cursor)
+
+    assert dapp._carry_ttl_sec(state) == float("inf")     # still not expiring them
+    assert dapp._carry_ttl_sec({}) == 0.0                   # wrapped: the TTL rules
+
+
+def test_unanswered_tables_counts_an_empty_table_as_an_answer():
+    from dashboard.app import _unanswered_tables
+
+    tables = {"a": {}, "b": {}, "c": {}}
+    # a chunk query that came back with no rows IS an answer (a pair table with
+    # no candles is normal, and it must not keep the tier "incomplete" forever)
+    assert set(_unanswered_tables(tables, {"a", "b", "c"}, set())) == set()
+    assert set(_unanswered_tables(tables, {"a"}, {"b"})) == {"c"}
+    assert set(_unanswered_tables(tables, set(), set())) == {"a", "b", "c"}
 
 
 def test_carried_rows_expire_and_follow_the_inventory():

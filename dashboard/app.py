@@ -353,6 +353,17 @@ def _carry_ttl_sec(sweep: dict = None) -> float:
 _MISSING_RELATION_RE = re.compile(r'relation "([^"]+)" does not exist')
 
 
+def _unanswered_tables(tables, answered, carried_fresh) -> list:
+    """Tables this sweep cannot vouch for — the definition of a truncated list.
+
+    `answered` is every table whose chunk query came back (empty result included:
+    a pair table with no candles is an answer); `carried_fresh` is every table an
+    earlier pass of this same sweep read recently enough to still be believed.
+    Anything else is a hole, and the UI has to say so.
+    """
+    return [t for t in tables if t not in answered and t not in carried_fresh]
+
+
 def forget_missing_relations(db_name: str, db_host: str, db_port: int,
                              tables: dict, err) -> list:
     """Drop the tables a failed query proved are gone, from this scan and from
@@ -518,6 +529,13 @@ async def _scan_database(
         errors: list = []
         skipped: list = []
         out: list = []
+        # Tables this sweep has a DIRECT answer for: their chunk query returned,
+        # whether or not it produced rows (an empty pair table is an answer, and
+        # `partial` used to treat "the budget cut the sweep" as a missing answer
+        # even when the carry covered it — which is why the pair list sat at
+        # "6514/8312 … a full rescan is running now" forever and re-read 6 394
+        # tables every retry to fill in 1 798.)
+        answered: set = set()
         recovery_cap = max(0, int(settings.dash_scan_recovery_max_tables))
         # Total time this sweep may spend yielding to clicks. A cap, so
         # interactivity never turns into "the pair list never completes".
@@ -568,7 +586,9 @@ async def _scan_database(
             if not sql:
                 return []
             try:
-                return await _fetch_union(sql)
+                rows_out = await _fetch_union(sql)
+                answered.update(chunk)
+                return rows_out
             except Exception as e:
                 errors.append((f"chunk[{len(chunk)}]", f"{type(e).__name__}: {e}"))
                 if forget_missing_relations(db_name, db_host, db_port, tables, e):
@@ -592,7 +612,9 @@ async def _scan_database(
                     chunk, _EXPECTED_SUMMARY_KEYS, force_text=True
                 )
                 try:
-                    return await _fetch_union(retry_sql)
+                    rows_out = await _fetch_union(retry_sql)
+                    answered.update(chunk)      # flattened to TEXT, but answered
+                    return rows_out
                 except Exception as e2:
                     errors.append((f"chunk[{len(chunk)}]:text", f"{type(e2).__name__}: {e2}"))
                     if forget_missing_relations(db_name, db_host, db_port, tables, e2):
@@ -607,6 +629,7 @@ async def _scan_database(
                 left = deadline - time.time()
                 if left < 1.0:
                     break
+                n_err = len(errors)
                 d = await _summary_row_for_table(
                     pool, tbl, sem, errors,
                     timeout_sec=min(8.0, max(0.5, left)),
@@ -615,6 +638,8 @@ async def _scan_database(
                 if d:
                     d["table_name"] = tbl
                     recovered.append(d)
+                if len(errors) == n_err:
+                    answered.add(tbl)   # no error = "no rows", not "no answer"
             return recovered
 
         chunks = list(chunked(tables, chunk_size))
@@ -643,12 +668,23 @@ async def _scan_database(
 
         secs = time.time() - started
         sweep_secs = max(0.0, secs - catalog_secs)
-        # 'partial' means "this frame is NOT the truth about the database":
-        # either the budget cut the sweep short, or tables reported errors while
-        # rows are missing. Empty tables alone never set it — they are normal.
-        partial = bool(skipped) or time.time() > deadline or (
-            bool(errors) and len(out) < len(tables)
-        )
+        # 'partial' is a statement about the LIST, not about this pass: it is
+        # partial while some table has neither a row from this sweep nor a
+        # carried row from an earlier pass of the same sweep. Carried rows are
+        # kept across a whole sweep however old (so the list never shrinks), but
+        # they may only vouch for the list while they are younger than the
+        # carry-over TTL — otherwise a database busy for days would call a frozen
+        # list "complete" and stop trying, which is the other way a dashboard
+        # lies. Empty tables and a budget that ended a COVERED sweep are not
+        # partial: they are the truth, read in pieces.
+        carry_ttl = float(settings.dash_scan_carryover_ttl_sec)
+        now_after = time.time()
+        fresh_carry = {
+            tbl for tbl, entry in ((sweep.get("rows") or {}).items() if sweep else ())
+            if now_after - float(entry[0]) <= carry_ttl
+        }
+        missing = _unanswered_tables(tables, answered, fresh_carry)
+        partial = bool(missing)
         if sweep is not None and n_chunks:
             # Remember where to continue. A sweep that answered nothing keeps its
             # position (those tables still have to be read); one that answered
@@ -675,6 +711,12 @@ async def _scan_database(
             "carried_rows": carried,
             "answered_chunks": answered_chunks,
             "chunk_start": start,
+            # What the badge needs in order to describe the hole instead of
+            # waving at it: how many tables this sweep cannot vouch for, which
+            # three to name, and how long carried rows are believed at all.
+            "missing_tables": len(missing),
+            "missing_sample": list(missing[:3]),
+            "carry_ttl": _carry_ttl_sec(sweep),
         }
         tail = f" (+catalog {catalog_secs:.1f}s)" if catalog_secs > 1.0 else ""
         if errors:
@@ -703,10 +745,17 @@ async def _scan_database(
                     f"; next sweep continues at chunk {sweep.get('start', 0)}/{n_chunks}"
                     + (f" ({carried} row(s) carried)" if carried else "")
                 )
+            # Two different reasons for the same-looking retry, and the log has
+            # to tell them apart: rows missing from the list, versus a list that
+            # looks full but is being held up by rows carried from earlier passes
+            # (which is why `rendering 4/4 tables` can still be a retry).
+            held = ""
+            if carried and missing:
+                held = f", {len(missing)} of them only carried from earlier passes"
             print(
                 f"[scan] {db_name}: {budget_sec:.0f}s budget exhausted — rendering "
                 f"{len(out)}/{len(tables)} tables ({len(skipped)} chunk(s) skipped on "
-                f"budget/busy db); the list will be retried with backoff{resume}",
+                f"budget/busy db{held}); the list will be retried with backoff{resume}",
                 flush=True,
             )
         return out
@@ -758,6 +807,8 @@ async def _load_summary(db_host, db_port, db_user, db_pass, timeframe: str) -> p
         # sweep that ADDS tables must not be paced by the failure backoff, while
         # one that gets nothing on a loaded server must be.
         "answered_chunks": sum(m.get("answered_chunks", 0) for m in metas),
+        "missing_tables": sum(m.get("missing_tables", 0) for m in metas),
+        "carry_ttl": max([m.get("carry_ttl") or 0.0 for m in metas] or [0.0]),
         "sweep_incomplete": any("start" in _SCAN_SWEEP_STATE.get(db, {})
                                 for _, db in dbs),
     }
@@ -3219,15 +3270,31 @@ else:
             else:
                 _when = f"retry in ~{max(0, int(_delay - _since))} s (backoff)"
             _fresh = _pm.get("rows", 0) - _pm.get("carried_rows", 0)
-            _carried = (
-                f", {_pm['carried_rows']} of them carried from the previous sweeps "
-                f"of this database (for up to {settings.dash_scan_carryover_ttl_sec:.0f}s)"
-                if _pm.get("carried_rows") else ""
-            )
+            # The carry window is not the setting as printed: while a sweep is
+            # still unfinished the rows it has read are kept until it wraps (that
+            # is what stops the pair list from shrinking mid-pass), so "for up to
+            # 900s" would describe a rule the app is deliberately not applying.
+            _ct = float(_pm.get("carry_ttl") or 0.0)
+            if _ct == float("inf"):
+                _win = "until this sweep wraps"
+            else:
+                _win = f"for up to {_ct:.0f}s"
+            _carried = ""
+            if _pm.get("carried_rows"):
+                _carried = (f", {_pm['carried_rows']} of them carried from the "
+                            f"previous sweeps of this database ({_win})")
+            _holes = int(_pm.get("missing_tables") or 0)
+            _holes_txt = ""
+            if _holes:
+                _sample = list(_pm.get("missing_sample") or [])
+                _holes_txt = f" \u2014 {_holes} table(s) still unanswered"
+                if _sample:
+                    _more = "…" if _holes > len(_sample) else ""
+                    _holes_txt += f" ({', '.join(_sample)}{_more})"
             st.warning(
                 f"⏳ {_tf} pair list is incomplete this frame: {_pm.get('rows', 0)}/"
                 f"{_pm.get('tables', 0)} tables have an answer — the budget read "
-                f"{_fresh} of them this sweep{_carried} "
+                f"{_fresh} of them this sweep{_carried}{_holes_txt} "
                 f"({settings.dash_scan_budget_sec:.0f}s scan budget) — {_when}. "
                 f"The charts are unaffected (they query the "
                 f"tables directly). Raise DASH_SCAN_BUDGET_SEC if your collector "
