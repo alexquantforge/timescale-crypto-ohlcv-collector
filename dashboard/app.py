@@ -1642,7 +1642,7 @@ def _warm_pair_caches(
             if tf_label == "1D" and row_15m:
                 m_db, m_tbl = row_15m["db_name"], row_15m["table_name"]
                 m_lim = max(int(lim15), 200)
-            cache_args, store_key = _chart_page_args(
+            page_kwargs, store_key = _chart_page_args(
                 row, tf_label, int(lim), m_db, m_tbl, m_lim,
                 ccxt_id, ticker, exchange_name,
                 chart_ctx["style"], chart_ctx["height"],
@@ -1652,9 +1652,9 @@ def _warm_pair_caches(
             if chart_ctx["stitch"]:
                 # The neighbour flip must find the PATCHED page ready in the
                 # store (this thread), not build it on the render path.
-                _warm_stitched_page(store_key, cache_args)
+                _warm_stitched_page(store_key, page_kwargs)
             else:
-                _render_chart_html_cached(*cache_args, stitch_enabled=False)
+                _render_chart_html_cached(**page_kwargs, stitch_enabled=False)
 
 
 # Lifetime of a built chart page — shared by the st.cache_data entry of the
@@ -1690,22 +1690,50 @@ def _chart_page_args(
     chart_style, chart_height, show_volume, poller_js, hist_js, flat_fill,
 ):
     """
-    (cache_args, store_key) for one chart page, from ONE list of values.
+    (builder_kwargs, store_key) for one chart page, from ONE list of values.
 
     The neighbour warm and the render path must agree on the identity of a
     chart page bit for bit, or the flip misses and rebuilds — so both derive
     their arguments here instead of spelling the same 20 parameters twice.
-    The store key is the same tuple without the DB credentials (they are not
+
+    Everything is passed BY NAME on purpose. The builder takes 22 arguments and
+    `stitch_enabled` sits in the MIDDLE of its signature, so a positional
+    tuple here silently shifts `live_poller_js` onto it:
+        TypeError: _render_chart_html_cached() got multiple values for
+        argument 'stitch_enabled'
+    — which is exactly what this helper introduced once, on a path no unit test
+    covered (the crash needs a real DB row, demo mode takes the other branch).
+    `_chart_page_args` is now bound against the real signature in the test
+    suite, so the keyword names below are checked, not eyeballed.
+
+    The store key is the same values WITHOUT the DB credentials (they are not
     part of a page's identity, and copying them into a long-lived dict would
     keep a password alive for the process lifetime).
     """
-    core = (
-        row["db_name"], row["table_name"], _safe_max_ts(row), tf_label, int(limit),
-        m_db, m_tbl, int(m_lim), ccxt_id, sym_ticker, sym_ex, chart_style,
-        int(chart_height), bool(show_volume), poller_js or "", hist_js or "",
-        bool(flat_fill),
-    )
-    return (db_host, db_port, db_user, db_pass) + core, core
+    params = {
+        "db_name": row["db_name"],
+        "table_name": row["table_name"],
+        "max_ts": _safe_max_ts(row),
+        "tf_label": tf_label,
+        "limit": int(limit),
+        "merge_db": m_db,
+        "merge_table": m_tbl,
+        "merge_limit": int(m_lim),
+        "ccxt_id": ccxt_id,
+        "sym_ticker": sym_ticker,
+        "sym_ex": sym_ex,
+        "chart_style": chart_style,
+        "chart_height": int(chart_height),
+        "show_volume": bool(show_volume),
+        "live_poller_js": poller_js or "",
+        "history_loader_js": hist_js or "",
+        "flat_fill": bool(flat_fill),
+    }
+    # dict order == insertion order == the key: one source of truth, and a
+    # missing/renamed parameter breaks the signature test instead of quietly
+    # producing a key that never matches the warm.
+    return dict(db_host=db_host, db_port=db_port, db_user=db_user,
+                db_pass=db_pass, **params), tuple(params.values())
 
 
 def _remember(store: dict, key, value, limit: int = _PAGE_STORE_LIMIT) -> None:
@@ -1730,7 +1758,7 @@ def _stitched_candle_count(txt: str) -> int:
         return 0
 
 
-def _warm_stitched_page(store_key, cache_args) -> int:
+def _warm_stitched_page(store_key: tuple, page_kwargs: dict) -> int:
     """
     Builds the gap-stitched chart page in a BACKGROUND thread and stores it.
 
@@ -1742,7 +1770,7 @@ def _warm_stitched_page(store_key, cache_args) -> int:
     user's zoom.
     """
     try:
-        res = _render_chart_html_cached.__wrapped__(*cache_args, stitch_enabled=True)
+        res = _render_chart_html_cached.__wrapped__(**page_kwargs, stitch_enabled=True)
     except Exception:
         return 0
     html, txt = (res or ("", ""))
@@ -2324,7 +2352,7 @@ with tab_charts:
             if tf_label == "1D" and row_15m is not None:
                 m_db, m_tbl = row_15m["db_name"], row_15m["table_name"]
                 m_lim = max(limit_15m, 200)
-            cache_args, store_key = _chart_page_args(
+            page_kwargs, store_key = _chart_page_args(
                 row, tf_label, limit, m_db, m_tbl, m_lim,
                 ccxt_id, sym_ticker, sym_ex,
                 chart_style, chart_height, bool(show_volume),
@@ -2341,7 +2369,7 @@ with tab_charts:
                 time.time(), CHART_PAGE_TTL_SEC,
             )
             if should_warm:
-                _bg(("stitch", store_key), _warm_stitched_page, store_key, cache_args)
+                _bg(("stitch", store_key), _warm_stitched_page, store_key, page_kwargs)
                 _CURRENT_CHART_KEYS.add(store_key)
 
             if variant == "stitched":
@@ -2349,9 +2377,7 @@ with tab_charts:
                 html_code, stitch_txt = entry["html"], entry["txt"]
                 _remember(_DISPLAYED_HASH, store_key, entry.get("hash"))
             else:
-                res = _render_chart_html_cached(
-                    *cache_args, stitch_enabled=False,
-                )
+                res = _render_chart_html_cached(**page_kwargs, stitch_enabled=False)
                 if res is None:
                     st.info(f"No {tf_label} candles available for {sym_ticker} ({sym_ex}).")
                     return

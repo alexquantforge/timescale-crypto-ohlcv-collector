@@ -692,7 +692,7 @@ def test_chart_page_args_identity_excludes_credentials():
     for k, v in vars(monkey_src).items():
         setattr(dapp, k, v)
     try:
-        cache_args, store_key = dapp._chart_page_args(
+        page_kwargs, store_key = dapp._chart_page_args(
             row, "15m", 700, "", "", 0, "bybit", "BTC/USDT", "bybit",
             "Candlesticks", 430, False, "POLLER_JS", "HIST_JS", True,
         )
@@ -700,13 +700,57 @@ def test_chart_page_args_identity_excludes_credentials():
         for k, v in saved.items():
             setattr(dapp, k, v)
 
-    assert cache_args[:4] == ("h", 1, "u", "s3cret")   # the cache needs the DB
-    assert "s3cret" not in store_key                    # the store must not hold it
+    assert (page_kwargs["db_host"], page_kwargs["db_port"], page_kwargs["db_user"],
+            page_kwargs["db_pass"]) == ("h", 1, "u", "s3cret")   # cache needs the DB
+    assert "s3cret" not in store_key and "db_pass" not in store_key  # store must not
     assert "btc_usdt_on_bybit" in store_key and "POLLER_JS" in store_key
     # a different pair/exchange/style is a different page
     other = list(store_key)
     other[other.index("Candlesticks")] = "OHLCV Bars"
     assert tuple(other) != store_key
+
+
+def test_chart_page_kwargs_bind_to_the_builder_signature():
+    """`_chart_page_args` must produce kwargs the real builder accepts.
+
+    Regression for the crash this helper caused: the page identity was passed
+    as a POSITIONAL tuple while `stitch_enabled` sits in the middle of the
+    builder's 22-argument signature, so `live_poller_js` landed on it and every
+    chart died with
+
+        TypeError: _render_chart_html_cached() got multiple values for
+        argument 'stitch_enabled'
+
+    No test caught it because demo mode (the only path AppTest can run without
+    a database) takes the other branch. Binding against the live signature is
+    the cheap way to keep that true for the next parameter added.
+    """
+    import inspect
+    from types import SimpleNamespace
+
+    from dashboard import app as dapp
+
+    saved = {k: getattr(dapp, k) for k in ("db_host", "db_port", "db_user", "db_pass")}
+    for k, v in {"db_host": "h", "db_port": 1, "db_user": "u", "db_pass": "p"}.items():
+        setattr(dapp, k, v)
+    try:
+        page_kwargs, store_key = dapp._chart_page_args(
+            {"db_name": "db1", "table_name": "btc_usdt_on_bybit"},
+            "1D", 400, "db1", "btc_usdt_on_bybit", 200, "bybit", "BTC/USDT", "bybit",
+            "OHLCV Bars", 430, True, "P", "H", False,
+        )
+        sig = inspect.signature(dapp._render_chart_html_cached.__wrapped__)
+        sig.bind(**page_kwargs, stitch_enabled=False)     # render path
+        sig.bind(**page_kwargs, stitch_enabled=True)       # background warm
+        sig.bind_partial(**page_kwargs)                    # __wrapped__ call shape
+    finally:
+        for k, v in saved.items():
+            setattr(dapp, k, v)
+
+    # every kwarg name is derived from the signature: no silent renames
+    assert set(page_kwargs) == set(sig.parameters) - {"stitch_enabled"}
+    assert len(store_key) == 17 and all(isinstance(v, (str, int, bool)) for v in store_key)
+    assert hash(store_key)                                   # dict key, must be hashable
 
 
 def test_warm_stitched_page_stores_patch_and_counts_candles(monkeypatch):
@@ -719,15 +763,16 @@ def test_warm_stitched_page_stores_patch_and_counts_candles(monkeypatch):
     def fake_build(*args, stitch_enabled=False, **kw):
         built["n"] += 1
         built["stitch"] = stitch_enabled
+        built["as_kwargs"] = bool(kw) and not args
         return ("<html>patched</html>", "🩹 47 missing 15m candles stitched from exchange (in-memory)")
 
     monkeypatch.setattr(dapp, "_render_chart_html_cached",
                         SimpleNamespace(__wrapped__=fake_build), raising=False)
-    key, args = ("db1.t1.15m",), ("db1", "t1")
+    key, args = ("db1.t1.15m",), {"table_name": "t1", "db_name": "db1"}
 
     assert dapp._warm_stitched_page(key, args) == 47
     # built UNCHACHED, with stitching on (the whole point: not on the UI path)
-    assert built == {"n": 1, "stitch": True}
+    assert built == {"n": 1, "stitch": True, "as_kwargs": True}   # keywords, not positional
     entry = dapp._STITCHED_PAGES[key]
     assert entry["html"] == "<html>patched</html>"
     assert entry["hash"] == hash("<html>patched</html>")
@@ -873,3 +918,59 @@ def test_pg_type_group_accepts_catalog_typnames():
         for i in range(3)
     }
     assert resolve_summary_union_casts(tables, ["close", "ob_spread_pct", "ticker"]) == {}
+
+
+def test_chart_page_actually_builds_from_those_kwargs(tmp_path, monkeypatch):
+    """End-to-end shape check: the real builder, fed by the real kwargs.
+
+    Binding against the signature proves the names exist; this proves the
+    values reach the right PARAMETERS — i.e. that the page that gets built is a
+    chart, not a TypeError, for both variants (DB-only and stitched). It needs
+    no database and no Streamlit app: the candle frame is the only input.
+    """
+    import time as _time
+
+    import pandas as pd
+
+    from dashboard import app as dapp
+
+    now = int(_time.time()) - 3 * 900            # a healthy, recently written table
+    frame = pd.DataFrame({
+        "ts": [now + i * 900 for i in range(6)],
+        "open": [1.0] * 6, "high": [1.1] * 6, "low": [0.9] * 6,
+        "close": [1.05] * 6, "volume": [10.0] * 6,
+    })
+    monkeypatch.setattr(dapp, "load_candles_cached", lambda *a, **kw: frame)
+    fetches = []
+    monkeypatch.setattr(
+        dapp, "_fetch_missing_candles_cached",
+        lambda *a, **kw: fetches.append(a) or [],
+    )
+    for k, v in {"db_host": "h", "db_port": 1, "db_user": "u", "db_pass": "p"}.items():
+        monkeypatch.setattr(dapp, k, v)
+
+    row = {"db_name": "db1", "table_name": "btc_usdt_on_bybit", "max_ts": now + 5 * 900}
+    page_kwargs, store_key = dapp._chart_page_args(
+        row, "15m", 700, "db1", "btc_usdt_on_bybit", 200, "bybit",
+        "BTC/USDT", "bybit", "Candlesticks", 430, True, "POLLER", "HIST", True,
+    )
+
+    html, txt = dapp._render_chart_html_cached.__wrapped__(**page_kwargs, stitch_enabled=False)
+    assert "createChart" in html and len(html) > 2000
+    assert txt == "&nbsp;"                        # nothing stitched, nothing to say
+    assert fetches == []                          # the plain page touches no exchange
+
+    # same kwargs, stitched variant — the ONLY difference is that the stitch runs
+    html2, _ = dapp._render_chart_html_cached.__wrapped__(**page_kwargs, stitch_enabled=True)
+    assert "createChart" in html2
+    assert isinstance(store_key, tuple) and len(store_key) == 17
+
+    # and the warning the progressive paint must NOT swallow: a stale table
+    # with nothing to stitch says so, in red, on the plain page too
+    stale = dict(row, max_ts=now - 200 * 3600)
+    stale_kwargs, _ = dapp._chart_page_args(
+        stale, "15m", 700, "", "", 0, "bybit", "BTC/USDT", "bybit",
+        "Candlesticks", 430, True, "", "", True,
+    )
+    _, txt_stale = dapp._render_chart_html_cached.__wrapped__(**stale_kwargs, stitch_enabled=False)
+    assert "collector" in txt_stale and "behind" in txt_stale
