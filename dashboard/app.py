@@ -16,6 +16,7 @@ Layout: the Charts tab is first — 15m chart on top, 1D chart below, with
 """
 import os
 import re
+import inspect
 import sys
 import json
 import time
@@ -62,6 +63,7 @@ from dashboard.helpers import (
     stitch_candle_gaps,
     fill_missing_bars,
     build_summary_union_sql,
+    coerce_summary_types,
     chunked,
     snapshot_path,
     save_summary_snapshot,
@@ -75,12 +77,39 @@ st.set_page_config(
 )
 
 
+# Whether the installed Streamlit's st.iframe still takes `scrolling`. Probed
+# once (see _html_component); None = not probed yet.
+_IFRAME_SCROLLING: Optional[bool] = None
+
+
 def _html_component(html: str, height: int):
-    """Renders raw HTML: st.iframe on new Streamlit, components.html on older versions."""
-    try:
-        st.iframe(html, height=height, scrolling=False)
-    except (AttributeError, TypeError):
+    """
+    Renders raw HTML: st.iframe on new Streamlit, components.html on older ones.
+
+    Current `st.iframe` has no `scrolling` parameter, so calling it with one
+    raised TypeError on EVERY render, and the except-clause silently kept using
+    the deprecated `components.v1.html` — a wall of "will be removed after
+    2026-06-01" warnings per rerun (hundreds of them while browsing pairs).
+    Ask the signature once instead of using exceptions as control flow: a
+    TypeError thrown from inside a render must not double-render through the
+    legacy path, and each component still needs ITS OWN height (only the
+    keyword support is cached, never the kwargs).
+    """
+    global _IFRAME_SCROLLING
+    iframe = getattr(st, "iframe", None)
+    if iframe is None:
         components.html(html, height=height)
+        return
+    if _IFRAME_SCROLLING is None:
+        try:
+            allowed = set(inspect.signature(iframe).parameters)
+        except (TypeError, ValueError):  # builtins without a signature
+            allowed = set()
+        _IFRAME_SCROLLING = "scrolling" in allowed
+    if _IFRAME_SCROLLING:
+        iframe(html, height=int(height), scrolling=False)
+    else:
+        iframe(html, height=int(height))
 
 SUMMARY_COLUMNS = """
     ticker, exchange, asset_type,
@@ -107,15 +136,20 @@ _EXPECTED_SUMMARY_KEYS = [
 ]
 
 
-async def _summary_row_for_table(pool, tbl: str, sem: asyncio.Semaphore, errors: list):
+async def _summary_row_for_table(
+    pool, tbl: str, sem: asyncio.Semaphore, errors: list, timeout_sec: float = None
+):
     """Last row of one candle table normalized to the summary schema; missing
     columns are padded with None. Returns None for empty/broken tables (broken
     ones are REPORTED into `errors`, never silently skipped)."""
     async with sem:
         try:
-            async with pool.acquire() as conn:
-                row = await conn.fetchrow(
+            async with pool.acquire(timeout=10.0) as conn:
+                fetch = conn.fetchrow(
                     f'SELECT * FROM "{tbl}" ORDER BY "Timestamp" DESC LIMIT 1'
+                )
+                row = await fetch if not timeout_sec else await asyncio.wait_for(
+                    fetch, timeout=max(0.5, float(timeout_sec))
                 )
         except Exception as e:
             errors.append((tbl, f"{type(e).__name__}: {e}"))
@@ -134,9 +168,17 @@ async def _summary_row_for_table(pool, tbl: str, sem: asyncio.Semaphore, errors:
 # Data loading (cached)
 # ---------------------------------------------------------------------------
 
+# Per-database / per-timeframe scan telemetry, filled in by the scan coroutine
+# and read when deciding whether a snapshot may be persisted. Keyed by db name
+# and by timeframe; a module-level dict because `asyncio.run` + the background
+# refresh thread share one process, while st.cache_data would pickle away
+# anything attached to the frame itself.
+_SCAN_META: dict = {}
+
+
 async def _scan_database(
     db_name: str, tier_label: str, db_host, db_port, db_user, db_pass,
-    pool_size: int = 6, chunk_size: int = 120, budget_sec: float = None,
+    pool_size: int = None, chunk_size: int = None, budget_sec: float = None,
 ):
     """
     Last-row summary of every %_on_% table of one database.
@@ -147,10 +189,24 @@ async def _scan_database(
     collector was writing — the queries themselves are trivial, the round
     trips under concurrent write load are not.
 
+    Batching only pays off while the batch query actually RUNS: every chunk is
+    a UNION ALL over 120 heterogeneous tables, so a single TEXT-typed ob_*
+    column (legacy HIGH<->LOW move, old import) used to kill the whole chunk
+    with DatatypeMismatchError and silently drop it back to 120 round trips —
+    the exact cost the batching was written to remove. Hence the scan reads
+    information_schema TYPES as well, so `build_summary_union_sql` can flatten
+    only the offending column, and a chunk that still fails retries once as an
+    all-TEXT query before any per-table recovery is attempted.
+
     Bounded by `budget_sec`: whatever chunks answered in time are returned and
-    the page renders, instead of the user staring at a spinner.
+    the page renders, instead of the user staring at a spinner. The result is
+    flagged in `_SCAN_META` so a truncated scan is never cached as the last
+    good snapshot.
     """
+    started = time.time()
     budget_sec = settings.dash_scan_budget_sec if budget_sec is None else budget_sec
+    pool_size = settings.dash_scan_pool_size if pool_size is None else pool_size
+    chunk_size = settings.dash_scan_chunk_size if chunk_size is None else chunk_size
     try:
         pool = await asyncpg.create_pool(
             host=db_host, port=db_port, user=db_user, password=db_pass,
@@ -161,13 +217,23 @@ async def _scan_database(
 
     try:
         async with pool.acquire() as conn:
+            # Only the projected columns: asking for every column of every
+            # table ships ~30 rows per pair (240k for a 8k-pair database)
+            # before the scan has even started, which is pure queue time while
+            # the collector is writing.
             col_rows = await conn.fetch(
-                "SELECT table_name, column_name FROM information_schema.columns "
-                "WHERE table_schema='public' AND table_name LIKE '%_on_%'"
+                "SELECT table_name, column_name, data_type FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name LIKE '%_on_%' "
+                "AND (column_name = $1 OR column_name = ANY($2::text[]))",
+                "Timestamp", list(_EXPECTED_SUMMARY_KEYS),
             )
+        # table -> {column: data_type}. The TYPES matter: a chunk of 120
+        # heterogeneous tables is UNION ALL'ed, and one TEXT-typed ob_* column
+        # (legacy HIGH<->LOW moves, old imports) makes PostgreSQL reject the
+        # whole query — see resolve_summary_union_casts.
         tables: dict = {}
         for r in col_rows:
-            tables.setdefault(r["table_name"], set()).add(r["column_name"])
+            tables.setdefault(r["table_name"], {})[r["column_name"]] = r["data_type"]
         if not tables:
             return []
 
@@ -176,24 +242,50 @@ async def _scan_database(
         errors: list = []
         out: list = []
 
+        async def _fetch_union(sql: str, timeout: float) -> list:
+            # The query itself is bounded by the SCAN budget, not only by the
+            # pool's command_timeout: with 45 slow chunks and 6 connections,
+            # 30s-per-query stalls alone add up to minutes while the page
+            # renders nothing (asyncpg implements command_timeout the same
+            # way, so cancelling here is a supported path, not a hack).
+            left = max(0.5, float(timeout))
+            async with sem:
+                async with pool.acquire(timeout=min(15.0, left)) as conn:
+                    rows = await asyncio.wait_for(conn.fetch(sql), timeout=left)
+            return [dict(r) for r in rows]
+
         async def run_chunk(chunk: dict):
             if time.time() > deadline:
                 return []
             sql = build_summary_union_sql(chunk, _EXPECTED_SUMMARY_KEYS)
             if not sql:
                 return []
-            async with sem:
+            try:
+                return await _fetch_union(sql, deadline - time.time())
+            except Exception as e:
+                # A type mismatch (or a table the collector just dropped mid
+                # -scan) must not cost the chunk its batching: retry ONCE with
+                # every column flattened to TEXT. That query is type-stable by
+                # construction, and the values are converted back in Python.
+                errors.append((f"chunk[{len(chunk)}]", f"{type(e).__name__}: {e}"))
+                retry_sql = build_summary_union_sql(
+                    chunk, _EXPECTED_SUMMARY_KEYS, force_text=True
+                )
                 try:
-                    async with pool.acquire() as conn:
-                        rows = await conn.fetch(sql)
-                    return [dict(r) for r in rows]
-                except Exception as e:
-                    # One broken table must not lose its whole chunk: fall
-                    # back to the per-table reads for this batch only.
-                    errors.append((f"chunk[{len(chunk)}]", f"{type(e).__name__}: {e}"))
+                    return await _fetch_union(retry_sql, deadline - time.time())
+                except Exception as e2:
+                    errors.append((f"chunk[{len(chunk)}]:text", f"{type(e2).__name__}: {e2}"))
+            # Last resort: per-table reads, but bounded by the remaining budget
+            # — an unbounded 120-query recovery is what turned a slow startup
+            # into a minutes-long one.
             recovered = []
             for tbl in chunk:
-                d = await _summary_row_for_table(pool, tbl, sem, errors)
+                if time.time() > deadline:
+                    break
+                d = await _summary_row_for_table(
+                    pool, tbl, sem, errors,
+                    timeout_sec=min(8.0, max(0.5, deadline - time.time())),
+                )
                 if d:
                     d["table_name"] = tbl
                     recovered.append(d)
@@ -207,10 +299,34 @@ async def _scan_database(
             d["db_name"] = db_name
             d["volume_tier"] = tier_label
 
+        secs = time.time() - started
+        # 'partial' means "this frame is NOT the truth about the database":
+        # either the budget cut the sweep short, or tables reported errors while
+        # rows are missing. Empty tables alone never set it — they are normal.
+        partial = time.time() > deadline or (
+            bool(errors) and len(out) < len(tables)
+        )
+        _SCAN_META[db_name] = {
+            "tables": len(tables),
+            "rows": len(out),
+            "chunks": len(chunks),
+            "fallback_chunks": len([t for t, _ in errors if t.startswith("chunk[")]),
+            "seconds": secs,
+            "partial": partial,
+        }
         if errors:
             preview = "; ".join(f"{t}: {e}" for t, e in errors[:3])
-            print(f"[scan] {db_name}: {len(errors)} chunk(s) fell back to per-table reads: {preview}", flush=True)
-        if time.time() > deadline:
+            print(
+                f"[scan] {db_name}: {len(set(t for t, _ in errors))} chunk(s) needed a "
+                f"retry/per-table fallback ({secs:.1f}s): {preview}",
+                flush=True,
+            )
+        elif secs > 3.0:
+            print(
+                f"[scan] {db_name}: {len(chunks)} chunk(s) / {len(out)} tables in {secs:.1f}s",
+                flush=True,
+            )
+        if partial:
             print(
                 f"[scan] {db_name}: {budget_sec:.0f}s budget exhausted — rendering "
                 f"{len(out)}/{len(tables)} tables (collector is probably writing hard)",
@@ -231,15 +347,29 @@ async def _load_summary(db_host, db_port, db_user, db_pass, timeframe: str) -> p
         *[_scan_database(db, tier, db_host, db_port, db_user, db_pass) for tier, db in dbs]
     )
     all_rows = [r for scan in scans for r in scan]
+    metas = [_SCAN_META.get(db, {}) for _, db in dbs]
+    _SCAN_META[timeframe] = {
+        "partial": bool(metas) and any(m.get("partial") for m in metas),
+        "seconds": max((m.get("seconds") or 0.0) for m in metas) if metas else 0.0,
+        "rows": sum(m.get("rows", 0) for m in metas),
+        "tables": sum(m.get("tables", 0) for m in metas),
+    }
     if not all_rows:
         return pd.DataFrame()
-    return pd.DataFrame(all_rows)
+    # A chunk flattened to TEXT (type-stable UNION) hands back strings; give
+    # the frame its numeric dtypes before anything sorts or formats it.
+    return coerce_summary_types(pd.DataFrame(all_rows))
 
 
 def _scan_summary_now(db_host, db_port, db_user, db_pass, timeframe: str) -> pd.DataFrame:
-    """Full scan + snapshot persist (used by both the sync and the background path)."""
+    """Full scan + snapshot persist (used by both the sync and the background path).
+
+    A scan cut short by the time budget is NOT persisted: caching a truncated
+    pair list as the 'last good snapshot' is how a busy collector quietly
+    shrinks the dashboard from one launch to the next.
+    """
     df = asyncio.run(_load_summary(db_host, db_port, db_user, db_pass, timeframe))
-    if settings.dash_snapshot_enabled:
+    if settings.dash_snapshot_enabled and not _SCAN_META.get(timeframe, {}).get("partial"):
         save_summary_snapshot(
             snapshot_path(settings.dash_snapshot_dir, timeframe), df
         )
@@ -282,7 +412,15 @@ def load_summary_cached(db_host, db_port, db_user, db_pass, timeframe: str) -> p
             return snap
 
     try:
-        return _scan_summary_now(db_host, db_port, db_user, db_pass, timeframe)
+        df = _scan_summary_now(db_host, db_port, db_user, db_pass, timeframe)
+        if _SCAN_META.get(timeframe, {}).get("partial"):
+            # A truncated scan is what the user would otherwise live with for
+            # the full 10-minute cache TTL: render it now, rescan behind.
+            st.session_state[f"_partial_scan_{timeframe}"] = (
+                time.time(), dict(_SCAN_META.get(timeframe, {}))
+            )
+            _refresh_summary_in_background(db_host, db_port, db_user, db_pass, timeframe)
+        return df
     except Exception as e:
         st.error(f"Database connection error: {e}")
         return pd.DataFrame()
@@ -1676,6 +1814,23 @@ if demo_mode:
 else:
     df_15m = load_summary_cached(db_host, db_port, db_user, db_pass, "15m")
     df_1d = load_summary_cached(db_host, db_port, db_user, db_pass, "1d")
+
+    # The scan is bounded by a wall-clock budget so the page paints while the
+    # collector writes; say so when it had to cut the pair list short, instead
+    # of looking like the collector lost pairs.
+    for _tf in ("15m", "1d"):
+        # Stored with a timestamp and self-expiring: the flag is set inside a
+        # cached function, so nothing would ever clear it on a later complete
+        # scan, and mutating session_state while rendering is its own hazard.
+        _entry = st.session_state.get(f"_partial_scan_{_tf}")
+        _pm = _entry[1] if _entry and time.time() - _entry[0] < 180 else None
+        if _pm:
+            st.warning(
+                f"⏳ {_tf} pair list is incomplete this frame: {_pm.get('rows', 0)}/"
+                f"{_pm.get('tables', 0)} tables fit in the {settings.dash_scan_budget_sec:.0f}s "
+                f"scan budget. A full rescan is running in the background — refresh in a "
+                f"moment. Raise DASH_SCAN_BUDGET_SEC if your collector keeps the DB busy."
+            )
 
 # Keep only pairs of the exchanges enabled in the sidebar — charts tab,
 # Prev/Next list, live writer target set and the liquidity table all inherit it.

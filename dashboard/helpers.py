@@ -7,7 +7,8 @@ and a synthetic demo-data generator used when no TimescaleDB is reachable.
 """
 import json
 import os
-from typing import List, Optional, Tuple
+from functools import lru_cache
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -178,16 +179,122 @@ SUMMARY_COLUMN_TYPES = {
 }
 SUMMARY_DEFAULT_TYPE = "double precision"
 
+# Every subquery of the chunk is ordered by "Timestamp" and projects it as
+# `max_ts`, so that column takes part in the UNION type resolution even though
+# it is not part of the requested summary keys.
+SUMMARY_ORDER_COLUMN = "Timestamp"
+SUMMARY_ORDER_ALIAS = "max_ts"
 
-def summary_column_sql(table_columns, column: str) -> str:
-    """One projected column of a per-table subquery (real column or NULL pad)."""
+# PostgreSQL unifies these type families inside a UNION ALL by itself. Two
+# DIFFERENT families in the same projected column (`double precision` vs `text`
+# being the classic) is a hard DatatypeMismatchError for the WHOLE query — i.e.
+# for all 120 tables of the chunk, which then degrades into 120 individual
+# round trips. That is what made the "batched" scan slower than the unbatched
+# one on databases whose legacy tables still carry TEXT-ified ob_* columns.
+_PG_TYPE_GROUPS = {
+    "smallint": "number", "integer": "number", "bigint": "number",
+    "real": "number", "double precision": "number", "numeric": "number",
+    "decimal": "number", "money": "number",
+    "text": "text", "character varying": "text", "character": "text",
+    "bpchar": "text", "name": "text", "citext": "text", "uuid": "text",
+    "boolean": "bool",
+    "date": "time", "timestamp without time zone": "time",
+    "timestamp with time zone": "time", "time without time zone": "time",
+    "time with time zone": "time", "interval": "time",
+    "json": "json", "jsonb": "json",
+}
+
+# Free-text columns the scan must NEVER try to convert to numbers.
+SUMMARY_TEXT_COLUMNS = (
+    "table_name", "db_name", "volume_tier", "ticker", "exchange", "asset_type",
+    "ob_vitality_grade", "open_time_msk", "open_time_almaty",
+    "url_of_trading_pair", "url_of_swap_contract_if_it_exists",
+)
+
+# A TEXT-typed number writes itself as '' when the source value was NULL, and
+# pandas reads that back as a non-null empty string: blanks count as nulls so
+# one legacy row cannot veto the conversion of the whole column.
+SUMMARY_BLANK_TOKENS = frozenset(("", "none", "null", "nan", "nat", "-"))
+SUMMARY_TRUE_TOKENS = frozenset(("true", "t", "yes", "y", "1", "1.0"))
+SUMMARY_FALSE_TOKENS = frozenset(("false", "f", "no", "n"))
+# Never numberified: bool(NaN) is True, so a flag column whose NULLs pandas
+# turned into a float NaN would read as "this market IS a barcode" — a DEAD
+# health chip on every pair that simply has no orderbook snapshot yet.
+SUMMARY_BOOL_COLUMNS = ("ob_is_barcode",)
+
+
+@lru_cache(maxsize=None)
+def _type_family(t: str) -> str:
+    return _PG_TYPE_GROUPS.get(t, t or "unknown")
+
+
+def pg_type_group(data_type) -> str:
+    """information_schema data_type -> UNION-compatibility family.
+
+    Cached: the plan is resolved for every (chunk table x projected column)
+    pair, which on a 8k-pair database is ~10^5 calls per scan — all of them
+    over a handful of distinct type names.
+    """
+    return _type_family((data_type or "").strip().lower())
+
+
+def normalize_summary_table_columns(tables) -> dict:
+    """
+    `tables` -> {table: {column: pg type or None}}.
+
+    Accepts both shapes the scan has historically used: a set of column names
+    (types unknown -> None) or a mapping column -> information_schema
+    `data_type`, which is what makes type-stable batching possible.
+    """
+    out: dict = {}
+    for tbl, cols in tables.items():
+        if isinstance(cols, dict):
+            out[tbl] = {c: (t or None) for c, t in cols.items()}
+        else:
+            out[tbl] = {c: None for c in cols}
+    return out
+
+
+def resolve_summary_union_casts(tables: dict, columns) -> Dict[str, str]:
+    """
+    Cast plan for one chunk: {column: "text"} for every projected column whose
+    type family is NOT uniform across the subqueries of this chunk.
+
+    Uniform (or type-unknown) chunks get an EMPTY plan, so the emitted SQL
+    stays byte-identical to the naive one and PostgreSQL does the work. Only a
+    genuinely mixed column is flattened to TEXT — the values are then converted
+    back in Python by `coerce_summary_types`, which cannot fail.
+    """
+    normalized = normalize_summary_table_columns(tables)
+    plan: Dict[str, str] = {}
+    if not normalized:
+        return plan
+    for col in list(columns) + [SUMMARY_ORDER_COLUMN]:
+        expected = SUMMARY_COLUMN_TYPES.get(col, SUMMARY_DEFAULT_TYPE)
+        groups = set()
+        for cols in normalized.values():
+            # A table without the column is padded with NULL::<expected>, so
+            # it contributes the expected family to the UNION as well.
+            declared = cols.get(col, None) if col in cols else None
+            groups.add(pg_type_group(declared) if declared else pg_type_group(expected))
+        if len(groups) > 1:
+            plan[col] = "text"
+    return plan
+
+
+def summary_column_sql(table_columns, column: str, cast: Optional[str] = None) -> str:
+    """One projected column of a per-table subquery (real column or NULL pad).
+
+    `cast` overrides the projected type for the WHOLE chunk (see
+    `resolve_summary_union_casts`); without it the column is emitted natively.
+    """
     if column in table_columns:
-        return f'"{column}"'
-    pg_type = SUMMARY_COLUMN_TYPES.get(column, SUMMARY_DEFAULT_TYPE)
+        return f'"{column}"::{cast}' if cast else f'"{column}"'
+    pg_type = cast or SUMMARY_COLUMN_TYPES.get(column, SUMMARY_DEFAULT_TYPE)
     return f'NULL::{pg_type} AS "{column}"'
 
 
-def build_summary_union_sql(tables: dict, columns) -> str:
+def build_summary_union_sql(tables: dict, columns, force_text: bool = False) -> str:
     """
     UNION ALL of `last row of table` subqueries for a chunk of tables.
 
@@ -197,19 +304,68 @@ def build_summary_union_sql(tables: dict, columns) -> str:
     load. Batching keeps the exact same result (last row, missing columns
     padded) at ~1/100th of the round trips.
 
-    `tables` maps table_name -> set of its column names. Tables without a
+    `tables` maps table_name -> set of its column names, or -> {column:
+    data_type} when the caller also read information_schema types (strongly
+    preferred: it is what keeps the UNION type-stable). Tables without a
     "Timestamp" column are skipped.
+
+    `force_text` flattens EVERY column to TEXT. It is the cheap second attempt
+    for a chunk that still failed for an unforeseeable type reason: one extra
+    round trip per chunk instead of `len(chunk)` per-table reads.
     """
     parts = []
+    if force_text:
+        plan = {c: "text" for c in list(columns) + [SUMMARY_ORDER_COLUMN]}
+    else:
+        plan = resolve_summary_union_casts(tables, columns)
     for tbl, cols in tables.items():
-        if "Timestamp" not in cols:
+        if SUMMARY_ORDER_COLUMN not in cols:
             continue
-        projected = ", ".join(summary_column_sql(cols, c) for c in columns)
+        projected = ", ".join(
+            summary_column_sql(cols, c, plan.get(c)) for c in columns
+        )
+        order_cast = plan.get(SUMMARY_ORDER_COLUMN)
+        ts = f'"{SUMMARY_ORDER_COLUMN}"'
+        if order_cast:
+            ts = f"{ts}::{order_cast}"
         parts.append(
-            f"(SELECT '{tbl}'::text AS table_name, \"Timestamp\" AS max_ts, {projected}"
-            f' FROM "{tbl}" ORDER BY "Timestamp" DESC LIMIT 1)'
+            f"(SELECT '{tbl}'::text AS table_name, {ts} AS {SUMMARY_ORDER_ALIAS}, {projected}"
+            f' FROM "{tbl}" ORDER BY "{SUMMARY_ORDER_COLUMN}" DESC LIMIT 1)'
         )
     return "\nUNION ALL\n".join(parts)
+
+
+def coerce_summary_types(df):
+    """
+    Restore numeric/boolean dtypes of a summary frame.
+
+    A chunk whose column types disagreed is flattened to TEXT in SQL (that is
+    the price of batching), and a legacy table may hand back a TEXT column on
+    the per-table path too — pandas would then sort `ob_vitality_score`
+    lexicographically and every NumberColumn format would choke on a str.
+
+    A column is converted ONLY when nothing is lost: every value that is not
+    blank/None must parse. A genuinely textual column is therefore left alone
+    instead of being silently erased into NaN.
+    """
+    if df is None or df.empty:
+        return df
+    for col in df.columns:
+        if col in SUMMARY_TEXT_COLUMNS:
+            continue
+        s = df[col]
+        if getattr(s, "dtype", None) is None or s.dtype.kind not in ("O", "S", "U", "f"):
+            continue  # already int / bool / datetime
+        lowered = s.astype(str).str.strip().str.lower()
+        if col in SUMMARY_BOOL_COLUMNS:
+            # 'true'/'false' text, 1/0 floats or plain None -> a real bool
+            df[col] = lowered.isin(SUMMARY_TRUE_TOKENS)
+            continue
+        blank = s.isna() | lowered.isin(SUMMARY_BLANK_TOKENS)
+        conv = pd.to_numeric(s, errors="coerce")
+        if not (conv.isna() & ~blank).any():
+            df[col] = conv
+    return df
 
 
 def chunked(items, size: int):
@@ -262,7 +418,7 @@ def load_summary_snapshot(path: str, max_age_sec: float):
         age = _time.time() - os.path.getmtime(path)
         if age > float(max_age_sec):
             return None, None
-        return pd.read_pickle(path), age
+        return coerce_summary_types(pd.read_pickle(path)), age
     except Exception:
         return None, None
 

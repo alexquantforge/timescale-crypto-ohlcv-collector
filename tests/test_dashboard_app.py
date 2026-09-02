@@ -138,7 +138,7 @@ def test_summary_row_for_table_pads_missing_ob_columns():
             }
 
     class _Pool:
-        def acquire(self):
+        def acquire(self, *a, **kw):  # the scan passes acquire(timeout=...)
             conn = _Conn()
 
             class _A:
@@ -175,7 +175,7 @@ def test_summary_row_for_table_reports_broken_table():
             raise RuntimeError("relation is corrupted")
 
     class _Pool:
-        def acquire(self):
+        def acquire(self, *a, **kw):  # the scan passes acquire(timeout=...)
             conn = _Conn()
 
             class _A:
@@ -334,3 +334,328 @@ def test_stitch_fetch_honours_its_time_budget(monkeypatch):
 
     assert elapsed < 2.0
     assert _SlowExchange.calls < 40  # stopped early instead of paging 40 times
+
+
+# ---------------------------------------------------------------------------
+# Summary scan: batching must survive a heterogeneous database.
+#
+# Every chunk of the scan is ONE `UNION ALL` over ~120 per-table subqueries.
+# PostgreSQL resolves the type of each projected column across all branches,
+# and a legacy table whose ob_* column is TEXT (an old HIGH<->LOW move that
+# TEXT-ified them) made the whole chunk die with
+#   DatatypeMismatchError: UNION types double precision and text cannot be matched
+# The scan then did 120 per-table reads FOR THAT CHUNK — the exact cost the
+# batching was invented to remove, and the reason the dashboard's first paint
+# took minutes on a database with a few thousand of those tables.
+# ---------------------------------------------------------------------------
+
+
+def _union_is_type_stable(sql: str, schema: dict) -> bool:
+    """Re-implements PostgreSQL's UNION type check for the generated SQL.
+
+    Returns True when every projected column exposes the same type family in
+    every branch (which is what makes the chunk a single round trip).
+    """
+    from dashboard.helpers import pg_type_group
+
+    families: dict = {}
+    for branch in sql.split("\nUNION ALL\n"):
+        inner = branch.split("SELECT", 1)[1].split(" FROM ", 1)[0]
+        for idx, expr in enumerate(p.strip() for p in inner.split(", ")):
+            if "::" in expr:
+                typ = expr.split("::", 1)[1].split(" AS ")[0].strip()
+                fam = pg_type_group(typ)
+            else:
+                col = expr.strip('"')
+                tbl = branch.split('FROM "', 1)[1].split('"', 1)[0]
+                fam = pg_type_group(schema[tbl].get(col, "double precision"))
+            if idx not in families:
+                families[idx] = fam
+            elif families[idx] != fam:
+                return False
+    return True
+
+
+class _FakeScanPool:
+    """asyncpg pool stand-in that REFUSES an unstable UNION, like Postgres does."""
+
+    def __init__(self, schema, *, break_unions=False, break_rows=False):
+        # break_unions: False | "first" (only the native projection dies, the
+        # all-TEXT retry works) | True (the chunk is simply unqueryable).
+        self.schema = schema
+        self.break_unions = break_unions
+        self.break_rows = break_rows
+        self.union_queries: list = []
+        self.per_table_reads = 0
+
+    def acquire(self, *a, **kw):
+        outer = self
+
+        class _Conn:
+            async def fetch(self, query, *args):
+                # *args: the schema lookup is a PARAMETERIZED query (the column
+                # list is bound, not interpolated) — keep the fake honest about it.
+                if "information_schema" in query:
+                    if args:
+                        assert args[0] == "Timestamp" and "Timestamp" not in args[1]
+                    return [
+                        {"table_name": t, "column_name": c, "data_type": dt}
+                        for t, cols in outer.schema.items()
+                        for c, dt in cols.items()
+                    ]
+                outer.union_queries.append(query)
+                if outer.break_unions is True or (
+                    outer.break_unions == "first" and len(outer.union_queries) == 1
+                ):
+                    raise RuntimeError("relation disappeared mid-scan")
+                if not _union_is_type_stable(query, outer.schema):
+                    raise RuntimeError(
+                        "UNION types double precision and text cannot be matched"
+                    )
+                tables = [t for t in outer.schema if f"'{t}'::text" in query]
+                return [outer._row(t) for t in tables]
+
+            async def fetchrow(self, query, *args):
+                outer.per_table_reads += 1
+                if outer.break_rows:
+                    raise RuntimeError("relation disappeared mid-scan")
+                tbl = query.split('FROM "', 1)[1].split('"', 1)[0]
+                return outer._row(tbl, table_name=tbl)
+
+        class _Acquire:
+            async def __aenter__(self):
+                return _Conn()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Acquire()
+
+    def _row(self, tbl, table_name=None):
+        row = {"table_name": table_name or tbl, "max_ts": 1_787_700_000}
+        for col in self.schema[tbl]:
+            if col == "Timestamp":
+                row["Timestamp"] = 1_787_700_000
+            elif self.schema[tbl][col] == "text":
+                row[col] = "42.5"          # TEXT-typed number, as legacy tables store it
+            else:
+                row[col] = 42.5
+        return row
+
+    async def close(self):
+        pass
+
+
+def _run_scan(monkeypatch, pool, **kwargs):
+    import asyncio
+
+    from dashboard import app as dapp
+
+    async def fake_create_pool(**kw):
+        return pool
+
+    monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool)
+    kwargs.setdefault("budget_sec", 10.0)
+    return asyncio.run(
+        dapp._scan_database("db_test", "HIGH", "h", 1, "u", "p",
+                            pool_size=2, chunk_size=120, **kwargs)
+    )
+
+
+def test_scan_casts_mixed_columns_instead_of_falling_back(monkeypatch):
+    """The chunk is served by ONE query even with TEXT-typed legacy columns."""
+    schema = {
+        "btc_usdt_on_bybit": {
+            "Timestamp": "bigint", "ticker": "text", "close": "double precision",
+            "ob_vitality_score": "double precision", "ob_is_barcode": "boolean",
+        },
+        "old_spot_usdt_on_gateio": {          # legacy TEXT-ified metrics
+            "Timestamp": "bigint", "ticker": "text", "close": "double precision",
+            "ob_vitality_score": "text", "ob_is_barcode": "text",
+        },
+        "fresh_usdt:usdt_on_okx": {           # perp: no ob_* columns at all
+            "Timestamp": "bigint", "ticker": "text", "close": "double precision",
+        },
+    }
+    pool = _FakeScanPool(schema)
+    rows = _run_scan(monkeypatch, pool)
+
+    assert len(rows) == 3
+    assert len(pool.union_queries) == 1, "one round trip per chunk, no degradation"
+    assert pool.per_table_reads == 0
+    assert '"ob_vitality_score"::text' in pool.union_queries[0]
+    assert all('"db_test"' not in r or r["db_name"] == "db_test" for r in rows)
+    assert {r["volume_tier"] for r in rows} == {"HIGH"}
+
+
+def test_scan_retries_a_broken_chunk_as_text_before_per_table_reads(monkeypatch):
+    """A chunk that fails for any other reason gets a type-stable retry, not
+    120 single-table queries."""
+    schema = {
+        f"p{i}_usdt_on_bybit": {"Timestamp": "bigint", "ticker": "text", "close": "numeric"}
+        for i in range(3)
+    }
+    pool = _FakeScanPool(schema, break_unions="first")
+    rows = _run_scan(monkeypatch, pool)
+
+    assert len(pool.union_queries) == 2            # native attempt + all-TEXT retry
+    assert '"close"::text' in pool.union_queries[1]
+    assert pool.per_table_reads == 0               # never reached
+    assert len(rows) == 3
+
+
+def test_scan_per_table_recovery_is_bounded_and_reports(monkeypatch):
+    """When even the all-TEXT chunk dies, recovery is per-table and the broken
+    tables are REPORTED — and an exhausted budget stops the recovery loop."""
+    import asyncio
+
+    from dashboard import app as dapp
+
+    schema = {
+        f"p{i}_usdt_on_bybit": {"Timestamp": "bigint", "ticker": "text", "close": "double precision"}
+        for i in range(3)
+    }
+    pool = _FakeScanPool(schema, break_unions=True, break_rows=True)
+
+    async def fake_create_pool(**kw):
+        return pool
+
+    monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool)
+    rows = asyncio.run(
+        dapp._scan_database("db_x", "LOW", "h", 1, "u", "p",
+                            pool_size=2, chunk_size=120, budget_sec=10.0)
+    )
+    assert rows == []
+    assert pool.per_table_reads == 3               # tried each table, each failed
+    meta = dapp._SCAN_META["db_x"]
+    # errors + missing rows => the frame is not the truth: never cache it
+    assert meta["partial"] is True and meta["tables"] == 3 and meta["rows"] == 0
+
+    # a zero budget must not issue a single chunk query at all
+    pool2 = _FakeScanPool(schema)
+    rows2 = asyncio.run(
+        dapp._scan_database("db_y", "LOW", "h", 1, "u", "p",
+                            pool_size=2, chunk_size=120, budget_sec=0.0)
+    )
+    assert rows2 == [] and pool2.union_queries == []
+    assert dapp._SCAN_META["db_y"]["partial"] is True
+
+
+def test_partial_scan_is_not_persisted_as_the_snapshot(monkeypatch):
+    """A truncated scan renders, but never overwrites the last good snapshot."""
+    import pandas as pd
+
+    from dashboard import app as dapp
+
+    saved: list = []
+    monkeypatch.setattr(dapp, "snapshot_path", lambda directory, tf: f"/tmp/{tf}.pkl")
+    monkeypatch.setattr(
+        dapp, "save_summary_snapshot",
+        lambda path, df: saved.append(path) or True,
+    )
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_enabled", True, raising=False)
+
+    df = pd.DataFrame([{"ticker": "BTC/USDT", "close": 1.0}])
+
+    async def fake_load(*a, **kw):
+        return df
+
+    monkeypatch.setattr(dapp, "_load_summary", fake_load)
+
+    dapp._SCAN_META["15m"] = {"partial": True, "rows": 10, "tables": 99, "seconds": 25.0}
+    dapp._scan_summary_now("h", 1, "u", "p", "15m")
+    assert saved == []
+
+    dapp._SCAN_META["15m"] = {"partial": False, "rows": 99, "tables": 99, "seconds": 3.0}
+    dapp._scan_summary_now("h", 1, "u", "p", "15m")
+    assert saved == ["/tmp/15m.pkl"]
+
+
+def test_html_component_prefers_st_iframe_without_pinning_height(monkeypatch):
+    """Two regressions at once: `components.html` (deprecated, one console
+    warning per call — hundreds while browsing pairs) must not be selected just
+    because the new API dropped the `scrolling` kwarg, and the cached signature
+    probe must not pin the FIRST chart's height for every later component."""
+    import types
+
+    from dashboard import app as dapp
+
+    iframe_calls: list = []
+    legacy_calls: list = []
+
+    def fake_iframe(src, *, width="stretch", height="content"):
+        iframe_calls.append(height)
+
+    monkeypatch.setattr(dapp, "_IFRAME_SCROLLING", None, raising=False)
+    monkeypatch.setattr(dapp, "st", types.SimpleNamespace(iframe=fake_iframe))
+    monkeypatch.setattr(
+        dapp.components, "html", lambda html, height=None: legacy_calls.append(height)
+    )
+
+    dapp._html_component("<a>", 470)
+    dapp._html_component("<b>", 300)
+    assert iframe_calls == [470, 300]      # per-call height, no keyword reuse
+    assert legacy_calls == []              # st.iframe exists -> no legacy path
+
+    # an old Streamlit without st.iframe still renders through components.html
+    monkeypatch.setattr(dapp, "st", types.SimpleNamespace())
+    dapp._html_component("<c>", 250)
+    assert legacy_calls == [250]
+
+
+def test_scan_aborts_chunks_that_never_answer(monkeypatch):
+    """The budget must bound the QUERY, not only its scheduling.
+
+    With a database under heavy write load, chunks time out — and the pool's
+    own command_timeout (30 s) per chunk, repeated over dozens of chunks, is a
+    minute of spinner for a page that then renders a partial list anyway. The
+    scan cancels each chunk at the remaining budget instead.
+    """
+    import asyncio
+    import time as _time
+
+    from dashboard import app as dapp
+
+    schema = {f"p{i}_usdt_on_bybit": {"Timestamp": "bigint", "ticker": "text"} for i in range(3)}
+
+    class _Conn:
+        async def fetch(self, query, *args):
+            if "information_schema" in query:
+                return [
+                    {"table_name": t, "column_name": c, "data_type": dt}
+                    for t, cols in schema.items() for c, dt in cols.items()
+                ]
+            await asyncio.sleep(10)  # a chunk PostgreSQL never answers in time
+            return []
+
+        async def fetchrow(self, query, *args):  # pragma: no cover - must not run
+            raise AssertionError("per-table reads must be skipped once the budget is gone")
+
+    class _Pool:
+        def acquire(self, *a, **kw):
+            class _A:
+                async def __aenter__(self):
+                    return _Conn()
+
+                async def __aexit__(self, *exc):
+                    return False
+
+            return _A()
+
+        async def close(self):
+            pass
+
+    async def fake_create_pool(**kw):
+        return _Pool()
+
+    monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool)
+    started = _time.time()
+    rows = asyncio.run(
+        dapp._scan_database("db_slow", "HIGH", "h", 1, "u", "p",
+                            pool_size=2, chunk_size=120, budget_sec=0.2)
+    )
+    elapsed = _time.time() - started
+
+    assert rows == []
+    assert elapsed < 3.0, f"budget did not bound the query: {elapsed:.1f}s"
+    assert dapp._SCAN_META["db_slow"]["partial"] is True

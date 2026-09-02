@@ -891,3 +891,128 @@ def test_summary_snapshot_round_trip(tmp_path):
     assert load_summary_snapshot(path, max_age_sec=0.0) == (None, None)
     assert load_summary_snapshot(str(tmp_path / "nope.pkl"), 3600) == (None, None)
     assert save_summary_snapshot(path, pd.DataFrame()) is False
+
+
+# ---------------------------------------------------------------------------
+# Type-stable UNION batching (the "dashboard starts in minutes" regression)
+#
+# The scan batches 120 tables into ONE UNION ALL query. PostgreSQL resolves the
+# column types across all branches, so a single legacy table whose ob_* column
+# is TEXT (old HIGH<->LOW move) rejected the WHOLE chunk with
+# `DatatypeMismatchError: UNION types double precision and text cannot be
+# matched` — and the fallback then paid 120 individual round trips per chunk,
+# which is exactly what batching was supposed to remove.
+# ---------------------------------------------------------------------------
+
+def test_resolve_summary_union_casts_flags_only_mixed_columns():
+    from dashboard.helpers import resolve_summary_union_casts
+
+    cols = ["ticker", "close", "ob_vitality_score", "ob_is_barcode"]
+    # uniform chunk: nobody needs a cast -> SQL stays as it always was
+    uniform = {
+        "a_usdt_on_bybit": {"Timestamp": "bigint", "ticker": "text",
+                            "close": "double precision", "ob_vitality_score": "double precision",
+                            "ob_is_barcode": "boolean"},
+        "b_usdt_on_bybit": {"Timestamp": "bigint", "ticker": "text",
+                            "close": "double precision", "ob_vitality_score": "double precision",
+                            "ob_is_barcode": "boolean"},
+    }
+    assert resolve_summary_union_casts(uniform, cols) == {}
+
+    mixed = dict(uniform)
+    mixed["c_usdt_on_gateio"] = {"Timestamp": "bigint", "ticker": "text",
+                                 "close": "text"}            # TEXT-ified candle column
+    mixed["d_usdt_on_okx"] = {"Timestamp": "bigint", "ticker": "text",
+                              "close": "double precision",
+                              "ob_is_barcode": "text"}      # TEXT-ified flag
+    plan = resolve_summary_union_casts(mixed, cols)
+    assert plan == {"close": "text", "ob_is_barcode": "text"}
+    # a column every table agrees on (here: absent everywhere but padded) is
+    # never touched, and bigint-vs-double precision is legal in a UNION
+    assert "ob_vitality_score" not in plan
+    assert "ticker" not in plan
+
+
+def test_build_summary_union_sql_is_type_stable_when_a_chunk_is_mixed():
+    from dashboard.helpers import build_summary_union_sql
+
+    cols = ["close", "ob_is_barcode"]
+    tables = {
+        "a_usdt_on_bybit": {"Timestamp": "bigint", "close": "double precision"},
+        "b_usdt_on_gateio": {"Timestamp": "bigint", "close": "text"},
+    }
+    tables["c_usdt_on_okx"] = {"Timestamp": "bigint"}   # no ob_* at all
+    sql = build_summary_union_sql(tables, cols)
+    # both branches project the SAME type, or the UNION does not compile
+    assert sql.count('"close"::text') == 2
+    # a column nobody disagrees on keeps its declared pad type (no cast noise)
+    assert 'NULL::boolean AS "ob_is_barcode"' in sql
+    # a table WITHOUT the mixed column is padded to the flattened type, or the
+    # UNION would mix text and double precision again
+    assert 'NULL::text AS "close"' in sql
+
+
+def test_build_summary_union_sql_force_text_flattens_everything():
+    from dashboard.helpers import build_summary_union_sql
+
+    cols = ["close", "ticker"]
+    tables = {
+        "a_usdt_on_bybit": {"Timestamp": "bigint", "close": "numeric", "ticker": "text"},
+        "b_usdt:usdt_on_okx": {"Timestamp": "text", "close": "json"},  # anything exotic
+    }
+    sql = build_summary_union_sql(tables, cols, force_text=True)
+    assert '"close"::text' in sql and '"ticker"::text' in sql
+    assert '"Timestamp"::text AS max_ts' in sql          # ms/s/text tables unify
+    assert "NULL::text" in sql
+
+
+def test_coerce_summary_types_recovers_numbers_without_erasing_text():
+    import pandas as pd
+
+    from dashboard.helpers import coerce_summary_types
+
+    df = pd.DataFrame([
+        # TEXT-flattened numerics + a genuine string column + junk rows
+        {"ticker": "BTC/USDT:USDT", "close": "42500.5", "ob_vitality_score": None,
+         "ob_is_barcode": "false", "max_ts": "1787700000"},
+        {"ticker": "0G/USDT", "close": "", "ob_vitality_score": "7.5",
+         "ob_is_barcode": "true", "max_ts": 1787700001},
+    ])
+    out = coerce_summary_types(df)
+    assert out["close"].dtype.kind == "f"          # '' -> NaN, not a string column
+    assert out["ob_vitality_score"].dtype.kind == "f"
+    assert out["max_ts"].dtype.kind in "ifu"
+    assert bool(out["ob_is_barcode"].iloc[0]) is False
+    assert bool(out["ob_is_barcode"].iloc[1]) is True
+    assert list(out["ticker"]) == ["BTC/USDT:USDT", "0G/USDT"]  # never coerced
+
+    # a column that only LOOKS textual is left alone instead of becoming NaN
+    notes = pd.DataFrame([{"notes": "alpha"}, {"notes": "beta"}])
+    assert list(coerce_summary_types(notes)["notes"]) == ["alpha", "beta"]
+
+
+def test_coerce_summary_types_never_invents_a_barcode_flag():
+    """NULL flags must stay FALSY.
+
+    bool(NaN) is True in Python, so letting pandas turn a flag column's NULLs
+    into float NaN would brand every pair without an orderbook snapshot as a
+    dead barcode market — a red chip in the health strip and a 0 vitality
+    reading, on a perfectly healthy table.
+    """
+    import pandas as pd
+
+    from dashboard.helpers import coerce_summary_types
+
+    missing = coerce_summary_types(pd.DataFrame([{"ob_is_barcode": None}, {"ob_is_barcode": None}]))
+    assert missing["ob_is_barcode"].dtype.kind == "b"
+    assert not missing["ob_is_barcode"].any()
+
+    texty = coerce_summary_types(pd.DataFrame([
+        {"ob_is_barcode": "true"}, {"ob_is_barcode": "false"}, {"ob_is_barcode": ""},
+    ]))
+    assert list(texty["ob_is_barcode"]) == [True, False, False]
+
+    numeric = coerce_summary_types(pd.DataFrame([
+        {"ob_is_barcode": 1.0}, {"ob_is_barcode": 0.0}, {"ob_is_barcode": None},
+    ]))
+    assert list(numeric["ob_is_barcode"]) == [True, False, False]

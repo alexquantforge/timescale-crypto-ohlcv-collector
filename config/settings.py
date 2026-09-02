@@ -236,8 +236,18 @@ class Settings(BaseSettings):
     # back in time is rendered — the dashboard must stay usable while the
     # collector writes.
     dash_scan_budget_sec: float = Field(default=25.0, alias="DASH_SCAN_BUDGET_SEC")
+    # Scan shape: all tables of a timeframe are read in CHUNKS of
+    # dash_scan_chunk_size, each chunk being ONE UNION ALL query executed by
+    # one of dash_scan_pool_size pooled connections. Bigger chunks = fewer
+    # round trips (the scan is round-trip bound, not CPU bound); a chunk that
+    # PostgreSQL rejects for any reason retries as an all-TEXT query, so a
+    # legacy TEXT-typed column no longer costs the whole batch its batching.
+    dash_scan_chunk_size: int = Field(default=120, alias="DASH_SCAN_CHUNK_SIZE")
+    dash_scan_pool_size: int = Field(default=6, alias="DASH_SCAN_POOL_SIZE")
     # Keep the last good summary on disk and paint it instantly on startup,
-    # refreshing in the background (stale-while-revalidate).
+    # refreshing in the background (stale-while-revalidate). A scan cut short
+    # by the budget is NOT persisted, so a busy collector cannot shrink the
+    # pair list from launch to launch.
     dash_snapshot_enabled: bool = Field(default=True, alias="DASH_SNAPSHOT_ENABLED")
     dash_snapshot_dir: str = Field(default="", alias="DASH_SNAPSHOT_DIR")
     dash_snapshot_max_age_sec: float = Field(default=86400.0, alias="DASH_SNAPSHOT_MAX_AGE_SEC")
