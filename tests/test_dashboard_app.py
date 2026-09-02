@@ -386,6 +386,7 @@ class _FakeScanPool:
         self.break_unions = break_unions
         self.break_rows = break_rows
         self.union_queries: list = []
+        self.catalog_queries: list = []
         self.per_table_reads = 0
 
     def acquire(self, *a, **kw):
@@ -393,11 +394,14 @@ class _FakeScanPool:
 
         class _Conn:
             async def fetch(self, query, *args):
-                # *args: the schema lookup is a PARAMETERIZED query (the column
-                # list is bound, not interpolated) — keep the fake honest about it.
-                if "information_schema" in query:
-                    if args:
-                        assert args[0] == "Timestamp" and "Timestamp" not in args[1]
+                # *args: the catalog lookup is a PARAMETERIZED query (the
+                # column list is bound, not interpolated) — keep the fake
+                # honest about it.
+                if "pg_catalog" in query:
+                    outer.catalog_queries.append(query)
+                    # the column list is BOUND, never interpolated, and the
+                    # candle-time column is matched case-identically ("Timestamp")
+                    assert args[0] == "Timestamp" and "Timestamp" not in args[1]
                     return [
                         {"table_name": t, "column_name": c, "data_type": dt}
                         for t, cols in outer.schema.items()
@@ -455,6 +459,8 @@ def _run_scan(monkeypatch, pool, **kwargs):
         return pool
 
     monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool)
+    # the inventory is cached per database name; tests must not inherit it
+    monkeypatch.setattr(dapp, "_SCAN_INVENTORY", {}, raising=False)
     kwargs.setdefault("budget_sec", 10.0)
     return asyncio.run(
         dapp._scan_database("db_test", "HIGH", "h", 1, "u", "p",
@@ -521,6 +527,7 @@ def test_scan_per_table_recovery_is_bounded_and_reports(monkeypatch):
         return pool
 
     monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool)
+    monkeypatch.setattr(dapp, "_SCAN_INVENTORY", {}, raising=False)
     rows = asyncio.run(
         dapp._scan_database("db_x", "LOW", "h", 1, "u", "p",
                             pool_size=2, chunk_size=120, budget_sec=10.0)
@@ -620,7 +627,7 @@ def test_scan_aborts_chunks_that_never_answer(monkeypatch):
 
     class _Conn:
         async def fetch(self, query, *args):
-            if "information_schema" in query:
+            if "pg_catalog" in query:
                 return [
                     {"table_name": t, "column_name": c, "data_type": dt}
                     for t, cols in schema.items() for c, dt in cols.items()
@@ -649,6 +656,7 @@ def test_scan_aborts_chunks_that_never_answer(monkeypatch):
         return _Pool()
 
     monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool)
+    monkeypatch.setattr(dapp, "_SCAN_INVENTORY", {}, raising=False)
     started = _time.time()
     rows = asyncio.run(
         dapp._scan_database("db_slow", "HIGH", "h", 1, "u", "p",
@@ -766,3 +774,102 @@ def test_feed_value_serves_cache_and_never_fetches_inline(monkeypatch):
     dapp._FEEDS[("ticker", "bybit", "BTC/USDT")]["at"] -= 10_000
     assert dapp._feed_value("ticker", "bybit", "BTC/USDT") is None
     assert len(scheduled) == 2
+
+
+def test_inventory_is_read_from_pg_catalog_and_cached(monkeypatch):
+    """Two regressions in one line of code.
+
+    * information_schema.columns is a VIEW that runs has_table_privilege() per
+      column per table — on a 14k-table database it measured 30…250 s, which
+      was the actual dashboard startup cost (a 75-table database "scanned" in
+      8…24 s for ONE chunk query: the time was in the catalog, not the data).
+    * and it was re-read on every rescan, i.e. on every rerun of the app.
+    """
+    import asyncio
+
+    from dashboard import app as dapp
+
+    queries = []
+
+    class _Conn:
+        async def fetch(self, query, *args):
+            queries.append(query)
+            return [{"table_name": "btc_usdt_on_bybit", "column_name": "close",
+                     "data_type": "float8"}]
+
+    class _Pool:
+        def acquire(self, *a, **kw):
+            class _A:
+                async def __aenter__(self):
+                    return _Conn()
+
+                async def __aexit__(self, *exc):
+                    return False
+
+            return _A()
+
+    monkeypatch.setattr(dapp, "_SCAN_INVENTORY", {}, raising=False)
+    monkeypatch.setattr(dapp.settings, "dash_scan_inventory_ttl_sec", 600.0, raising=False)
+
+    tables = asyncio.run(dapp._table_inventory(_Pool(), "db_a", "host1", 5432))
+    assert tables == {"btc_usdt_on_bybit": {"close": "float8"}}
+    assert len(queries) == 1
+    q = queries[0]
+    assert "information_schema" not in q and "pg_catalog.pg_attribute" in q
+    # '_' is a LIKE wildcard: it must be escaped, or unrelated tables (a
+    # "leone_tmp", any name containing "xony") join the pair list
+    assert r"LIKE '%\_on\_%'" in q
+    assert "a.attnum > 0" in q and "NOT a.attisdropped" in q        # real columns only
+    assert "c.relkind IN ('r', 'p')" in q                          # hypertables are 'p'
+    assert "t.typname" in q                                        # float8, not "double precision"
+
+    # second call inside the TTL: zero queries (this is what stops a scan
+    # storm on every rerun of the app)
+    asyncio.run(dapp._table_inventory(_Pool(), "db_a", "host1", 5432))
+    assert len(queries) == 1
+
+    # …but a DIFFERENT server is a different inventory (the sidebar can point
+    # the dashboard at another Postgres)
+    asyncio.run(dapp._table_inventory(_Pool(), "db_a", "host2", 5433))
+    assert len(queries) == 2
+    queries.clear()
+
+    # ttl=0 -> re-read every time (documented escape hatch for new listings)
+    monkeypatch.setattr(dapp.settings, "dash_scan_inventory_ttl_sec", 0.0, raising=False)
+    asyncio.run(dapp._table_inventory(_Pool(), "db_a", "host2", 5433))
+    assert len(queries) == 1
+
+
+def test_background_revalidation_is_throttled():
+    """The scan is expensive; a snapshot means the list is USABLE, so the
+    refresh must not re-fire on every rerun (pair click, 60 s reload, …)."""
+    from dashboard.helpers import snapshot_refresh_due
+
+    assert snapshot_refresh_due(0.0, 1000.0, 120.0) is True         # never scanned
+    assert snapshot_refresh_due(900.0, 1000.0, 120.0) is False       # 100 s ago
+    assert snapshot_refresh_due(880.0, 1000.0, 120.0) is True        # 120 s ago
+    assert snapshot_refresh_due(None, 1000.0, 120.0) is True
+    # interval 0 disables the throttle (legacy behaviour)
+    assert snapshot_refresh_due(999.9, 1000.0, 0.0) is True
+
+
+def test_pg_type_group_accepts_catalog_typnames():
+    """The cast plan compares type FAMILIES, and pg_type speaks in typname
+    aliases while information_schema speaks SQL names — both must land in the
+    same family, or every chunk looks 'mixed' and gets flattened to TEXT."""
+    from dashboard.helpers import pg_type_group, resolve_summary_union_casts
+
+    assert pg_type_group("float8") == pg_type_group("double precision") == "number"
+    assert pg_type_group("int8") == pg_type_group("bigint") == "number"
+    assert pg_type_group("bool") == pg_type_group("boolean") == "bool"
+    assert pg_type_group("varchar") == pg_type_group("text") == "text"
+
+    # a whole database of float8 columns is uniform -> no casts at all
+    tables = {
+        f"p{i}_usdt_on_bybit": {
+            "Timestamp": "int8", "close": "float8", "ob_spread_pct": "float8",
+            "ob_is_barcode": "bool", "ticker": "text",
+        }
+        for i in range(3)
+    }
+    assert resolve_summary_union_casts(tables, ["close", "ob_spread_pct", "ticker"]) == {}

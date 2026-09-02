@@ -244,6 +244,14 @@ class Settings(BaseSettings):
     # legacy TEXT-typed column no longer costs the whole batch its batching.
     dash_scan_chunk_size: int = Field(default=120, alias="DASH_SCAN_CHUNK_SIZE")
     dash_scan_pool_size: int = Field(default=6, alias="DASH_SCAN_POOL_SIZE")
+    # How often the table/column inventory of a database is re-read from
+    # pg_catalog. New listings and engine column migrations land here, so this
+    # is a freshness knob for the PAIR LIST only (candles and live data are
+    # unaffected). 0 = re-read on every scan (the pre-fix behaviour, and on a
+    # 14k-table database it is what made startup slow).
+    dash_scan_inventory_ttl_sec: float = Field(
+        default=600.0, alias="DASH_SCAN_INVENTORY_TTL_SEC"
+    )
     # Keep the last good summary on disk and paint it instantly on startup,
     # refreshing in the background (stale-while-revalidate). A scan cut short
     # by the budget is NOT persisted, so a busy collector cannot shrink the
@@ -251,6 +259,12 @@ class Settings(BaseSettings):
     dash_snapshot_enabled: bool = Field(default=True, alias="DASH_SNAPSHOT_ENABLED")
     dash_snapshot_dir: str = Field(default="", alias="DASH_SNAPSHOT_DIR")
     dash_snapshot_max_age_sec: float = Field(default=86400.0, alias="DASH_SNAPSHOT_MAX_AGE_SEC")
+    # Minimum gap between two background rescans. Without it EVERY rerun
+    # (every pair click, every 60 s auto-reload) launched a full 4-database
+    # scan, which on a busy machine is a self-sustaining load loop: the scans
+    # slow the database, the slower scans hit their budget and return a
+    # shorter pair list, and that list is re-scanned just as eagerly.
+    dash_snapshot_refresh_sec: float = Field(default=120.0, alias="DASH_SNAPSHOT_REFRESH_SEC")
 
     priority_lane_enabled: bool = Field(default=True, alias="PRIORITY_LANE_ENABLED")
     priority_lane_interval_sec: float = Field(default=1.0, alias="PRIORITY_LANE_INTERVAL_SEC")

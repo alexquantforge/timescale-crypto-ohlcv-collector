@@ -191,13 +191,22 @@ SUMMARY_ORDER_ALIAS = "max_ts"
 # for all 120 tables of the chunk, which then degrades into 120 individual
 # round trips. That is what made the "batched" scan slower than the unbatched
 # one on databases whose legacy tables still carry TEXT-ified ob_* columns.
+# Both spellings are listed on purpose: information_schema.columns reports
+# SQL type NAMES ("double precision"), pg_catalog.pg_type reports typname
+# aliases ("float8") — and the scan reads pg_catalog, because
+# information_schema.columns is a VIEW that resolves has_table_privilege()
+# for every column of every table: on a 14k-table database it measured
+# 30…250 s, which was the real startup cost. Same families, two vocabularies.
 _PG_TYPE_GROUPS = {
     "smallint": "number", "integer": "number", "bigint": "number",
-    "real": "number", "double precision": "number", "numeric": "number",
-    "decimal": "number", "money": "number",
-    "text": "text", "character varying": "text", "character": "text",
+    "int2": "number", "int4": "number", "int8": "number", "serial": "number",
+    "real": "number", "double precision": "number", "float4": "number",
+    "float8": "number", "numeric": "number", "decimal": "number",
+    "money": "number",
+    "text": "text", "character varying": "text", "varchar": "text",
+    "character": "text",
     "bpchar": "text", "name": "text", "citext": "text", "uuid": "text",
-    "boolean": "bool",
+    "boolean": "bool", "bool": "bool",
     "date": "time", "timestamp without time zone": "time",
     "timestamp with time zone": "time", "time without time zone": "time",
     "time with time zone": "time", "interval": "time",
@@ -1608,3 +1617,21 @@ def feed_should_use(entry, now: float, ttl: float) -> bool:
     if not entry:
         return False
     return (float(now) - float(entry.get("at") or 0.0)) <= float(ttl)
+
+
+def snapshot_refresh_due(last_started: float, now: float, min_interval_sec: float) -> bool:
+    """
+    Whether the stale-while-revalidate background rescan may start again.
+
+    With a snapshot on disk, EVERY rerun of the app (every pair click, every
+    1 s fragment tick that re-runs the script, every 60 s auto-reload) used to
+    launch a full 4-database scan. On a box where one scan costs tens of
+    seconds that is a self-sustaining load loop: the scans slow down the
+    collector's database, the slower scans then hit their time budget and
+    return an ever smaller pair list, which is re-scanned just as eagerly.
+    The pair list is a list of TABLES — it changes on the order of minutes, so
+    it is refreshed at most once per `min_interval_sec`.
+    """
+    if not last_started:
+        return True
+    return (float(now) - float(last_started)) >= float(min_interval_sec)

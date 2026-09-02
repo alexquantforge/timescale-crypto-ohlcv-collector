@@ -66,6 +66,7 @@ from dashboard.helpers import (
     chart_render_plan,
     coerce_summary_types,
     feed_should_use,
+    snapshot_refresh_due,
     chunked,
     snapshot_path,
     save_summary_snapshot,
@@ -176,6 +177,72 @@ async def _summary_row_for_table(
 # refresh thread share one process, while st.cache_data would pickle away
 # anything attached to the frame itself.
 _SCAN_META: dict = {}
+# When a timeframe was last (re)scanned — the throttle for the background
+# revalidation, so a page that reruns every second does not rescan every
+# second. Written before the thread starts, not after it finishes: a slow
+# scan must not invite a second one on top of it.
+_LAST_SCAN_AT: dict = {}
+
+
+# table -> {column: data_type}, per (host, port, database), read from
+# pg_catalog and kept for dash_scan_inventory_ttl_sec (see _table_inventory).
+# Keyed by the server too: the sidebar can point the dashboard at another
+# Postgres, and an inventory cached against the old one must never answer.
+_SCAN_INVENTORY: dict = {}
+
+
+async def _table_inventory(pool, db_name: str, db_host: str = "", db_port: int = 0) -> dict:
+    """
+    Which pair tables exist and what their columns are typed as.
+
+    Three things this deliberately does NOT do the obvious way:
+
+    * It reads pg_class/pg_attribute/pg_type instead of information_schema.
+      information_schema.columns is a view that evaluates has_table_privilege()
+      per column per table: measured at 30…250 s on a 14k-table database
+      while the collector was writing — i.e. the catalog lookup, not the data,
+      was the startup cost (and it was inside the timing, which is why a
+      75-table database "scanned" in 8…24 s for one chunk query).
+    * It selects only the projected columns (~23 per table, not all 30+), so
+      the result is 8k×23 rows instead of 8k×30 and never carries candle data.
+    * It is CACHED per database. The list of tables and their types changes on
+      the order of minutes (a new listing, an engine migration adding ob_*
+      columns), while the scan itself runs on every revalidation — reading the
+      catalog that often is pure pressure on the same Postgres the collector is
+      writing to.
+
+    Types matter because a chunk of 120 heterogeneous tables is UNION ALL'ed:
+    one TEXT-typed ob_* column (legacy HIGH<->LOW move) used to make PostgreSQL
+    reject the whole chunk — see resolve_summary_union_casts.
+    """
+    ttl = float(settings.dash_scan_inventory_ttl_sec)
+    cache_key = (db_host, db_port, db_name)
+    ent = _SCAN_INVENTORY.get(cache_key)
+    if ent and time.time() - ent["at"] < ttl:
+        return ent["tables"]
+
+    async with pool.acquire(timeout=20.0) as conn:
+        col_rows = await conn.fetch(
+            "SELECT c.relname AS table_name, a.attname AS column_name, "
+            "       t.typname AS data_type "
+            "FROM pg_catalog.pg_class c "
+            "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+            "JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
+            "JOIN pg_catalog.pg_type t ON t.oid = a.atttypid "
+            "WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') "
+            "  AND a.attnum > 0 AND NOT a.attisdropped "
+            # '\_' = a literal underscore: '%_on_%' on its own lets '_' match
+            # any character and pulls unrelated tables into the pair list.
+            "  AND c.relname LIKE '%\\_on\\_%' "
+            "  AND (a.attname = $1 OR a.attname = ANY($2::text[]))",
+            "Timestamp", list(_EXPECTED_SUMMARY_KEYS),
+        )
+
+    tables: dict = {}
+    for r in col_rows:
+        tables.setdefault(r["table_name"], {})[r["column_name"]] = r["data_type"]
+    _SCAN_INVENTORY[cache_key] = {"at": time.time(), "tables": tables}
+    return tables
 
 
 async def _scan_database(
@@ -218,24 +285,7 @@ async def _scan_database(
         return []
 
     try:
-        async with pool.acquire() as conn:
-            # Only the projected columns: asking for every column of every
-            # table ships ~30 rows per pair (240k for a 8k-pair database)
-            # before the scan has even started, which is pure queue time while
-            # the collector is writing.
-            col_rows = await conn.fetch(
-                "SELECT table_name, column_name, data_type FROM information_schema.columns "
-                "WHERE table_schema='public' AND table_name LIKE '%_on_%' "
-                "AND (column_name = $1 OR column_name = ANY($2::text[]))",
-                "Timestamp", list(_EXPECTED_SUMMARY_KEYS),
-            )
-        # table -> {column: data_type}. The TYPES matter: a chunk of 120
-        # heterogeneous tables is UNION ALL'ed, and one TEXT-typed ob_* column
-        # (legacy HIGH<->LOW moves, old imports) makes PostgreSQL reject the
-        # whole query — see resolve_summary_union_casts.
-        tables: dict = {}
-        for r in col_rows:
-            tables.setdefault(r["table_name"], {})[r["column_name"]] = r["data_type"]
+        tables = await _table_inventory(pool, db_name, db_host, db_port)
         if not tables:
             return []
 
@@ -409,7 +459,15 @@ def load_summary_cached(db_host, db_port, db_user, db_pass, timeframe: str) -> p
             settings.dash_snapshot_max_age_sec,
         )
         if snap is not None and not snap.empty:
-            _refresh_summary_in_background(db_host, db_port, db_user, db_pass, timeframe)
+            # Throttled: a valid snapshot means the list is USABLE, so the
+            # rescan is a background nicety, not something to re-launch on
+            # every rerun (see settings.dash_snapshot_refresh_sec).
+            if snapshot_refresh_due(
+                _LAST_SCAN_AT.get(timeframe, 0.0), time.time(),
+                settings.dash_snapshot_refresh_sec,
+            ):
+                _LAST_SCAN_AT[timeframe] = time.time()
+                _refresh_summary_in_background(db_host, db_port, db_user, db_pass, timeframe)
             st.session_state[f"_snap_age_{timeframe}"] = age
             return snap
 
@@ -1936,6 +1994,12 @@ if st.sidebar.button("🔄 Refresh data (clear caches)"):
     load_candles_cached.clear()
     fetch_live_cached.clear()
     _render_chart_html_cached.clear()
+    # module-level stores are not Streamlit caches, so the button has to
+    # clear them by hand: without this, "show me the NEW pair" would keep
+    # answering from a 10-minute-old pg_catalog snapshot.
+    _SCAN_INVENTORY.clear()
+    _STITCHED_PAGES.clear()
+    _LAST_SCAN_AT.clear()
     st.rerun()
 
 # Compact layout: no big page title — charts come first with minimal top padding
