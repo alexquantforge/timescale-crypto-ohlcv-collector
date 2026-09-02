@@ -647,3 +647,28 @@ async def test_writer_deletes_only_the_buckets_it_rewrites(monkeypatch):
     assert '("Timestamp" / 900) = ANY($1::bigint[])' in sql
     assert args[0] == [t0 // 900, (t0 + 1800) // 900]   # the skipped bucket is untouched
     assert conn.copied[1] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_lane_that_never_stamped_says_never_and_not_zero():
+    """`EXTRACT(EPOCH FROM (now() - max(served_at)))` is NULL when nothing was
+    ever stamped. Coercing that to 0 produced the console line "last engine stamp
+    0.0h ago" for a collector that never answered at all — the one message that
+    must not be ambiguous, because 0.0s means "alive this instant"."""
+    from src.core.priority_pairs import lane_pulse
+
+    class _NullRow(dict):
+        pass
+
+    conn = _PulseConn(_NullRow({"watched": 11, "served": 0, "idle_sec": None,
+                                "served_15m": 0, "served_1d": 0,
+                                "idle_15m": None, "idle_1d": None}))
+    pulse = await lane_pulse(conn)
+    assert pulse["idle_sec"] is None and pulse["idle_15m"] is None
+    assert pulse["served_15m"] == 0 and pulse["watched"] == 11
+
+    # A missing column (a database whose table predates the heartbeat ALTER and
+    # has not been healed yet) is also "unknown", never "0 seconds ago".
+    conn2 = _PulseConn({"watched": 3, "served": 0, "idle_sec": None})
+    pulse2 = await lane_pulse(conn2)
+    assert pulse2["idle_1d"] is None and pulse2["served_1d"] == 0

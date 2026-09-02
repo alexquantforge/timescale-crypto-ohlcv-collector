@@ -177,30 +177,64 @@ async def _summary_row_for_table(
 
 
 # ---------------------------------------------------------------------------
+# State that has to OUTLIVE a rerun
+# ---------------------------------------------------------------------------
+# Streamlit builds a BRAND NEW `__main__` module for every run
+# (ScriptRunner._run_script → self._new_module("__main__")), so a module-level
+# `_X: dict = {}` in this file is re-created each time the page reruns. For a
+# scratch variable that is fine; for a rate limiter or a cache it is the exact
+# opposite of what was intended:
+#
+#     [markets] ⚠️ gate: load_markets failed (RequestTimeout …/spot/currencies) …
+#     [markets] ⚠️ gate: load_markets failed …      ← six of these in a minute,
+#
+# each rerun "forgetting" that the exchange had just failed and was being backed
+# off, and starting another market-catalog load on top. Anything that exists to
+# *avoid* work — a backoff, a cooldown, a dedup flag, a TTL cache — must live in
+# `st.cache_resource`, which is the one namespace that survives. (Closures
+# created inside the cached `_live_infra` see the FIRST run's globals and are
+# therefore accidentally persistent; that split is why the same failure was
+# logged from two places at once.)
+@st.cache_resource(show_spinner=False)
+def _app_state() -> dict:
+    return {}
+
+
+def _state(name: str, factory):
+    """The one instance of `name`, for the lifetime of the process."""
+    store = _app_state()
+    if name not in store:
+        store[name] = factory()
+    return store[name]
+
+
+# ---------------------------------------------------------------------------
 # Data loading (cached)
 # ---------------------------------------------------------------------------
 
 # Per-database / per-timeframe scan telemetry, filled in by the scan coroutine
 # and read when deciding whether a snapshot may be persisted. Keyed by db name
-# and by timeframe; a module-level dict because `asyncio.run` + the background
-# refresh thread share one process, while st.cache_data would pickle away
-# anything attached to the frame itself.
-_SCAN_META: dict = {}
+# and by timeframe, and taken from `_state` rather than written as a bare
+# `{} = dict()`: the scan coroutine, the background refresh thread and the next
+# rerun have to share ONE object, and a module-level literal is rebuilt on every
+# rerun (see `app_state`), which would reset the scan throttle and the resume
+# cursor several times a minute.
+_SCAN_META: dict = _state("scan_meta", dict)
 # When a timeframe was last (re)scanned — the throttle for the revalidation,
 # so a page that reruns every second does not rescan every second. Written
 # before the thread starts, not after it finishes: a slow scan must not invite
 # a second one on top of it.
-_LAST_SCAN_AT: dict = {}
+_LAST_SCAN_AT: dict = _state("last_scan_at", dict)
 # Consecutive TRUNCATED scans per timeframe, driving the retry backoff (see
 # scan_retry_delay_sec). A pair list cut short by the budget has to be retried
 # or the dashboard never shows the full list — but at a FIXED interval every
 # retry adds load and guarantees the next scan is truncated too.
-_SCAN_ATTEMPTS: dict = {}
+_SCAN_ATTEMPTS: dict = _state("scan_attempts", dict)
 # Last scan result per timeframe, in memory: {"df":…, "meta":…, "at":…}.
 # A partial scan lives HERE and never on disk (the "last good snapshot" file
 # must stay complete, or a busy collector shrinks the pair list from launch to
 # launch). Serving it is what keeps a rerun off the database entirely.
-_SUMMARY_STORE: dict = {}
+_SUMMARY_STORE: dict = _state("summary_store", dict)
 # Per-database progress of the sweeps: {"start": chunk index to begin with,
 # "rows": {table: (when, row)}}. A budget cuts a sweep at its TAIL, and the tail
 # is the same tail every time, so a 8271-table database with ~12 of 69 chunks
@@ -208,15 +242,15 @@ _SUMMARY_STORE: dict = {}
 # at "1318/8271 tables" through dozens of retries, and every retry cost the busy
 # database the queries it had already answered. Remembering where a sweep stopped
 # and what it read makes successive sweeps cover new ground instead.
-_SCAN_SWEEP_STATE: dict = {}
+_SCAN_SWEEP_STATE: dict = _state("scan_sweep_state", dict)
 # Timeframes whose last scan attempt never got `_SCAN_GATE`. Another tier holds
 # the gate for the whole of its own sweep, so a tier that is only unlucky about
 # timing used to wait out the FULL backoff for nothing — the log line
 # "1d: skipped — another scan holds the database" then repeated for hours and the
 # 1D pair list never refreshed. A skip costs the database nothing, so it is
 # retried soon instead (bounded number of tries, see `_SCAN_DEFER_TRIES`).
-_SCAN_DEFERRED_AT: dict = {}
-_SCAN_DEFER_TRIES: dict = {}
+_SCAN_DEFERRED_AT: dict = _state("scan_deferred_at", dict)
+_SCAN_DEFER_TRIES: dict = _state("scan_defer_tries", dict)
 # One scan per process. Before this, a scan of "15m" and a scan of "1d" each
 # fanned out over both of their databases, i.e. up to 8 concurrent pools ×
 # `dash_scan_pool_size` connections of UNION-ALL MAX() queries — against the
@@ -240,7 +274,7 @@ def _mark_interaction() -> None:
 # pg_catalog and kept for dash_scan_inventory_ttl_sec (see _table_inventory).
 # Keyed by the server too: the sidebar can point the dashboard at another
 # Postgres, and an inventory cached against the old one must never answer.
-_SCAN_INVENTORY: dict = {}
+_SCAN_INVENTORY: dict = _state("scan_inventory", dict)
 
 
 async def _table_inventory(pool, db_name: str, db_host: str = "", db_port: int = 0) -> dict:
@@ -1005,11 +1039,31 @@ def _safe_max_ts(row: Optional[dict]) -> int:
 # Live ticker (server-side chips, cached ~1s)
 # ---------------------------------------------------------------------------
 
+def _new_sync_exchange(ccxt_id: str, timeout_ms: int = 8000):
+    """A dashboard ccxt instance, configured for ONE job: read public data.
+
+    `fetchCurrencies` is switched off deliberately. ccxt's `load_markets()` does
+    `if self.has['fetchCurrencies']: self.fetch_currencies()` BEFORE the market
+    catalog — for gate that is `GET /api/v4/spot/currencies`, the slowest and
+    most rate-limited call in the sequence, and the one that made every dashboard
+    market load time out (so no chart gap could ever be stitched on gate, while
+    bybit loaded 3557 markets in 7.9 s). Public candles, tickers and order books
+    need markets, not currency metadata.
+    """
+    import ccxt as _ccxt
+    ex = getattr(_ccxt, ccxt_id)({"enableRateLimit": True, "timeout": int(timeout_ms)})
+    try:
+        ex.has = dict(ex.has or {})
+        ex.has["fetchCurrencies"] = False
+    except Exception:
+        pass
+    return ex
+
+
 @st.cache_resource(show_spinner=False)
 def _get_sync_exchange(ccxt_id: str):
     """Persistent synchronous ccxt instance (kept across reruns & sessions)."""
-    import ccxt as _ccxt
-    return getattr(_ccxt, ccxt_id)({"enableRateLimit": True, "timeout": 8000})
+    return _new_sync_exchange(ccxt_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1027,9 +1081,9 @@ def _get_sync_exchange(ccxt_id: str):
 # was ever fetched. One loader per exchange, a real timeout for the load, an
 # exponential pause after a failure, and a background mode so the render path
 # never waits for it.
-_MARKET_GATE: dict = {}
-_MARKET_GATE_LOCK = threading.Lock()
-_MARKET_LOG_AT: dict = {}
+_MARKET_GATE: dict = _state("market_gate", dict)
+_MARKET_GATE_LOCK = _state("market_gate_lock", threading.Lock)
+_MARKET_LOG_AT: dict = _state("market_log_at", dict)
 
 
 def _market_load_sec() -> float:
@@ -1222,7 +1276,7 @@ def _fetch_missing_candles_paged(ex, symbol: str, timeframe: str, r0: int, r1: i
 # With `st.cache_data(ttl=3600)` the FIRST hiccup was cached as if it were the
 # answer, so a chart stayed gapped for an hour after one timeout and the caption
 # blamed the exchange.
-_STITCH_CACHE: dict = {}
+_STITCH_CACHE: dict = _state("stitch_cache", dict)
 _STITCH_OK_TTL = 3600.0
 
 
@@ -1467,7 +1521,7 @@ def _set_live_target(pairs: list) -> None:
     _publish_priority_pairs_async(pairs)
 
 
-_LAST_PUBLISH = {"ts": 0.0, "key": None}
+_LAST_PUBLISH = _state("last_publish", lambda: {"ts": 0.0, "key": None})
 _PUBLISH_MIN_INTERVAL = 5.0  # TTL is 90 s — re-announcing more often is waste
 
 
@@ -1476,7 +1530,8 @@ _PUBLISH_MIN_INTERVAL = 5.0  # TTL is 90 s — re-announcing more often is waste
 # that back, "the dashboard should have repaired the chart" and "no collector is
 # running, so nothing can be written" looked identical: a stale chart, a
 # half-hearted stitch and no explanation. One aggregate query, throttled.
-_LANE_PULSE: dict = {"at": 0.0, "watched": 0, "served": 0, "idle_sec": None}
+_LANE_PULSE: dict = _state("lane_pulse", lambda: {"at": 0.0, "watched": 0, "served": 0,
+                                                    "idle_sec": None})
 _PULSE_MIN_INTERVAL = 30.0
 
 
@@ -1982,9 +2037,7 @@ def _live_infra() -> dict:
         with writer_ex_lock:
             ex = writer_ex.get(ccxt_id)
             if ex is None:
-                ex = getattr(_ccxt, ccxt_id)(
-                    {"enableRateLimit": True, "timeout": 6000}
-                )
+                ex = _new_sync_exchange(ccxt_id, timeout_ms=6000)
                 writer_ex[ccxt_id] = ex
         # Same rule as the render path: one loader per exchange, backed off on
         # failure. This used to hold `writer_ex_lock` across a `load_markets()`
@@ -2270,8 +2323,10 @@ def _compute_live_health_row(sym_ticker, sym_ex, hist_1d, atr_val, db_row, db_na
 # is pre-fetched for the ±5 neighbouring pairs in daemon threads while the
 # user looks at the current pair. The UI thread NEVER waits on these.
 # ---------------------------------------------------------------------------
-_BG_LOCK = threading.Lock()
-_BG_RUNNING: set = set()
+# Both are persistent, and they have to be a PAIR: a dedup set that survives
+# while the lock guarding it does not is just a race with better manners.
+_BG_LOCK = _state("bg_lock", threading.Lock)
+_BG_RUNNING: set = _state("bg_running", set)
 _LIVE_SNAP: dict = {}  # (ticker, exchange, atr) -> (snapshot_or_None, fetched_at)
 
 

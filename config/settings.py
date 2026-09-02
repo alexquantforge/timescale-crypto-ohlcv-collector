@@ -331,6 +331,13 @@ class Settings(BaseSettings):
     # A published set expires this fast, so closing the browser tab stops the
     # lane instead of pinning the engine to an abandoned pair.
     priority_lane_ttl_sec: float = Field(default=90.0, alias="PRIORITY_LANE_TTL_SEC")
+    # ccxt's load_markets() normally fetches the exchange's CURRENCY table first
+    # (gate: GET /spot/currencies). Nothing in this project reads currency
+    # metadata, and that extra request is what pushes market loading past the
+    # 30 s hard wait in `load_markets_with_retry` — a failed load means the
+    # exchange is skipped for the whole cycle. Keep it off unless you are
+    # debugging precision/limits issues.
+    ccxt_fetch_currencies: bool = Field(default=False, alias="CCXT_FETCH_CURRENCIES")
     # Coordination database holding the tiny handshake table (empty = 15m HIGH).
     priority_lane_db: str = Field(default="", alias="PRIORITY_LANE_DB")
     # How far back the lane may bridge a hole in the pair you are LOOKING at.

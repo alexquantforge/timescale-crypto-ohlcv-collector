@@ -280,6 +280,40 @@ def _load_app_module():
     return module
 
 
+def test_a_rerun_does_not_forget_the_backoff(monkeypatch):
+    """THE cause behind the six identical `[markets] ⚠️ gate: load_markets
+    failed` lines in one minute.
+
+    Streamlit creates a brand-new `__main__` module for every run, so a
+    module-level `_X: dict = {}` is rebuilt on each rerun — which is harmless for
+    a scratch variable and fatal for a rate limiter: every rerun "forgot" that
+    gate had just failed and launched another market-catalog load, keeping the
+    endpoint permanently timed out. Stores that exist to AVOID work therefore
+    come from `st.cache_resource` (`_state`), which outlives the rerun.
+    """
+    os.environ["DASHBOARD_DEMO"] = "1"
+    app = _load_app_module()
+    app._MARKET_GATE["gate"] = {"fails": 3, "err": "RequestTimeout"}
+    app._MARKET_LOG_AT[("load", "gate")] = 123.0
+
+    again = _load_app_module()          # a fresh exec of the same file = a rerun
+    assert again._MARKET_GATE.get("gate", {}).get("fails") == 3
+    assert again._MARKET_LOG_AT.get(("load", "gate")) == 123.0
+    assert again._MARKET_GATE is app._MARKET_GATE
+
+
+def test_dashboard_exchanges_do_not_fetch_the_currency_table():
+    """ccxt prepends `fetch_currencies()` to `load_markets()` when the exchange
+    implements it — gate's `/spot/currencies` is the request that never finished
+    in time here. Public candles/ticker/orderbook do not need it."""
+    os.environ["DASHBOARD_DEMO"] = "1"
+    app = _load_app_module()
+    for ccxt_id in ("gate", "okx", "bybit"):
+        ex = app._new_sync_exchange(ccxt_id)
+        assert ex.has.get("fetchCurrencies") is False, ccxt_id
+        assert ex.timeout == 8000
+
+
 def test_publish_is_throttled_and_never_blocks(monkeypatch):
     """The publish is fire-and-forget and skipped when the set is unchanged:
     holding Prev/Next must not queue one database write per keystroke."""
@@ -730,8 +764,10 @@ def _run_scan(monkeypatch, pool, **kwargs):
         return pool
 
     monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool)
-    # the inventory is cached per database name; tests must not inherit it
+    # the inventory (and any sweep cursor) is keyed by database name and lives in
+    # a process-wide store now; tests must not inherit it from each other
     monkeypatch.setattr(dapp, "_SCAN_INVENTORY", {}, raising=False)
+    monkeypatch.setattr(dapp, "_SCAN_SWEEP_STATE", {}, raising=False)
     kwargs.setdefault("budget_sec", 10.0)
     return asyncio.run(
         dapp._scan_database("db_test", "HIGH", "h", 1, "u", "p",
@@ -1966,3 +2002,22 @@ def test_a_scan_pushed_aside_by_another_tier_retries_soon_then_gives_up(monkeypa
     held.release()
     dapp._scan_summary_now("h", 1, "u", "p", "1d")
     assert "1d" not in dapp._SCAN_DEFERRED_AT and "1d" not in dapp._SCAN_DEFER_TRIES
+
+
+def test_the_collector_skips_the_currency_table_too(monkeypatch):
+    """Same defect on the collector side, bigger consequence: the engine wraps
+    `load_markets()` in a 30 s hard wait, and gate's extra currency round trip is
+    what pushed it over — `load_markets for gateio failed (attempt 1/3):
+    TimeoutError()` means that exchange collects NOTHING for the cycle while the
+    log looks healthy. `CCXT_FETCH_CURRENCIES=true` brings the request back."""
+    import sys
+    from config.settings import settings
+
+    sys.path.insert(0, str(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    from src.exchanges.client import create_exchange
+
+    monkeypatch.setattr(settings, "ccxt_fetch_currencies", False, raising=False)
+    assert create_exchange("gate").has.get("fetchCurrencies") is False
+
+    monkeypatch.setattr(settings, "ccxt_fetch_currencies", True, raising=False)
+    assert create_exchange("gate").has.get("fetchCurrencies") is not False

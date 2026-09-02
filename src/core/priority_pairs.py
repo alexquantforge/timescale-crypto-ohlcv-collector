@@ -364,26 +364,34 @@ async def lane_pulse(conn, stale_sec: float = 120.0) -> dict:
     await ensure_priority_table(conn)
     row = await _fetch_healed(conn, "fetchrow", _PULSE_SQL,
                               str(int(stale_sec)), str(int(DEFAULT_TTL_SEC)))
-    def _num(key: str, default=0):
-        try:
-            v = row[key]
-        except (TypeError, LookupError, KeyError):
-            return default
-        return default if v is None else v
-
     if not row:
         return {"watched": 0, "served": 0, "idle_sec": None,
                 "served_15m": 0, "served_1d": 0, "idle_15m": None, "idle_1d": None}
-    out = {
-        "watched": int(_num("watched") or 0),
-        "served": int(_num("served") or 0),
-        "idle_sec": (float(_num("idle_sec")) if _num("idle_sec") is not None else None),
+
+    def _count(key: str) -> int:
+        try:
+            return int(row[key] or 0)
+        except (TypeError, ValueError, LookupError, KeyError):
+            return 0
+
+    def _age(key: str):
+        """NULL and 0 are different facts here: 'never stamped' is not 'stamped
+        this instant', and the caption prints one of them as the word `never`."""
+        try:
+            v = row[key]
+        except (TypeError, ValueError, LookupError, KeyError):
+            return None
+        return None if v is None else float(v)
+
+    return {
+        "watched": _count("watched"),
+        "served": _count("served"),
+        "idle_sec": _age("idle_sec"),
+        "served_15m": _count("served_15m"),
+        "served_1d": _count("served_1d"),
+        "idle_15m": _age("idle_15m"),
+        "idle_1d": _age("idle_1d"),
     }
-    for tf in ("15m", "1d"):
-        out[f"served_{tf}"] = int(_num(f"served_{tf}") or 0)
-        idle = _num(f"idle_{tf}")
-        out[f"idle_{tf}"] = float(idle) if idle is not None else None
-    return out
 
 
 async def read_priority_pairs(conn, ttl_sec: float = DEFAULT_TTL_SEC) -> List[Tuple[str, str]]:
