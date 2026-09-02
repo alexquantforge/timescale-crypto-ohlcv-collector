@@ -997,7 +997,8 @@ class MarketDataEngine:
                     bars = int(stats["bars"]) - stamped_bars[0]
                     stamped_bars[0] = int(stats["bars"])
                     async with pool.acquire() as conn:
-                        await mark_lane_service(conn, list(served_pending), bars)
+                        await mark_lane_service(conn, list(served_pending), bars,
+                                                timeframe=self.timeframe)
                     served_pending.clear()
 
                 if time.time() - last_report >= 60.0:
@@ -1008,9 +1009,13 @@ class MarketDataEngine:
                     stats = {"pairs": 0, "bars": 0}
                     last_report = time.time()
             except Exception as e:
-                logger.warning(
-                    f"[{self.timeframe.upper()}] [LANE] cycle error ({type(e).__name__}: {e})"
-                )
+                # One line per kind of failure per 10 min (the loop ticks every
+                # 1-2 s), not one per tick — see the 15m lane for the same rule.
+                if lane_warn_due(("cycle", type(e).__name__, str(e)[:80])):
+                    logger.warning(
+                        f"[{self.timeframe.upper()}] [LANE] cycle error "
+                        f"({type(e).__name__}: {e})"
+                    )
             await asyncio.sleep(max(0.05, interval - (time.time() - started)))
 
     async def start_loop(self) -> None:

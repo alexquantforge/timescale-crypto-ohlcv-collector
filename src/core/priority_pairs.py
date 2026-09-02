@@ -20,7 +20,6 @@ unit-testable without a database.
 from __future__ import annotations
 
 import time
-import weakref
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 PRIORITY_TABLE = "dashboard_priority_pairs"
@@ -49,11 +48,34 @@ CREATE_SQL = (
 SERVE_SQLS = (
     f"ALTER TABLE {PRIORITY_TABLE} ADD COLUMN IF NOT EXISTS served_at timestamptz",
     f"ALTER TABLE {PRIORITY_TABLE} ADD COLUMN IF NOT EXISTS served_bars int",
+    # Per-timeframe, because there are TWO engines and one watch list: with a
+    # single stamp, `main.py run` (1D only) made every 15m chart look "serviced"
+    # while the 15m hole stayed exactly as it was. The note is only worth
+    # printing if it can name the engine that is missing.
+    f"ALTER TABLE {PRIORITY_TABLE} ADD COLUMN IF NOT EXISTS served_15m_at timestamptz",
+    f"ALTER TABLE {PRIORITY_TABLE} ADD COLUMN IF NOT EXISTS served_1d_at timestamptz",
 )
 
-# An ensured connection never re-runs the DDL: the lane reads this table once a
-# second, and `CREATE/ALTER ... IF NOT EXISTS` per second is catalog noise.
-_ENSURED: "weakref.WeakSet" = weakref.WeakSet()
+
+def serve_column(timeframe: str) -> str:
+    """Which heartbeat column this engine stamps / this chart reads."""
+    return "served_15m_at" if str(timeframe or "").lower().startswith("15") else "served_1d_at"
+
+# DDL throttle. The lane reads this table once a second, and a
+# `CREATE/ALTER ... IF NOT EXISTS` per second per engine is pure catalog noise, so
+# the statements run once and then every DDL_MIN_INTERVAL_SEC.
+#
+# Deliberately NOT a per-connection memo: asyncpg hands out `PoolConnectionProxy`
+# objects, and those cannot be weakly referenced — a `weakref.WeakSet` of
+# connections raised `TypeError: cannot create weak reference to
+# 'PoolConnectionProxy' object` inside `read_priority_pairs()`, which the lane
+# loop swallowed as a cycle error EVERY TICK: the priority lane did not refresh a
+# single pair, and the only trace was a repeating warning. Keyed process-wide
+# instead (one coordination table per process), with `force=True` on the
+# "schema says it is not there yet" paths so a fresh database is never left
+# without its table.
+_DDL_DONE_AT = [0.0]
+DDL_MIN_INTERVAL_SEC = 300.0
 
 
 def lane_since_sec(
@@ -208,13 +230,54 @@ def resolve_exchange_alias(published: str, name_to_id: dict) -> Tuple[str, str]:
     return label, label                           # unknown: pass through
 
 
-async def ensure_priority_table(conn) -> None:
-    if conn in _ENSURED:
+async def ensure_priority_table(conn, force: bool = False) -> None:
+    """Creates the handshake table (and grows the heartbeat columns) if needed."""
+    now = time.time()
+    if not force and now - float(_DDL_DONE_AT[0]) < DDL_MIN_INTERVAL_SEC:
         return
+    _DDL_DONE_AT[0] = now
     await conn.execute(CREATE_SQL)
     for ddl in SERVE_SQLS:
         await conn.execute(ddl)
-    _ENSURED.add(conn)
+
+
+def _missing_schema_error(e: Exception) -> bool:
+    """'table/column does not exist' in asyncpg's (or a fake's) words."""
+    msg = str(e).lower()
+    return "does not exist" in msg or "undefined" in type(e).__name__.lower()
+
+
+async def _fetch_healed(conn, kind: str, sql: str, *args):
+    """`fetch`/`fetchrow` with the same one-shot re-ensure as `_execute_healed`.
+
+    Matters for the ENGINE side most: a lane that cannot read the table logs a
+    cycle error every second forever, and if the throttle above decided "schema is
+    already ensured" after the table disappeared (a restore, a rename), that cycle
+    error would be the last thing the lane ever did.
+    """
+    try:
+        return await getattr(conn, kind)(sql, *args)
+    except Exception as e:
+        if not _missing_schema_error(e):
+            raise
+        await ensure_priority_table(conn, force=True)
+        return await getattr(conn, kind)(sql, *args)
+
+
+async def _execute_healed(conn, sql: str, *args) -> None:
+    """One statement, re-ensuring the schema once if the DB does not know it.
+
+    The DDL throttle above makes "the table exists but my memo says it was
+    created" possible after a fresh restore; retrying once with `force=True`
+    costs nothing and beats failing the lane tick.
+    """
+    try:
+        await conn.execute(sql, *args)
+    except Exception as e:
+        if not _missing_schema_error(e):
+            raise
+        await ensure_priority_table(conn, force=True)
+        await conn.execute(sql, *args)
 
 
 async def publish_priority_pairs(conn, pairs: Iterable, ttl_sec: float = DEFAULT_TTL_SEC) -> int:
@@ -227,22 +290,33 @@ async def publish_priority_pairs(conn, pairs: Iterable, ttl_sec: float = DEFAULT
     """
     normalized = normalize_pairs(pairs)
     await ensure_priority_table(conn)
-    if normalized:
-        await conn.executemany(
-            f"INSERT INTO {PRIORITY_TABLE} (exchange, symbol, updated_at)"
-            " VALUES ($1, $2, now())"
-            " ON CONFLICT (exchange, symbol) DO UPDATE SET updated_at = now()",
-            normalized,
-        )
-    await conn.execute(
-        f"DELETE FROM {PRIORITY_TABLE}"
-        f" WHERE updated_at < now() - ($1 || ' seconds')::interval",
-        str(int(ttl_sec * 4)),
+    insert_sql = (
+        f"INSERT INTO {PRIORITY_TABLE} (exchange, symbol, updated_at)"
+        " VALUES ($1, $2, now())"
+        " ON CONFLICT (exchange, symbol) DO UPDATE SET updated_at = now()"
     )
+    delete_sql = (
+        f"DELETE FROM {PRIORITY_TABLE}"
+        f" WHERE updated_at < now() - ($1 || ' seconds')::interval"
+    )
+    try:
+        if normalized:
+            await conn.executemany(insert_sql, normalized)
+        await conn.execute(delete_sql, str(int(ttl_sec * 4)))
+    except Exception as e:
+        if not _missing_schema_error(e):
+            raise
+        # table gone (restore / rename): create it and announce the set again
+        await ensure_priority_table(conn, force=True)
+        if normalized:
+            await conn.executemany(insert_sql, normalized)
+        await conn.execute(delete_sql, str(int(ttl_sec * 4)))
     return len(normalized)
 
 
-async def mark_lane_service(conn, pairs: Sequence[Tuple[str, str]], candles: int = 0) -> int:
+async def mark_lane_service(
+    conn, pairs: Sequence[Tuple[str, str]], candles: int = 0, timeframe: str = "15m"
+) -> int:
     """Engine side of the heartbeat: stamp the pairs this loop just served.
 
     Small (the watch list is capped at `MAX_PRIORITY_PAIRS`) and called at most
@@ -250,15 +324,31 @@ async def mark_lane_service(conn, pairs: Sequence[Tuple[str, str]], candles: int
     actually working on the pair the user is looking at, or is it just waiting
     for a process that is not running?"
     """
+    col = serve_column(timeframe)
     stamped = 0
     for exchange, symbol in normalize_pairs(pairs):
-        await conn.execute(
-            f"UPDATE {PRIORITY_TABLE} SET served_at = now(), served_bars = $3"
-            " WHERE exchange = $1 AND symbol = $2",
+        await _execute_healed(
+            conn,
+            f"UPDATE {PRIORITY_TABLE} SET served_at = now(), served_bars = $3,"
+            f" {col} = now() WHERE exchange = $1 AND symbol = $2",
             exchange, symbol, int(candles),
         )
         stamped += 1
     return stamped
+
+
+_PULSE_SQL = (
+    f"SELECT count(*) AS watched,"
+    f" count(*) FILTER (WHERE served_at > now() - ($1 || ' seconds')::interval) AS served,"
+    f" EXTRACT(EPOCH FROM (now() - max(served_at))) AS idle_sec,"
+    f" count(*) FILTER (WHERE served_15m_at > now() - ($1 || ' seconds')::interval)"
+    f" AS served_15m,"
+    f" count(*) FILTER (WHERE served_1d_at > now() - ($1 || ' seconds')::interval) AS served_1d,"
+    f" EXTRACT(EPOCH FROM (now() - max(served_15m_at))) AS idle_15m,"
+    f" EXTRACT(EPOCH FROM (now() - max(served_1d_at))) AS idle_1d"
+    f" FROM {PRIORITY_TABLE}"
+    f" WHERE updated_at > now() - ($2 || ' seconds')::interval"
+)
 
 
 async def lane_pulse(conn, stale_sec: float = 120.0) -> dict:
@@ -272,24 +362,35 @@ async def lane_pulse(conn, stale_sec: float = 120.0) -> dict:
     reloaded. Saying that is far more useful than silently re-painting the hole.
     """
     await ensure_priority_table(conn)
-    row = await conn.fetchrow(
-        f"SELECT count(*) AS watched,"
-        f" count(*) FILTER (WHERE served_at > now() - ($1 || ' seconds')::interval) AS served,"
-        f" EXTRACT(EPOCH FROM (now() - max(served_at))) AS idle_sec"
-        f" FROM {PRIORITY_TABLE}"
-        f" WHERE updated_at > now() - ($2 || ' seconds')::interval",
-        str(int(stale_sec)), str(int(DEFAULT_TTL_SEC)),
-    )
-    watched = int(row["watched"] or 0) if row else 0
-    served = int(row["served"] or 0) if row else 0
-    idle = float(row["idle_sec"]) if row and row["idle_sec"] is not None else None
-    return {"watched": watched, "served": served, "idle_sec": idle}
+    row = await _fetch_healed(conn, "fetchrow", _PULSE_SQL,
+                              str(int(stale_sec)), str(int(DEFAULT_TTL_SEC)))
+    def _num(key: str, default=0):
+        try:
+            v = row[key]
+        except (TypeError, LookupError, KeyError):
+            return default
+        return default if v is None else v
+
+    if not row:
+        return {"watched": 0, "served": 0, "idle_sec": None,
+                "served_15m": 0, "served_1d": 0, "idle_15m": None, "idle_1d": None}
+    out = {
+        "watched": int(_num("watched") or 0),
+        "served": int(_num("served") or 0),
+        "idle_sec": (float(_num("idle_sec")) if _num("idle_sec") is not None else None),
+    }
+    for tf in ("15m", "1d"):
+        out[f"served_{tf}"] = int(_num(f"served_{tf}") or 0)
+        idle = _num(f"idle_{tf}")
+        out[f"idle_{tf}"] = float(idle) if idle is not None else None
+    return out
 
 
 async def read_priority_pairs(conn, ttl_sec: float = DEFAULT_TTL_SEC) -> List[Tuple[str, str]]:
     """Engine side: the pairs the dashboard is currently displaying."""
     await ensure_priority_table(conn)
-    rows = await conn.fetch(
+    rows = await _fetch_healed(
+        conn, "fetch",
         f"SELECT exchange, symbol,"
         f" EXTRACT(EPOCH FROM (now() - updated_at)) AS age"
         f" FROM {PRIORITY_TABLE} ORDER BY updated_at DESC"

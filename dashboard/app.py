@@ -1485,26 +1485,40 @@ def lane_health() -> dict:
     return dict(_LANE_PULSE)
 
 
-def _lane_pulse_note() -> str:
-    """One short line under the chart: is a live collector answering the wake-up?
+# Which process answers the wake-up for a given chart. `main.py run` defaults to
+# 1D, so a user who started "the collector" still has a dead 15m lane — the note
+# has to name the missing engine, or it sends them to the wrong terminal.
+_LANE_CMD = {
+    "15m": "python main.py run --timeframe 15m",
+    "1d": "python main.py run --timeframe 1d",
+}
+
+
+def _lane_pulse_note(tf_key: str = "") -> str:
+    """One short line under the chart: is a live engine answering this wake-up?
 
     This exists because "the dashboard should have repaired the gap" and "no
     collector process is running, so the wake-up goes unanswered" look identical
-    from the chart — a hole and a caption about stitching. The heartbeat in
-    `dashboard_priority_pairs.served_at` is the only thing that tells them apart.
+    from the chart — a hole and a caption about stitching. The per-timeframe
+    heartbeat in `dashboard_priority_pairs` is the only thing that tells them
+    apart, and it also catches "1D is running, 15m is not".
     """
     pulse = lane_health()
     if not pulse.get("at") or not pulse.get("watched"):
         return ""
-    idle = pulse.get("idle_sec")
-    if pulse.get("served"):
+    tf_key = tf_key if tf_key in ("15m", "1d") else "15m"
+    served = int(pulse.get(f"served_{tf_key}") or 0)
+    idle = pulse.get(f"idle_{tf_key}")
+    watched = int(pulse.get("watched") or 0)
+    if served:
         age = "never" if idle is None else f"{idle:.0f}s"
-        return (f"<span style='color:#4db6ac'>⚡ lane alive — {pulse['served']}/"
-                f"{pulse['watched']} pair(s) serviced, last stamp {age} ago</span>")
+        return (f"<span style='color:#4db6ac'>⚡ {tf_key} lane alive — {served}/{watched} "
+                f"pair(s) serviced, last stamp {age} ago</span>")
     age = "never" if idle is None else f"{idle / 3600.0:.1f}h"
-    return ("<span style='color:#ef5350'>⛔ no collector is refreshing this pair "
-            f"(lane last answered {age} ago) — the hole stays in the database "
-            "until `python main.py run` is up</span>")
+    return ("<span style='color:#ef5350'>⛔ no "
+            f"{tf_key} engine is refreshing this pair (lane last answered {age} ago)"
+            " — the hole stays in the database until "
+            f"`{_LANE_CMD[tf_key]}` is up (or `--timeframe all`)</span>")
 
 
 def _read_lane_pulse_async() -> None:
@@ -1732,15 +1746,20 @@ def _live_infra() -> dict:
                 _LANE_PULSE.update(pulse)
                 if pulse.get("watched") and not pulse.get("served"):
                     # The console line that explains a stale chart better than
-                    # any caption: somebody is asking, nothing is answering.
+                    # any caption: somebody is asking, nothing is answering — and
+                    # it names WHICH engine is missing, because `main.py run`
+                    # starts 1D only and that leaves the 15m lane dead.
                     idle = pulse.get("idle_sec")
+                    missing = [tf for tf in ("15m", "1d")
+                               if not int(pulse.get(f"served_{tf}") or 0)]
+                    age = "never" if idle is None else f"{idle / 3600.0:.1f}h"
+                    how = (f"; start {_LANE_CMD[missing[0]]}" if missing else "")
                     _market_log_once(
                         ("lane-pulse",),
-                        "[lane] ⛔ nothing is servicing the watch list "
-                        f"({pulse['watched']} pair(s) published, last engine stamp "
-                        f"{'never' if idle is None else f'{idle / 3600:.1f}h ago'}) — "
-                        "no candle will be written back until the collector runs "
-                        "(`python main.py run`)",
+                        f"[lane] ⛔ nothing is servicing the watch list "
+                        f"({pulse['watched']} pair(s) published, last engine stamp {age}"
+                        f"{', missing ' + ', '.join(missing) if missing else ''}) — "
+                        f"no candle will be written back{how}",
                     )
             return pulse
 
@@ -2739,7 +2758,7 @@ def _render_chart_html_cached(
         elif filled and stitch_errors:
             stitch_txt = f"{_fail} · {filled} more drawn flat meanwhile"
 
-    _note = _lane_pulse_note()
+    _note = _lane_pulse_note(tf_key)
     if _note:
         stitch_txt = f"{stitch_txt}<br>{_note}"
 

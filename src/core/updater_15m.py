@@ -1924,7 +1924,7 @@ async def priority_lane_loop() -> None:
                 _LANE_SERVED.clear()
                 _LANE_SERVED_BARS["n"] = 0
                 async with pool.acquire() as conn:
-                    await mark_lane_service(conn, served, bars)
+                    await mark_lane_service(conn, served, bars, timeframe="15m")
 
             if time.time() - last_report >= 60.0:
                 log(
@@ -1935,7 +1935,12 @@ async def priority_lane_loop() -> None:
                 stats = {"pairs": 0, "candles": 0}
                 last_report = time.time()
         except Exception as e:
-            log(f"  [LANE] ⚠️ cycle error ({type(e).__name__}: {e})")
+            # Kept, but at most one line per (kind of) error per 10 minutes: this
+            # loop ticks once a second, and a lane that cannot read its table used
+            # to bury the log in identical warnings — while a *silently* dead lane
+            # was the other failure mode. Both are covered now.
+            if lane_warn_due(("cycle", type(e).__name__, str(e)[:80])):
+                log(f"  [LANE] ⚠️ cycle error ({type(e).__name__}: {e})")
 
         await asyncio.sleep(max(0.05, interval - (time.time() - started)))
 

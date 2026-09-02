@@ -496,13 +496,21 @@ def test_the_chart_names_a_dead_collector_instead_of_a_stitch_bug(monkeypatch):
     app = _load_app_module()
 
     monkeypatch.setattr(app, "_LANE_PULSE", {"at": 1.0, "watched": 11, "served": 0,
-                                             "idle_sec": 9000.0}, raising=True)
-    txt = app._lane_pulse_note()
-    assert "no collector" in txt and "2.5h" in txt and "main.py run" in txt
+                                             "served_15m": 0, "idle_15m": 9000.0,
+                                             "served_1d": 0, "idle_1d": 9000.0},
+                        raising=True)
+    txt = app._lane_pulse_note("15m")
+    assert "no 15m engine" in txt and "2.5h" in txt and "--timeframe 15m" in txt
 
     monkeypatch.setattr(app, "_LANE_PULSE", {"at": 1.0, "watched": 11, "served": 3,
-                                             "idle_sec": 4.0}, raising=True)
-    assert "lane alive" in app._lane_pulse_note()
+                                             "served_15m": 3, "idle_15m": 4.0,
+                                             "served_1d": 0, "idle_1d": 9000.0},
+                        raising=True)
+    assert "15m lane alive" in app._lane_pulse_note("15m")
+    # ...while the DAILY chart is still unanswered: `main.py run` starts 1D only,
+    # so the missing engine has to be named per timeframe, not "the collector".
+    assert "no 1d engine" in app._lane_pulse_note("1d")
+    assert "--timeframe 1d" in app._lane_pulse_note("1d")
 
     monkeypatch.setattr(app, "_LANE_PULSE", {}, raising=True)
     assert app._lane_pulse_note() == ""        # never asked → nothing to claim

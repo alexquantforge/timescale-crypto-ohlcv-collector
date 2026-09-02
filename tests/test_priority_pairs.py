@@ -380,6 +380,7 @@ async def test_mark_lane_service_stamps_only_the_pairs_actually_served():
     sqls = [c for c in conn.calls if c[0] == "execute" and "UPDATE" in c[1]]
     assert len(sqls) == 2
     assert "served_at = now()" in sqls[0][1] and "served_bars" in sqls[0][1]
+    assert "served_15m_at = now()" in sqls[0][1]        # per-timeframe column
     assert sqls[0][2] == ("bybit", "BTC/USDT:USDT", 137)
 
 
@@ -387,21 +388,106 @@ async def test_mark_lane_service_stamps_only_the_pairs_actually_served():
 async def test_lane_pulse_reads_watched_served_and_idle():
     from src.core.priority_pairs import lane_pulse
 
-    row = {"watched": 11, "served": 0, "idle_sec": 12_000.0}
+    # 1D engine alive and stamping, 15m engine absent: the row must say so
+    # per timeframe, or `main.py run` (1D only) would look like a healthy lane.
+    row = {"watched": 11, "served": 4, "idle_sec": 3.0,
+           "served_15m": 0, "served_1d": 4, "idle_15m": 12_000.0, "idle_1d": 3.0}
     conn = _PulseConn(row)
     pulse = await lane_pulse(conn)
-    assert pulse == {"watched": 11, "served": 0, "idle_sec": 12000.0}
+    assert pulse["watched"] == 11 and pulse["served"] == 4
+    assert pulse["served_15m"] == 0 and pulse["idle_15m"] == 12000.0
+    assert pulse["served_1d"] == 4 and pulse["idle_1d"] == 3.0
     # the aggregate is ONE query, and it is asked with the freshness window
     assert sum(1 for c in conn.calls if c[0] == "fetchrow") == 1
     assert "count(*) FILTER" in conn.calls[-1][1]
 
-    # A connection that already has the table does not re-run DDL every second:
-    # the lane reads this table once per tick.
-    again = _PulseConn({"watched": 1, "served": 1, "idle_sec": 2.0})
-    await lane_pulse(again)
-    assert any(c[0] == "execute" and "CREATE TABLE" in c[1] for c in again.calls)
-    await lane_pulse(again)
-    assert sum(1 for c in again.calls if c[0] == "execute") == 3   # 1 create + 2 alters
+
+@pytest.mark.asyncio
+async def test_ddl_is_throttled_but_can_be_forced(monkeypatch):
+    """The lane reads this table once a SECOND; `CREATE/ALTER ... IF NOT EXISTS`
+    every second is catalog noise, so DDL runs once and then rarely — while the
+    healing paths can always force it."""
+    from src.core import priority_pairs as pp
+
+    monkeypatch.setattr(pp, "_DDL_DONE_AT", [0.0])
+    conn = _PulseConn()
+    await pp.ensure_priority_table(conn)
+    assert sum(1 for c in conn.calls if "CREATE TABLE" in c[1]) == 1
+    await pp.ensure_priority_table(conn)                    # throttled
+    assert sum(1 for c in conn.calls if "CREATE TABLE" in c[1]) == 1
+    await pp.ensure_priority_table(conn, force=True)         # healed
+    assert sum(1 for c in conn.calls if "CREATE TABLE" in c[1]) == 2
+    # the heartbeat columns grow on PRE-EXISTING tables too, or an upgrade leaves
+    # the dashboard reading a column that was never added
+    assert any("ADD COLUMN IF NOT EXISTS served_at" in c[1] for c in conn.calls)
+
+
+@pytest.mark.asyncio
+async def test_a_pooled_connection_without_weakref_support_still_runs_the_lane(monkeypatch):
+    """THE regression this round: the "already ensured" memo was a
+    `weakref.WeakSet` of connections. asyncpg hands out `PoolConnectionProxy`,
+    which refuses weak references, so `read_priority_pairs()` raised
+    `TypeError: cannot create weak reference to 'PoolConnectionProxy' object` and
+    the priority lane died on every tick — `main.py run` was up, the wake-up was
+    published, and nothing refreshed a single pair."""
+    import weakref
+
+    from src.core import priority_pairs as pp
+
+    class _Proxy:                    # like PoolConnectionProxy: no __dict__/__weakref__
+        __slots__ = ("calls",)
+
+        def __init__(self):
+            self.calls = []
+
+        async def execute(self, sql, *a):
+            self.calls.append(("execute", sql, a))
+
+        async def executemany(self, sql, args):
+            self.calls.append(("executemany", sql, tuple(args)))
+
+        async def fetch(self, sql, *a):
+            self.calls.append(("fetch", sql, a))
+            return [{"exchange": "bybit", "symbol": "0G/USDT:USDT", "age": 1.0}]
+
+    with pytest.raises(TypeError):
+        weakref.ref(_Proxy())        # the fake really is un-weak-referenceable
+
+    monkeypatch.setattr(pp, "_DDL_DONE_AT", [0.0])
+    conn = _Proxy()
+    assert await pp.read_priority_pairs(conn) == [("bybit", "0G/USDT:USDT")]
+    await pp.mark_lane_service(conn, [("bybit", "0G/USDT:USDT")], 5)
+    assert any("served_at = now()" in c[1] for c in conn.calls)
+
+
+@pytest.mark.asyncio
+async def test_a_lane_that_lost_its_table_recreates_it_instead_of_dying(monkeypatch):
+    """Throttled DDL must never turn "the table is gone" into a permanent cycle
+    error: one missing-schema failure re-creates the table and retries."""
+    from src.core import priority_pairs as pp
+
+    class _LostThenFine:
+        def __init__(self):
+            self.fetch_calls = 0
+            self.executed = []
+
+        async def execute(self, sql, *a):
+            self.executed.append(sql)
+
+        async def executemany(self, sql, args):
+            self.executed.append(sql)
+
+        async def fetch(self, sql, *a):
+            self.fetch_calls += 1
+            if self.fetch_calls == 1:
+                raise RuntimeError('relation "dashboard_priority_pairs" does not exist')
+            return []
+
+    monkeypatch.setattr(pp, "_DDL_DONE_AT", [9e15])       # memo says "already done"
+    conn = _LostThenFine()
+    assert await pp.read_priority_pairs(conn) == []
+    assert conn.fetch_calls == 2                            # retried once
+    assert any("CREATE TABLE" in sql for sql in conn.executed)
 
 
 def test_both_lane_loops_stamp_the_heartbeat():
