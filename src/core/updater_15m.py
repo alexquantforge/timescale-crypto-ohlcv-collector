@@ -46,6 +46,7 @@ from src.core.priority_pairs import (
     due_pairs,
     lane_since_sec,
     lane_warn_due,
+    mark_lane_service,
     read_priority_pairs,
 )
 from pytz import timezone as pytz_timezone
@@ -1845,12 +1846,29 @@ async def refresh_priority_pair(ccxt_name: str, symbol: str) -> int:
     return len(cs)
 
 
+# Cadence of the heartbeat stamp into `dashboard_priority_pairs` (see
+# `mark_lane_service`). 15 s is fresh enough for a UI badge and cheap enough to
+# never be a second database workload.
+LANE_STAMP_MIN_INTERVAL_SEC = 15.0
+_LANE_STAMP_AT = [0.0]
+
+
+# Pairs completed since the lane last stamped the heartbeat table, and the number
+# of candles those runs wrote. Stamping per refresh would be a write per pair per
+# second, so the loop reports in batches (see `LANE_STAMP_MIN_INTERVAL_SEC`).
+_LANE_SERVED: set = set()
+_LANE_SERVED_BARS = {"n": 0}
+
+
 async def _lane_worker(pair: Tuple[str, str], stats: Dict[str, int]) -> None:
     exchange_name, symbol = pair
     try:
         written = await refresh_priority_pair(exchange_name, symbol)
         stats["candles"] += written
         stats["pairs"] += 1
+        if written >= 0:                       # a served attempt, even a 0-bar one
+            _LANE_SERVED.add(pair)
+            _LANE_SERVED_BARS["n"] += written
     finally:
         _LANE_LAST_RUN[pair] = time.time()
         _LANE_INFLIGHT.discard(pair)
@@ -1897,6 +1915,16 @@ async def priority_lane_loop() -> None:
             for p in due:
                 _LANE_INFLIGHT.add(p)
                 asyncio.create_task(_lane_worker(p, stats))
+
+            # Heartbeat: "the pair you are looking at IS being serviced", so the
+            # dashboard can tell a slow collector from no collector at all.
+            if _LANE_SERVED and time.time() - _LANE_STAMP_AT[0] >= LANE_STAMP_MIN_INTERVAL_SEC:
+                _LANE_STAMP_AT[0] = time.time()
+                served, bars = list(_LANE_SERVED), _LANE_SERVED_BARS["n"]
+                _LANE_SERVED.clear()
+                _LANE_SERVED_BARS["n"] = 0
+                async with pool.acquire() as conn:
+                    await mark_lane_service(conn, served, bars)
 
             if time.time() - last_report >= 60.0:
                 log(

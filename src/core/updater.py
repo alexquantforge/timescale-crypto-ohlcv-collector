@@ -22,6 +22,7 @@ from src.core.priority_pairs import (
     due_pairs,
     lane_since_sec,
     lane_warn_due,
+    mark_lane_service,
     read_priority_pairs,
     resolve_exchange_alias,
 )
@@ -960,10 +961,20 @@ class MarketDataEngine:
         stats = {"pairs": 0, "bars": 0}
         last_report = time.time()
 
+        served_pending: Set[tuple] = set()
+        stamp_at = [0.0]
+        stamped_bars = [0]        # `stats["bars"]` at the last stamp -> the delta
+        # `LANE_STAMP_MIN_INTERVAL_SEC` from the 15m module: batched heartbeat,
+        # imported lazily because the daily engine must not import the 15m loop.
+        stamp_every = 15.0
+
         async def _run(pair):
             try:
-                stats["bars"] += await self.refresh_priority_pair(pair[0], pair[1])
+                n = await self.refresh_priority_pair(pair[0], pair[1])
+                stats["bars"] += n
                 stats["pairs"] += 1
+                if n >= 0:
+                    served_pending.add(pair)
             finally:
                 last_run[pair] = time.time()
                 inflight.discard(pair)
@@ -980,6 +991,14 @@ class MarketDataEngine:
                         continue
                     inflight.add(pair)
                     asyncio.create_task(_run(pair))
+
+                if served_pending and time.time() - stamp_at[0] >= stamp_every:
+                    stamp_at[0] = time.time()
+                    bars = int(stats["bars"]) - stamped_bars[0]
+                    stamped_bars[0] = int(stats["bars"])
+                    async with pool.acquire() as conn:
+                        await mark_lane_service(conn, list(served_pending), bars)
+                    served_pending.clear()
 
                 if time.time() - last_report >= 60.0:
                     logger.info(

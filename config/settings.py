@@ -251,6 +251,12 @@ class Settings(BaseSettings):
     # change — but a failure is not an answer, and caching it for an hour is what
     # left a chart with a hole long after the exchange was reachable again.
     dash_stitch_retry_sec: float = Field(default=20.0, alias="DASH_STITCH_RETRY_SEC")
+    # How long ONE exchange's `load_markets()` may take in the dashboard. It is
+    # deliberately longer than a candle-fetch timeout (2-4 requests, gate pulls
+    # its currency table too), runs under a per-exchange lock, and only ever in a
+    # background thread when the caller is the render path — a failed load backs
+    # off exponentially instead of being retried by every pair every second.
+    dash_market_load_sec: float = Field(default=25.0, alias="DASH_MARKET_LOAD_TIMEOUT_SEC")
     # Wall-clock budget for the whole-database summary scan. Whatever came
     # back in time is rendered — the dashboard must stay usable while the
     # collector writes.

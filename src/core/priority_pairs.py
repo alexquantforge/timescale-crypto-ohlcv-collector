@@ -20,6 +20,7 @@ unit-testable without a database.
 from __future__ import annotations
 
 import time
+import weakref
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 PRIORITY_TABLE = "dashboard_priority_pairs"
@@ -39,6 +40,20 @@ CREATE_SQL = (
     " updated_at timestamptz NOT NULL DEFAULT now(),"
     " PRIMARY KEY (exchange, symbol))"
 )
+
+# The engine's side of the handshake: when it last SERVED a watched pair, and
+# how many candles that service wrote. Without it the dashboard publishes into
+# the void — "the dashboard wakes the updater" is unobservable, and a collector
+# that is not running (or is stuck) looked exactly like one that refused to fix
+# the gap. The ALTERs are idempotent so an existing table just grows columns.
+SERVE_SQLS = (
+    f"ALTER TABLE {PRIORITY_TABLE} ADD COLUMN IF NOT EXISTS served_at timestamptz",
+    f"ALTER TABLE {PRIORITY_TABLE} ADD COLUMN IF NOT EXISTS served_bars int",
+)
+
+# An ensured connection never re-runs the DDL: the lane reads this table once a
+# second, and `CREATE/ALTER ... IF NOT EXISTS` per second is catalog noise.
+_ENSURED: "weakref.WeakSet" = weakref.WeakSet()
 
 
 def lane_since_sec(
@@ -194,7 +209,12 @@ def resolve_exchange_alias(published: str, name_to_id: dict) -> Tuple[str, str]:
 
 
 async def ensure_priority_table(conn) -> None:
+    if conn in _ENSURED:
+        return
     await conn.execute(CREATE_SQL)
+    for ddl in SERVE_SQLS:
+        await conn.execute(ddl)
+    _ENSURED.add(conn)
 
 
 async def publish_priority_pairs(conn, pairs: Iterable, ttl_sec: float = DEFAULT_TTL_SEC) -> int:
@@ -220,6 +240,50 @@ async def publish_priority_pairs(conn, pairs: Iterable, ttl_sec: float = DEFAULT
         str(int(ttl_sec * 4)),
     )
     return len(normalized)
+
+
+async def mark_lane_service(conn, pairs: Sequence[Tuple[str, str]], candles: int = 0) -> int:
+    """Engine side of the heartbeat: stamp the pairs this loop just served.
+
+    Small (the watch list is capped at `MAX_PRIORITY_PAIRS`) and called at most
+    every few seconds, so the dashboard can always answer "is a live collector
+    actually working on the pair the user is looking at, or is it just waiting
+    for a process that is not running?"
+    """
+    stamped = 0
+    for exchange, symbol in normalize_pairs(pairs):
+        await conn.execute(
+            f"UPDATE {PRIORITY_TABLE} SET served_at = now(), served_bars = $3"
+            " WHERE exchange = $1 AND symbol = $2",
+            exchange, symbol, int(candles),
+        )
+        stamped += 1
+    return stamped
+
+
+async def lane_pulse(conn, stale_sec: float = 120.0) -> dict:
+    """How alive is the lane? Dashboard-side, one cheap aggregate query.
+
+    `watched` — pairs currently published; `served` — of those, how many an
+    engine stamped within `stale_sec`; `idle_sec` — age of the newest stamp
+    overall. `served == 0` with `watched > 0` means NO collector process is
+    servicing the pair the user is looking at: nothing will be written to the
+    database, and a chart hole will stay open no matter how often the page is
+    reloaded. Saying that is far more useful than silently re-painting the hole.
+    """
+    await ensure_priority_table(conn)
+    row = await conn.fetchrow(
+        f"SELECT count(*) AS watched,"
+        f" count(*) FILTER (WHERE served_at > now() - ($1 || ' seconds')::interval) AS served,"
+        f" EXTRACT(EPOCH FROM (now() - max(served_at))) AS idle_sec"
+        f" FROM {PRIORITY_TABLE}"
+        f" WHERE updated_at > now() - ($2 || ' seconds')::interval",
+        str(int(stale_sec)), str(int(DEFAULT_TTL_SEC)),
+    )
+    watched = int(row["watched"] or 0) if row else 0
+    served = int(row["served"] or 0) if row else 0
+    idle = float(row["idle_sec"]) if row and row["idle_sec"] is not None else None
+    return {"watched": watched, "served": served, "idle_sec": idle}
 
 
 async def read_priority_pairs(conn, ttl_sec: float = DEFAULT_TTL_SEC) -> List[Tuple[str, str]]:

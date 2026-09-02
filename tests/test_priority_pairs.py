@@ -351,6 +351,70 @@ async def test_1d_engine_lane_refreshes_the_daily_bar(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# The heartbeat: "did an engine actually service the pair being watched?"
+# ---------------------------------------------------------------------------
+
+class _PulseConn:
+    """Minimal asyncpg stand-in: records statements, replays a canned row."""
+
+    def __init__(self, row=None):
+        self.calls = []
+        self._row = row
+
+    async def execute(self, sql, *args):
+        self.calls.append(("execute", sql, args))
+
+    async def fetchrow(self, sql, *args):
+        self.calls.append(("fetchrow", sql, args))
+        return self._row
+
+
+@pytest.mark.asyncio
+async def test_mark_lane_service_stamps_only_the_pairs_actually_served():
+    from src.core.priority_pairs import mark_lane_service
+
+    conn = _PulseConn()
+    n = await mark_lane_service(conn, [("bybit", "BTC/USDT:USDT"), ("", "junk"),
+                                       ("gate", "0G/USDT:USDT")], candles=137)
+    assert n == 2
+    sqls = [c for c in conn.calls if c[0] == "execute" and "UPDATE" in c[1]]
+    assert len(sqls) == 2
+    assert "served_at = now()" in sqls[0][1] and "served_bars" in sqls[0][1]
+    assert sqls[0][2] == ("bybit", "BTC/USDT:USDT", 137)
+
+
+@pytest.mark.asyncio
+async def test_lane_pulse_reads_watched_served_and_idle():
+    from src.core.priority_pairs import lane_pulse
+
+    row = {"watched": 11, "served": 0, "idle_sec": 12_000.0}
+    conn = _PulseConn(row)
+    pulse = await lane_pulse(conn)
+    assert pulse == {"watched": 11, "served": 0, "idle_sec": 12000.0}
+    # the aggregate is ONE query, and it is asked with the freshness window
+    assert sum(1 for c in conn.calls if c[0] == "fetchrow") == 1
+    assert "count(*) FILTER" in conn.calls[-1][1]
+
+    # A connection that already has the table does not re-run DDL every second:
+    # the lane reads this table once per tick.
+    again = _PulseConn({"watched": 1, "served": 1, "idle_sec": 2.0})
+    await lane_pulse(again)
+    assert any(c[0] == "execute" and "CREATE TABLE" in c[1] for c in again.calls)
+    await lane_pulse(again)
+    assert sum(1 for c in again.calls if c[0] == "execute") == 3   # 1 create + 2 alters
+
+
+def test_both_lane_loops_stamp_the_heartbeat():
+    """The engines' loops must report what they served, or the dashboard cannot
+    tell a busy collector from an absent one."""
+    import pathlib as _pl
+    for rel in ("src/core/updater_15m.py", "src/core/updater.py"):
+        src = (_pl.Path(__file__).parent.parent / rel).read_text()
+        assert "mark_lane_service(" in src, rel
+        assert "served_pending" in src or "_LANE_SERVED" in src, rel
+
+
+# ---------------------------------------------------------------------------
 # The forming candle must be REWRITTEN, never appended to
 # ---------------------------------------------------------------------------
 

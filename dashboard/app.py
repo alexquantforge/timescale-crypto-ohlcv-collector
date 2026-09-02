@@ -37,7 +37,7 @@ from config.settings import settings
 from src.analytics.atr_filtered import compute_atr_no_paranormal_bars
 from src.analytics.orderbook import fetch_orderbook_snapshot
 from src.exchanges.client import create_exchange, close_exchange_safely
-from src.core.priority_pairs import publish_priority_pairs
+from src.core.priority_pairs import lane_pulse, publish_priority_pairs
 from dashboard.helpers import (
     shift_option,
     exchanges_for_ticker,
@@ -1012,6 +1012,132 @@ def _get_sync_exchange(ccxt_id: str):
     return getattr(_ccxt, ccxt_id)({"enableRateLimit": True, "timeout": 8000})
 
 
+# ---------------------------------------------------------------------------
+# Markets: loaded ONCE per exchange, under a lock, with a backoff, never while
+# the user is waiting for a click
+# ---------------------------------------------------------------------------
+# `if not ex.markets: ex.load_markets()` scattered through the feeds looked
+# harmless and was not. A ccxt market load is 2–4 requests (gate also pulls
+# /spot/currencies), slower than any of these instances' 6–8 s timeout, so on a
+# loaded line it FAILS — and the failure left no trace, so the next call tried
+# again: the live chips (once per second × 11 pairs), the chart stitch (once per
+# missing range) and the warm threads all piled onto the same instance at the
+# same time, gate rate-limited them harder, and the chart printed
+# `RequestTimeout: gate GET .../spot/currencies` for every pair while no candle
+# was ever fetched. One loader per exchange, a real timeout for the load, an
+# exponential pause after a failure, and a background mode so the render path
+# never waits for it.
+_MARKET_GATE: dict = {}
+_MARKET_GATE_LOCK = threading.Lock()
+_MARKET_LOG_AT: dict = {}
+
+
+def _market_load_sec() -> float:
+    """How long ONE exchange's market load may take (see `DASH_MARKET_LOAD_TIMEOUT_SEC`)."""
+    return float(getattr(settings, "dash_market_load_sec", 25.0) or 25.0)
+
+
+class MarketsUnavailable(RuntimeError):
+    """Raised instead of silently returning no candles: 'we could not even ask'
+    is a different fact from 'the exchange has nothing here'."""
+
+
+def _market_gate(ccxt_id: str) -> dict:
+    with _MARKET_GATE_LOCK:
+        g = _MARKET_GATE.get(ccxt_id)
+        if g is None:
+            g = {"lock": threading.Lock(), "at": 0.0, "fails": 0,
+                 "err": "", "loading": False}
+            _MARKET_GATE[ccxt_id] = g
+        return g
+
+
+def _market_log_once(key: str, msg: str) -> None:
+    """One line per (topic) per minute — a warm loop over 11 pairs would
+    otherwise print the same failure 30 times a second."""
+    now = time.time()
+    if now - _MARKET_LOG_AT.get(key, 0.0) < 60.0:
+        return
+    _MARKET_LOG_AT[key] = now
+    print(msg, flush=True)
+
+
+def _load_markets_locked(ccxt_id: str, ex, who: str) -> str:
+    """Performs the load while holding the gate lock. Returns '' or a reason."""
+    g = _market_gate(ccxt_id)
+    g["loading"] = True
+    started = time.time()
+    old_timeout = getattr(ex, "timeout", None)
+    try:
+        # A market load needs longer than a candle fetch; restoring it after
+        # keeps the tight timeout where it belongs (on the fetches).
+        ex.timeout = max(int(old_timeout or 0), int(_market_load_sec() * 1000))
+        ex.load_markets()
+        g.update(at=time.time(), fails=0, err="", loading=False)
+        print(f"[markets] {ccxt_id}: {len(ex.markets or {})} markets loaded "
+              f"in {time.time() - started:.1f}s (by {who})", flush=True)
+        return ""
+    except BaseException as e:            # ccxt lets a CancelledError escape here
+        g.update(at=time.time(), fails=int(g["fails"]) + 1, loading=False,
+                 err=f"{type(e).__name__}: {e}")
+        _market_log_once(("load", ccxt_id),
+                         f"[markets] ⚠️ {ccxt_id}: load_markets failed "
+                         f"({g['err']}) — retrying after a backoff, feeds and "
+                         f"stitching stay empty until it works")
+        return g["err"]
+    finally:
+        if old_timeout is not None:
+            try:
+                ex.timeout = old_timeout
+            except Exception:
+                pass
+
+
+def ensure_markets(ccxt_id: str, ex=None, wait_sec: float = 0.0, who: str = "feed") -> str:
+    """'' when `ccxt_id` has markets ready; otherwise a short reason, no raising.
+
+    `wait_sec` = 0 (the render path, anything on the click's critical path): the
+    load is started in a background thread and the caller is told it is not
+    ready — waiting here is precisely what made pair flips feel stuck. A caller
+    that can afford it (a worker thread) passes seconds.
+    """
+    ex = ex if ex is not None else _get_sync_exchange(ccxt_id)
+    if getattr(ex, "markets", None):
+        return ""
+    g = _market_gate(ccxt_id)
+    if not g["lock"].acquire(timeout=max(0.0, float(wait_sec))):
+        # Someone else is loading (or the queue is deeper than our patience).
+        return "markets are loading elsewhere"
+    try:
+        if getattr(ex, "markets", None):
+            return ""                       # loaded while we waited
+        backoff = min(900.0, 20.0 * (2 ** max(0, int(g["fails"]) - 1)))
+        since = time.time() - float(g["at"])
+        if int(g["fails"]) and since < backoff:
+            return (f"market load failed {since:.0f}s ago ({g['err']}); "
+                    f"next try in {backoff - since:.0f}s")
+        if float(wait_sec) <= 0:
+            if g["loading"]:
+                return "markets are still loading"
+            if not g["loading"]:
+                g["loading"] = True
+
+                def _bg_load(ccxt_id=ccxt_id, ex=ex, who=who):
+                    g2 = _market_gate(ccxt_id)
+                    with g2["lock"]:            # released by now; may be busy
+                        if getattr(ex, "markets", None):
+                            g2["loading"] = False
+                        else:
+                            _load_markets_locked(ccxt_id, ex, who)
+
+                threading.Thread(target=_bg_load, daemon=True,
+                                 name=f"markets-{ccxt_id}").start()
+            return "market load started in the background"
+        return _load_markets_locked(ccxt_id, ex, who)
+    finally:
+        g["lock"].release()
+
+
 def _fetch_missing_candles(ccxt_id: str, symbol: str, timeframe: str, r0: int, r1: int):
     """Fetches a missing candle range from the exchange → (closed bars, partial).
 
@@ -1025,15 +1151,33 @@ def _fetch_missing_candles(ccxt_id: str, symbol: str, timeframe: str, r0: int, r
     drawn AND retried: caching them as a complete answer for an hour is how a
     chart stayed gapped after one slow minute.
     """
+    ex = _get_sync_exchange(ccxt_id)
+    reason = ensure_markets(ccxt_id, ex, who="stitch")
+    if reason:
+        raise MarketsUnavailable(reason)
+
+    # One request stream per exchange instance at a time. The stitch runs on the
+    # render thread AND in the warm threads, and two threads driving one ccxt
+    # rate limiter is how a healthy endpoint starts answering with timeouts —
+    # which is what this whole path looked like in the log.
+    gate = _market_gate(ccxt_id)
+    if not gate["lock"].acquire(timeout=max(0.2, float(settings.dash_stitch_budget_sec))):
+        raise TimeoutError(f"{ccxt_id} is busy (another feed or stitch holds it)")
+    try:
+        return _fetch_missing_candles_paged(ex, symbol, timeframe, r0, r1)
+    finally:
+        gate["lock"].release()
+
+
+def _fetch_missing_candles_paged(ex, symbol: str, timeframe: str, r0: int, r1: int):
+    """The paging loop itself, run while the caller holds the exchange gate.
+
+    Pages needed for the requested span (+1 slack) are bounded so a very stale
+    table (weeks behind) is bridged completely instead of stopping mid-way at a
+    fixed page cap.
+    """
     step = 900 if timeframe == "15m" else 86400
     step_ms = step * 1000
-    ex = _get_sync_exchange(ccxt_id)
-    if not ex.markets:
-        ex.load_markets()
-
-    # Pages needed for the requested span (+1 slack), bounded so a very stale
-    # table (weeks behind) is still bridged completely instead of stopping
-    # mid-way at a fixed 6-page cap.
     pages = min(40, max(2, (int(r1) - int(r0)) // 1000 + 2))
     # Hard wall-clock budget: this runs on the chart's critical path, and a
     # very stale table could otherwise page the exchange for a minute while
@@ -1099,8 +1243,16 @@ def _fetch_missing_candles_cached(ccxt_id: str, symbol: str, timeframe: str,
         rows, partial = _fetch_missing_candles(ccxt_id, symbol, timeframe, r0, r1)
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
-        print(f"[stitch] {ccxt_id} {symbol} {timeframe} {r0}-{r1}: {err}", flush=True)
-        _STITCH_CACHE[key] = ([], err, now, float(settings.dash_stitch_retry_sec))
+        if isinstance(e, MarketsUnavailable):
+            # Not this range's problem — the whole exchange is not ready, so all
+            # its ranges share one message, one log line and one longer pause.
+            _market_log_once(("stitch", ccxt_id),
+                             f"[stitch] ⚠️ {ccxt_id}: no candles could be fetched — {err}")
+            _STITCH_CACHE[key] = ([], err, now, max(30.0, float(settings.dash_stitch_retry_sec)))
+        else:
+            _market_log_once(("stitch-err", ccxt_id, type(e).__name__),
+                             f"[stitch] {ccxt_id} {symbol} {timeframe} {r0}-{r1}: {err}")
+            _STITCH_CACHE[key] = ([], err, now, float(settings.dash_stitch_retry_sec))
         if errors is not None:
             errors.append(f"range {r0}-{r1}: {err}")
         return []
@@ -1123,8 +1275,12 @@ def _fetch_missing_candles_cached(ccxt_id: str, symbol: str, timeframe: str,
 def _fetch_ticker_cached(ccxt_id: str, symbol: str):
     ex = _get_sync_exchange(ccxt_id)
     try:
-        if not ex.markets:
-            ex.load_markets()
+        # Not `load_markets()` inline: one load per exchange, in the background,
+        # with a backoff after a failure (see `ensure_markets`). The feeds below
+        # ran on a 1 s cadence, so an unthrottled retry was a self-inflicted
+        # rate-limit storm that starved the chart's own catch-up fetches.
+        if ensure_markets(ccxt_id, ex, who="fetch_ticker_cached"):
+            return None
         t = ex.fetch_ticker(symbol)
         return {
             "last": t.get("last"),
@@ -1315,6 +1471,56 @@ _LAST_PUBLISH = {"ts": 0.0, "key": None}
 _PUBLISH_MIN_INTERVAL = 5.0  # TTL is 90 s — re-announcing more often is waste
 
 
+# Is a COLLECTOR PROCESS answering the wake-up? The dashboard only publishes the
+# watch list; the engines stamp `served_at` when they service it. Without reading
+# that back, "the dashboard should have repaired the chart" and "no collector is
+# running, so nothing can be written" looked identical: a stale chart, a
+# half-hearted stitch and no explanation. One aggregate query, throttled.
+_LANE_PULSE: dict = {"at": 0.0, "watched": 0, "served": 0, "idle_sec": None}
+_PULSE_MIN_INTERVAL = 30.0
+
+
+def lane_health() -> dict:
+    """The last pulse the dashboard read from the coordination table."""
+    return dict(_LANE_PULSE)
+
+
+def _lane_pulse_note() -> str:
+    """One short line under the chart: is a live collector answering the wake-up?
+
+    This exists because "the dashboard should have repaired the gap" and "no
+    collector process is running, so the wake-up goes unanswered" look identical
+    from the chart — a hole and a caption about stitching. The heartbeat in
+    `dashboard_priority_pairs.served_at` is the only thing that tells them apart.
+    """
+    pulse = lane_health()
+    if not pulse.get("at") or not pulse.get("watched"):
+        return ""
+    idle = pulse.get("idle_sec")
+    if pulse.get("served"):
+        age = "never" if idle is None else f"{idle:.0f}s"
+        return (f"<span style='color:#4db6ac'>⚡ lane alive — {pulse['served']}/"
+                f"{pulse['watched']} pair(s) serviced, last stamp {age} ago</span>")
+    age = "never" if idle is None else f"{idle / 3600.0:.1f}h"
+    return ("<span style='color:#ef5350'>⛔ no collector is refreshing this pair "
+            f"(lane last answered {age} ago) — the hole stays in the database "
+            "until `python main.py run` is up</span>")
+
+
+def _read_lane_pulse_async() -> None:
+    now = time.time()
+    if now - float(_LANE_PULSE["at"]) < _PULSE_MIN_INTERVAL:
+        return
+    infra = _live_infra_or_none()
+    if not infra or not infra.get("submit_pulse"):
+        return
+    _LANE_PULSE["at"] = now
+    try:
+        infra["submit_pulse"]()
+    except Exception:
+        pass
+
+
 def _publish_priority_pairs_async(pairs: list) -> None:
     """Hands the displayed pair set to the engine without blocking the rerun.
 
@@ -1335,6 +1541,10 @@ def _publish_priority_pairs_async(pairs: list) -> None:
         infra["submit_publish"](pairs)
     except Exception:
         pass
+    # ...and read the lane's reply (throttled separately, because the pair set
+    # may not change for an hour while the question "is anything listening" must
+    # still be answered).
+    _read_lane_pulse_async()
 
 
 def _get_live_target():
@@ -1361,6 +1571,7 @@ def _live_infra() -> dict:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         infra = {"loop": loop, "pools": {}, "pool_lock": asyncio.Lock()}
+        # `submit_pulse` is defined below and wired into `infra` there
 
         async def get_pool(db_name: str):
             async with infra["pool_lock"]:
@@ -1503,6 +1714,43 @@ def _live_infra() -> dict:
                     conn, pairs, ttl_sec=getattr(settings, "priority_lane_ttl_sec", 90.0)
                 )
 
+        async def lane_pulse_read():
+            """Reads the lane's heartbeat and records it for the chart caption.
+
+            Fire-and-forget like the publish itself: a render thread that waits
+            for the database is the pair-flip latency the user keeps feeling.
+            """
+            db_name = getattr(settings, "priority_lane_db", "") or getattr(
+                settings, "db_high_15m", ""
+            )
+            if not db_name:
+                return None
+            pool = await get_pool(db_name)
+            async with pool.acquire() as conn:
+                pulse = await lane_pulse(conn)
+            if isinstance(pulse, dict):
+                _LANE_PULSE.update(pulse)
+                if pulse.get("watched") and not pulse.get("served"):
+                    # The console line that explains a stale chart better than
+                    # any caption: somebody is asking, nothing is answering.
+                    idle = pulse.get("idle_sec")
+                    _market_log_once(
+                        ("lane-pulse",),
+                        "[lane] ⛔ nothing is servicing the watch list "
+                        f"({pulse['watched']} pair(s) published, last engine stamp "
+                        f"{'never' if idle is None else f'{idle / 3600:.1f}h ago'}) — "
+                        "no candle will be written back until the collector runs "
+                        "(`python main.py run`)",
+                    )
+            return pulse
+
+        def submit_pulse():
+            try:
+                asyncio.run_coroutine_threadsafe(lane_pulse_read(), loop)
+            except Exception:
+                pass
+            return None
+
         def submit_publish(pairs):
             """Schedules the publish and returns IMMEDIATELY.
 
@@ -1582,6 +1830,7 @@ def _live_infra() -> dict:
 
         infra["submit_recent"] = submit_recent
         infra["submit_publish"] = submit_publish
+        infra["submit_pulse"] = submit_pulse
         infra["submit_upsert_nowait"] = submit_upsert_nowait
         infra["submit_upsert"] = submit_upsert
         infra["submit_select"] = submit_select
@@ -1718,13 +1967,12 @@ def _live_infra() -> dict:
                     {"enableRateLimit": True, "timeout": 6000}
                 )
                 writer_ex[ccxt_id] = ex
-        if not ex.markets:
-            with writer_ex_lock:
-                if not ex.markets:
-                    try:
-                        ex.load_markets()
-                    except Exception:
-                        pass
+        # Same rule as the render path: one loader per exchange, backed off on
+        # failure. This used to hold `writer_ex_lock` across a `load_markets()`
+        # that can take longer than the round itself, so a slow gate turned the
+        # whole 1 s writer loop into a queue of waiters that all timed out.
+        if ensure_markets(ccxt_id, ex, wait_sec=0.0, who="live-writer") and not ex.markets:
+            return None
         return ex
 
     def writer_fetch_pair(entry: dict):
@@ -1737,6 +1985,10 @@ def _live_infra() -> dict:
         itself feel stuck while the collector was also running.
         """
         ex = writer_exchange(entry["ccxt"])
+        if ex is None:
+            # markets still loading / the exchange is backing off: no payload
+            # this second, and NO request burned while it is like that.
+            return None
         sym = entry["sym"]
         full = bool(entry.get("cur"))
 
@@ -1878,8 +2130,12 @@ def _fetch_orderbook_top(ccxt_id: str, symbol: str, limit: int = 50):
     """Top-of-book (cached ~1s) for the live Depth/Spread chips."""
     ex = _get_sync_exchange(ccxt_id)
     try:
-        if not ex.markets:
-            ex.load_markets()
+        # Not `load_markets()` inline: one load per exchange, in the background,
+        # with a backoff after a failure (see `ensure_markets`). The feeds below
+        # ran on a 1 s cadence, so an unthrottled retry was a self-inflicted
+        # rate-limit storm that starved the chart's own catch-up fetches.
+        if ensure_markets(ccxt_id, ex, who="fetch_orderbook_top"):
+            return None
         ob = ex.fetch_order_book(symbol, limit=limit)
         return {"bids": ob.get("bids") or [], "asks": ob.get("asks") or []}
     except Exception:
@@ -1891,8 +2147,12 @@ def _fetch_trade_tape(ccxt_id: str, symbol: str, limit: int = 200):
     """Recent trades (cached ~1s) for the live Trades/min chip."""
     ex = _get_sync_exchange(ccxt_id)
     try:
-        if not ex.markets:
-            ex.load_markets()
+        # Not `load_markets()` inline: one load per exchange, in the background,
+        # with a backoff after a failure (see `ensure_markets`). The feeds below
+        # ran on a 1 s cadence, so an unthrottled retry was a self-inflicted
+        # rate-limit storm that starved the chart's own catch-up fetches.
+        if ensure_markets(ccxt_id, ex, who="fetch_trade_tape"):
+            return None
         trades = ex.fetch_trades(symbol, limit=limit) or []
         return [
             {
@@ -2478,6 +2738,10 @@ def _render_chart_html_cached(
             )
         elif filled and stitch_errors:
             stitch_txt = f"{_fail} · {filled} more drawn flat meanwhile"
+
+    _note = _lane_pulse_note()
+    if _note:
+        stitch_txt = f"{stitch_txt}<br>{_note}"
 
     candles_arr, volume_arr = build_series_arrays(frame, with_volume=show_volume)
     dumps = lambda x: json.dumps(x, separators=(",", ":"))

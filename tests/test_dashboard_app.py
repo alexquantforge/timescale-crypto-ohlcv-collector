@@ -345,6 +345,169 @@ def test_a_failed_stitch_is_not_remembered_as_an_answer(monkeypatch):
     assert again == rows and _Flaky.calls == calls
 
 
+def test_markets_are_loaded_once_per_exchange_and_then_reused(monkeypatch):
+    """`if not ex.markets: ex.load_markets()` on a path that runs once per second
+    per pair is a market-load storm (gate: 3 requests, slower than the 8 s
+    instance timeout, so it ALWAYS failed and the chart could never fetch). One
+    load per exchange, then nothing until the markets are gone."""
+    os.environ["DASHBOARD_DEMO"] = "1"
+    app = _load_app_module()
+    calls = []
+
+    class _Ex:
+        markets = {}
+        timeout = 8000
+
+        def load_markets(self):
+            calls.append(1)
+            self.markets = {"A/B": {}}
+
+    ex = _Ex()
+    monkeypatch.setattr(app, "_MARKET_GATE", {}, raising=True)
+    monkeypatch.setattr(app, "_MARKET_LOG_AT", {}, raising=True)
+    monkeypatch.setattr(app, "_get_sync_exchange", lambda ccxt_id: ex)
+
+    assert app.ensure_markets("gate", ex, wait_sec=5.0) == ""
+    assert len(calls) == 1
+    assert app.ensure_markets("gate", ex, wait_sec=0.0) == ""
+    assert len(calls) == 1                      # and no lock dance at all now
+    # a load is given more time than a fetch, and the tight timeout returns
+    assert ex.timeout == 8000
+
+
+def test_the_render_path_never_waits_for_a_market_load(monkeypatch):
+    """The load may take 20 s; a pair flip may not. So the render path starts it
+    in the background and is told, in words, that the data is not available yet."""
+    import types as _types
+
+    os.environ["DASHBOARD_DEMO"] = "1"
+    app = _load_app_module()
+    started = []
+
+    class _T:
+        def __init__(self, target=None, **kw):
+            self._target = target
+
+        def start(self):
+            started.append(self._target)
+
+    class _Ex:
+        markets = {}
+        timeout = 8000
+
+        def load_markets(self):           # would block for 20 s in reality
+            raise AssertionError("must not run inline on the render path")
+
+    ex = _Ex()
+    monkeypatch.setattr(app, "_MARKET_GATE", {}, raising=True)
+    import threading as _real_threading
+    monkeypatch.setattr(app, "threading", _types.SimpleNamespace(
+        Thread=_T, Lock=_real_threading.Lock, Event=_real_threading.Event))
+    monkeypatch.setattr(app, "_get_sync_exchange", lambda ccxt_id: ex)
+
+    reason = app.ensure_markets("gate", ex, wait_sec=0.0)
+    assert "background" in reason
+    assert len(started) == 1                   # one loader, and the caller left
+
+    # ...and a second caller while it is loading is not allowed to queue another.
+    assert "loading elsewhere" in app.ensure_markets("gate", ex, wait_sec=0.0) or \
+           "still loading" in app.ensure_markets("gate", ex, wait_sec=0.0)
+    assert len(started) == 1
+
+
+def test_a_failing_market_load_backs_off_instead_of_beating_the_exchange(monkeypatch):
+    """The log the user pasted was 25 identical `RequestTimeout .../currencies`
+    lines in a minute. A failure must cost ONE retry per backoff window."""
+    os.environ["DASHBOARD_DEMO"] = "1"
+    app = _load_app_module()
+
+    class _Ex:
+        markets = {}
+        timeout = 8000
+        loads = 0
+
+        def load_markets(self):
+            type(self).loads += 1
+            raise RuntimeError("RequestTimeout: gate GET /spot/currencies")
+
+    ex = _Ex()
+    monkeypatch.setattr(app, "_MARKET_GATE", {}, raising=True)
+    monkeypatch.setattr(app, "_MARKET_LOG_AT", {}, raising=True)
+    monkeypatch.setattr(app, "_get_sync_exchange", lambda ccxt_id: ex)
+
+    first = app.ensure_markets("gate", ex, wait_sec=5.0)
+    assert "RequestTimeout" in first
+    second = app.ensure_markets("gate", ex, wait_sec=5.0)
+    assert "next try in" in second
+    assert _Ex.loads == 1                      # the backoff ate the second attempt
+    assert app._MARKET_GATE["gate"]["fails"] == 1
+
+
+def test_a_stitch_without_markets_says_so_instead_of_claiming_no_candles(monkeypatch):
+    """"The exchange returned nothing" and "we never got to ask" are different
+    facts; the caption used to print the first one for both."""
+    import types as _types
+
+    os.environ["DASHBOARD_DEMO"] = "1"
+    app = _load_app_module()
+
+    class _T:
+        def __init__(self, target=None, **kw):
+            self._target = target
+
+        def start(self):
+            pass
+
+    class _Ex:
+        markets = {}
+        timeout = 8000
+        fetched = 0
+
+        def load_markets(self):
+            raise RuntimeError("markets unavailable")
+
+        def fetch_ohlcv(self, *a, **k):
+            type(self).fetched += 1
+            return []
+
+    ex = _Ex()
+    monkeypatch.setattr(app, "_MARKET_GATE", {}, raising=True)
+    monkeypatch.setattr(app, "_MARKET_LOG_AT", {}, raising=True)
+    monkeypatch.setattr(app, "_STITCH_CACHE", {}, raising=True)
+    import threading as _real_threading
+    monkeypatch.setattr(app, "threading", _types.SimpleNamespace(
+        Thread=_T, Lock=_real_threading.Lock, Event=_real_threading.Event))
+    monkeypatch.setattr(app, "_get_sync_exchange", lambda ccxt_id: ex)
+
+    errs = []
+    got = app._fetch_missing_candles_cached(
+        "gate", "0G/USDT:USDT", "15m", 10, 20, errors=errs)
+    assert got == [] and errs and "background" in errs[0]
+    assert _Ex.fetched == 0                    # not one OHLCV request burned
+    # and the retry window for that exchange is wider than for a single range
+    assert app._STITCH_CACHE[("gate", "0G/USDT:USDT", "15m", 10, 20)][3] >= 30.0
+
+
+def test_the_chart_names_a_dead_collector_instead_of_a_stitch_bug(monkeypatch):
+    """The missing half of "the dashboard wakes the updater": if no engine
+    answers the wake-up, the chart has to SAY that the hole will not be written
+    back — otherwise a stale collector and a broken stitch are indistinguishable."""
+    os.environ["DASHBOARD_DEMO"] = "1"
+    app = _load_app_module()
+
+    monkeypatch.setattr(app, "_LANE_PULSE", {"at": 1.0, "watched": 11, "served": 0,
+                                             "idle_sec": 9000.0}, raising=True)
+    txt = app._lane_pulse_note()
+    assert "no collector" in txt and "2.5h" in txt and "main.py run" in txt
+
+    monkeypatch.setattr(app, "_LANE_PULSE", {"at": 1.0, "watched": 11, "served": 3,
+                                             "idle_sec": 4.0}, raising=True)
+    assert "lane alive" in app._lane_pulse_note()
+
+    monkeypatch.setattr(app, "_LANE_PULSE", {}, raising=True)
+    assert app._lane_pulse_note() == ""        # never asked → nothing to claim
+
+
 def test_an_empty_answer_stays_an_empty_answer(monkeypatch):
     """The other half of the rule: a pair the exchange genuinely has no candles
     for must NOT be re-fetched on every rerun — silence is an answer, only a
