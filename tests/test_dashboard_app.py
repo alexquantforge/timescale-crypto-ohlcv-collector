@@ -2697,3 +2697,162 @@ def test_the_collector_skips_the_currency_table_too(monkeypatch):
 
     monkeypatch.setattr(settings, "ccxt_fetch_currencies", True, raising=False)
     assert create_exchange("gate").has.get("fetchCurrencies") is not False
+
+
+def test_a_later_pass_of_a_building_sweep_may_run_longer_while_the_page_is_idle(monkeypatch, capsys):
+    """Their log, first passes after a restart:
+
+        [scan] 15m_low_vol…: 25s budget exhausted — rendering 0/8245 tables
+               (69 chunk(s) skipped on budget/busy db)
+
+    69 chunks of 120 tables at ~6s a chunk is ~6 min of ONE-OFF reading, which
+    25s slices cover at ~4 chunks per pass — 17 passes of "the list is
+    incomplete". The budget is therefore two-valued: the first paint of the
+    process keeps the short one (the page must still open fast), while a later
+    pass of a sweep that is still building runs longer ONLY while nobody has
+    touched the page. No extra query is asked by this: chunks rotate and the
+    catalog is reused mid-sweep, so a longer pass is fewer passes."""
+    import asyncio
+    import time as _time
+
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_scan_budget_sec", 1.0)
+    monkeypatch.setattr(dapp.settings, "dash_scan_budget_idle_sec", 9.0)
+    schema = {f"p{i}_usdt_on_bybit": {"Timestamp": "timestamptz"} for i in range(3)}
+    pool = _FakeScanPool(schema)
+
+    async def fake_create_pool(**kw):
+        return pool
+
+    monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool)
+    monkeypatch.setattr(dapp, "_LAST_INTERACTION_AT", _time.time() - 100.0)
+    st = {}
+    # an already-known listing: the pass that pays for it is the first paint
+    dapp._SCAN_INVENTORY[("h", 1, "db_idle")] = {"at": _time.time(), "tables": dict(schema)}
+
+    asyncio.run(dapp._scan_database("db_idle", "LOW", "h", 1, "u", "p",
+                                    pool_size=1, chunk_size=1, sweep=st))
+    first = dict(dapp._SCAN_META["db_idle"])
+    asyncio.run(dapp._scan_database("db_idle", "LOW", "h", 1, "u", "p",
+                                    pool_size=1, chunk_size=1, sweep=st))
+    later = dict(dapp._SCAN_META["db_idle"])
+    assert first["budget"] == 1.0, "the first paint must not be slowed by this"
+    assert later["budget"] == 9.0, later
+
+    # …and a click brings the short budget back
+    monkeypatch.setattr(dapp, "_LAST_INTERACTION_AT", _time.time())
+    asyncio.run(dapp._scan_database("db_idle", "LOW", "h", 1, "u", "p",
+                                    pool_size=1, chunk_size=1, sweep=st))
+    assert dapp._SCAN_META["db_idle"]["budget"] == 1.0
+    capsys.readouterr()
+
+
+def test_a_chunk_skipped_for_being_busy_is_counted_as_its_own_chunk(monkeypatch, capsys):
+    """The retry counters were deduplicated by the error TAG, and every chunk of
+    120 tables was tagged `chunk[120]` — so a pass in which 68 chunks were
+    skipped on a loaded server printed `2 chunk(s) skipped (db busy)` next to
+    `69 chunk(s) skipped on budget/busy db` in the very next line. One of the
+    two must be wrong, and it was the one the user read first: chunks are tagged
+    by position now."""
+    import asyncio
+
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_scan_yield_gap_sec", 0.0)
+    schema = {f"p{i}_usdt_on_bybit": {"Timestamp": "timestamptz"} for i in range(3)}
+    pool = _FakeScanPool(schema, break_unions="timeout")
+    pool.schema = schema
+
+    async def fake_create_pool(**kw):
+        return pool
+
+    monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool)
+    dapp._SCAN_INVENTORY[("h", 1, "db_tags")] = {
+        "at": __import__("time").time(), "tables": dict(schema)}
+    rows = asyncio.run(dapp._scan_database("db_tags", "LOW", "h", 1, "u", "p",
+                                           pool_size=1, chunk_size=1, budget_sec=10.0,
+                                           sweep={}))
+    out = capsys.readouterr().out
+    assert rows == []
+    # the FIRST number is the one the user reads; both must agree now
+    assert "\u2014 3 chunk(s) skipped (db busy)" in out, out
+    tags = {ln for ln in out.splitlines() if "chunk[1]" in ln or "chunk[2]" in ln}
+    assert tags, "the chunks must be named by position: " + out
+
+
+def test_a_listing_that_fails_is_a_failed_pass_and_not_a_crash(monkeypatch, capsys):
+    """Without a listing there is no chunk to run, so this is the one read a
+    sweep cannot work around — but it must not escape the cached load: an
+    exception there loses the whole page, and returning `[]` loses the PAIR
+    LIST, which is what "15минутка пропала" is. So: partial, cursor untouched,
+    the last listing still counted, and a line saying so."""
+    import asyncio
+
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+
+    async def fake_create_pool(**kw):
+        return _FakeScanPool({})
+
+    async def bad_inventory(*a, **kw):
+        raise RuntimeError("catalog statement timeout")
+
+    monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool)
+    monkeypatch.setattr(dapp, "_table_inventory", bad_inventory)
+    st = {"start": 14, "rows": {}}
+    rows = asyncio.run(dapp._scan_database("db_cat", "LOW", "h", 1, "u", "p",
+                                           pool_size=1, chunk_size=1, budget_sec=5.0,
+                                           sweep=st))
+    assert rows == []
+    meta = dapp._SCAN_META["db_cat"]
+    assert meta["partial"] is True and "listing" in meta["error"], meta
+    assert st["start"] == 14, "a failed read must not move the sweep cursor"
+    out = capsys.readouterr().out
+    assert "the catalog listing failed" in out and "not 'no pairs'" in out
+
+
+def test_the_badge_quotes_the_database_that_is_still_being_read(monkeypatch):
+    """15m/HIGH finished in one chunk, 15m/LOW is at 0/69 — and the badge said
+    "chunk 0/70" because the tier SUMMED both chunk counts. A diagnostic that
+    miscounts its own progress is how a converging sweep gets read as a stalled
+    one, so the position comes from the database that is actually starving."""
+    import asyncio
+
+    import pandas as pd
+
+    from dashboard import app as dapp
+
+    monkeypatch.setattr(dapp.settings, "db_high_15m", "db_hi")
+    monkeypatch.setattr(dapp.settings, "db_low_15m", "db_lo")
+    dapp._SCAN_SWEEP_STATE.clear()
+    dapp._SCAN_SWEEP_STATE["db_lo"] = {"start": 14}
+
+    async def fake_scan(db_name, tier, *a, **kw):
+        # The rows do not matter here: the tier meta is written before the frame
+        # is assembled, and it is the meta the badge reads.
+        if tier == "HIGH":
+            dapp._SCAN_META[db_name] = {
+                "tables": 75, "rows": 75, "chunks": 1, "chunk_start": 0,
+                "missing_tables": 0, "answered_chunks": 1, "partial": False,
+                "carried_rows": 0, "budget": 25.0, "carry_ttl": 900.0,
+                "seconds": 3.0, "sweep_seconds": 1.0, "catalog_seconds": 2.0,
+            }
+            return []
+        dapp._SCAN_META[db_name] = {
+            "tables": 8245, "rows": 0, "chunks": 69, "chunk_start": 14,
+            "missing_tables": 8245, "answered_chunks": 1, "partial": True,
+            "carried_rows": 0, "budget": 90.0, "carry_ttl": float("inf"),
+            "seconds": 120.0, "sweep_seconds": 92.0, "catalog_seconds": 27.3,
+        }
+        return []
+
+    monkeypatch.setattr(dapp, "_scan_database", fake_scan)
+    df = asyncio.run(dapp._load_summary("h", 1, "u", "p", "15m"))
+    m = dapp._SCAN_META["15m"]
+    assert m["starving_chunks"] == 69 and m["starving_chunk_start"] == 14, m
+    assert m["budget"] == 90.0, "the badge must quote the budget the pass ran on"
+    assert m["sweep_incomplete"] is True

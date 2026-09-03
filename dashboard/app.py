@@ -326,22 +326,43 @@ async def _table_inventory(pool, db_name: str, db_host: str = "", db_port: int =
         )
         return ent["tables"]
 
-    async with pool.acquire(timeout=20.0) as conn:
-        col_rows = await conn.fetch(
-            "SELECT c.relname AS table_name, a.attname AS column_name, "
-            "       t.typname AS data_type "
-            "FROM pg_catalog.pg_class c "
-            "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
-            "JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
-            "JOIN pg_catalog.pg_type t ON t.oid = a.atttypid "
-            "WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') "
-            "  AND a.attnum > 0 AND NOT a.attisdropped "
-            # '\_' = a literal underscore: '%_on_%' on its own lets '_' match
-            # any character and pulls unrelated tables into the pair list.
-            "  AND c.relname LIKE '%\\_on\\_%' "
-            "  AND (a.attname = $1 OR a.attname = ANY($2::text[]))",
-            "Timestamp", list(_EXPECTED_SUMMARY_KEYS),
-        )
+    # The listing has its OWN bound, because it is the one read a sweep cannot
+    # work around — and an unbounded one is a scan budget leak. Their log, first
+    # pass after a restart: 27.3s of a 56s pass on pg_catalog, 0 of 69 chunks
+    # answered, badge at "75/8320".
+    _cat_to = max(5.0, float(settings.dash_scan_catalog_timeout_sec))
+    try:
+        async with pool.acquire(timeout=20.0) as conn:
+            col_rows = await asyncio.wait_for(conn.fetch(
+                "SELECT c.relname AS table_name, a.attname AS column_name, "
+                "       t.typname AS data_type "
+                "FROM pg_catalog.pg_class c "
+                "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                "JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
+                "JOIN pg_catalog.pg_type t ON t.oid = a.atttypid "
+                "WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') "
+                "  AND a.attnum > 0 AND NOT a.attisdropped "
+                # '\_' = a literal underscore: '%_on_%' on its own lets '_' match
+                # any character and pulls unrelated tables into the pair list.
+                "  AND c.relname LIKE '%\\_on\\_%' "
+                "  AND (a.attname = $1 OR a.attname = ANY($2::text[]))",
+                "Timestamp", list(_EXPECTED_SUMMARY_KEYS),
+            ), timeout=_cat_to)
+    except Exception as e:
+        # If this process has listed these tables before, that listing is used:
+        # the sweep is walking exactly those tables, a table the database says is
+        # gone is still dropped by `forget_missing_relations`, and a stale guess
+        # costs one pass — while no listing at all costs the pass AND reads as
+        # "this database has no pairs".
+        if ent is not None:
+            _market_log_once(
+                ("inv-timeout", db_name),
+                f"[scan] {db_name}: the catalog read failed ({type(e).__name__}) — "
+                f"reusing a {time.time() - ent['at']:.0f}s listing instead of losing "
+                f"the pass; the next wrapped sweep re-reads it",
+            )
+            return ent["tables"]
+        raise
 
     tables: dict = {}
     for r in col_rows:
@@ -490,7 +511,22 @@ async def _scan_database(
     `dash_scan_recovery_max_tables`.
     """
     started = time.time()
-    budget_sec = settings.dash_scan_budget_sec if budget_sec is None else budget_sec
+    _budget_given = budget_sec is not None
+    budget_sec = float(settings.dash_scan_budget_sec if budget_sec is None else budget_sec)
+    if (not _budget_given and sweep is not None
+            and _SCAN_META.get(db_name, {}).get("budget") is not None
+            and time.time() - _LAST_INTERACTION_AT >= 2.0):
+        # One 25s slice per retry cannot cover an 8k-table tier: their 15m/LOW
+        # database answers ~4-6 chunks of 69 per pass (a 120-table UNION at ~6s
+        # on 6 pooled connections), which is 15-20 passes of "the pair list is
+        # incomplete" for ONE round of reading. So a pass that is not the first
+        # paint of this process, and that runs while nobody has touched the page
+        # for a moment, may use the idle budget. It asks nothing twice: the
+        # chunks rotate and the catalog is reused mid-sweep, so the cost of a
+        # longer pass is FEWER passes. A click stays first in line — every chunk
+        # re-checks the deadline after being granted a connection, and
+        # dash_scan_yield_gap_sec pauses the sweep behind the interaction.
+        budget_sec = max(budget_sec, float(settings.dash_scan_budget_idle_sec))
     pool_size = settings.dash_scan_pool_size if pool_size is None else pool_size
     chunk_size = settings.dash_scan_chunk_size if chunk_size is None else chunk_size
     catalog_secs = 0.0
@@ -533,10 +569,32 @@ async def _scan_database(
 
     try:
         t_catalog = time.time()
-        tables = await _table_inventory(
-            pool, db_name, db_host, db_port,
-            mid_sweep=bool(sweep is not None and "start" in sweep),
-        )
+        try:
+            tables = await _table_inventory(
+                pool, db_name, db_host, db_port,
+                mid_sweep=bool(sweep is not None and "start" in sweep),
+            )
+        except Exception as e:
+            # No listing, therefore no chunks to run. Report a FAILED pass —
+            # partial, sweep cursor untouched, the tables of the last listing
+            # still counted — instead of raising out of the cached load (which
+            # takes the page with it) or returning [] and letting the merge read
+            # that as "this database has no pairs".
+            why = f"{type(e).__name__}: {e}"
+            had = int((_SCAN_META.get(db_name) or {}).get("tables") or 0)
+            _SCAN_META[db_name] = {
+                "tables": had, "rows": 0, "chunks": 0, "skipped_chunks": 0,
+                "fallback_chunks": 0, "seconds": time.time() - started,
+                "sweep_seconds": 0.0, "catalog_seconds": time.time() - t_catalog,
+                "carried_rows": 0, "answered_chunks": 0, "budget": budget_sec,
+                "partial": True, "missing_tables": had, "missing_sample": [],
+                "carry_ttl": _carry_ttl_sec(sweep),
+                "error": f"the pair-table listing itself failed - {why}",
+            }
+            print(f"[scan] {db_name}: the catalog listing failed ({why}) - "
+                  f"{had} table(s) from the last listing kept, nothing re-read; "
+                  f"this is not 'no pairs'", flush=True)
+            return []
         catalog_secs = max(catalog_secs, time.time() - t_catalog)
         if not tables:
             # An EMPTY CATALOG is not an empty database. `pg_catalog` can answer
@@ -619,7 +677,7 @@ async def _scan_database(
                     rows = await asyncio.wait_for(conn.fetch(sql), timeout=left)
             return [dict(r) for r in rows]
 
-        async def run_chunk(chunk: dict):
+        async def run_chunk(ci: int, chunk: dict):
             if time.time() > deadline:
                 skipped.append(len(chunk))
                 return []
@@ -641,7 +699,11 @@ async def _scan_database(
                 answered.update(chunk)
                 return rows_out
             except Exception as e:
-                errors.append((f"chunk[{len(chunk)}]", f"{type(e).__name__}: {e}"))
+                # ci, not len(chunk): 69 chunks of 120 tables all answered
+                # "chunk[120]", and the skip count was taken as a SET of tags, so
+                # a pass that read nothing printed "2 chunk(s) skipped" next to
+                # "69 chunk(s) skipped" in the very next line.
+                errors.append((f"chunk[{ci}]", f"{type(e).__name__}: {e}"))
                 if forget_missing_relations(db_name, db_host, db_port, tables, e):
                     # The chunk is not "slow", it is stale: nothing to retry, and
                     # the tables it named are no longer part of the sweep.
@@ -667,7 +729,7 @@ async def _scan_database(
                     answered.update(chunk)      # flattened to TEXT, but answered
                     return rows_out
                 except Exception as e2:
-                    errors.append((f"chunk[{len(chunk)}]:text", f"{type(e2).__name__}: {e2}"))
+                    errors.append((f"chunk[{ci}]:text", f"{type(e2).__name__}: {e2}"))
                     if forget_missing_relations(db_name, db_host, db_port, tables, e2):
                         return []      # the TEXT retry said the same thing: no table
                     if scan_failure_is_transient(e2):
@@ -702,7 +764,9 @@ async def _scan_database(
         start = int(sweep.get("start", 0)) % n_chunks if (sweep is not None and n_chunks) else 0
         if start:
             chunks = chunks[start:] + chunks[:start]
-        for result in await asyncio.gather(*[run_chunk(c) for c in chunks]):
+        for result in await asyncio.gather(
+            *[run_chunk(ci, c) for ci, c in enumerate(chunks)]
+        ):
             out.extend(result)
 
         answered_chunks = max(0, n_chunks - len(skipped))
@@ -768,6 +832,10 @@ async def _scan_database(
             "missing_tables": len(missing),
             "missing_sample": list(missing[:3]),
             "carry_ttl": _carry_ttl_sec(sweep),
+            # What THIS pass was allowed to run for. The badge quoted the
+            # setting, which stopped being the truth the moment an idle
+            # revalidation was given a longer slice than the first paint.
+            "budget": float(budget_sec),
         }
         tail = f" (+catalog {catalog_secs:.1f}s)" if catalog_secs > 1.0 else ""
         if errors:
@@ -846,7 +914,7 @@ async def _load_summary(db_host, db_port, db_user, db_pass, timeframe: str) -> p
         scans = await asyncio.gather(*[_one(tier, db) for tier, db in dbs])
     all_rows = [r for scan in scans for r in scan]
     metas = [_SCAN_META.get(db, {}) for _, db in dbs]
-    _SCAN_META[timeframe] = {
+    meta_tf = {
         "partial": bool(metas) and any(m.get("partial") for m in metas),
         "seconds": max((m.get("seconds") or 0.0) for m in metas) if metas else 0.0,
         "rows": sum(m.get("rows", 0) for m in metas),
@@ -865,6 +933,22 @@ async def _load_summary(db_host, db_port, db_user, db_pass, timeframe: str) -> p
         "sweep_incomplete": any("start" in _SCAN_SWEEP_STATE.get(db, {})
                                 for _, db in dbs),
     }
+    # The chunk position the badge quotes belongs to the database that is STILL
+    # being read. Summing both tiers made "chunk 0/70" out of a HIGH tier that
+    # finished in one chunk and a LOW tier at 0/69 — a diagnostic that miscounts
+    # its own progress is how a converging sweep gets read as a stalled one.
+    _starving = [
+        m for (_tier, _db), m in zip(dbs, metas)
+        if "start" in (_SCAN_SWEEP_STATE.get(_db) or {}) and m.get("missing_tables")
+    ]
+    if _starving:
+        _m = max(_starving, key=lambda m: m.get("missing_tables") or 0)
+        meta_tf["starving_chunks"] = int(_m.get("chunks") or 0)
+        meta_tf["starving_chunk_start"] = int(_m.get("chunk_start") or 0)
+        meta_tf["budget"] = _m.get("budget")
+    else:
+        meta_tf["starving_chunks"] = meta_tf["starving_chunk_start"] = 0
+    _SCAN_META[timeframe] = meta_tf
     if not all_rows:
         return pd.DataFrame()
     # A chunk flattened to TEXT (type-stable UNION) hands back strings; give
@@ -3474,8 +3558,8 @@ else:
                 # that, because "(backoff)" reads as "the app gave up", which is
                 # exactly what "15минутка не загружается" was while the list grew
                 # by 6 chunks every pass.
-                _n = int(_pm.get("chunks") or 0)
-                _at = int(_pm.get("chunk_start") or 0)
+                _n = int(_pm.get("starving_chunks") or _pm.get("chunks") or 0)
+                _at = int(_pm.get("starving_chunk_start") or 0)
                 _when = (f"the sweep is at chunk {_at}/{_n} and continues in "
                          f"~{max(0, int(_delay - _since))} s")
             elif _since < 5.0:
@@ -3510,12 +3594,14 @@ else:
                 f"⏳ {_tf} pair list is incomplete this frame: {_pm.get('rows', 0)}/"
                 f"{_pm.get('tables', 0)} tables have an answer — the budget read "
                 f"{_fresh} of them this sweep{_carried}{_holes_txt} "
-                f"({settings.dash_scan_budget_sec:.0f}s scan budget) — {_when}. "
+                f"({_pm.get('budget') or settings.dash_scan_budget_sec:.0f}s scan "
+                f"budget) — {_when}. "
                 f"The candles are unaffected (a chart queries its own table), but "
                 f"a pair this sweep has not reached yet is not in the selector — "
                 f"that is the only way this line can cost you a chart. "
-                f"DASH_SCAN_BUDGET_SEC (now {settings.dash_scan_budget_sec:.0f}s) is "
-                f"the lever if the collector keeps the database busy."
+                f"DASH_SCAN_BUDGET_SEC ({settings.dash_scan_budget_sec:.0f}s per pass, "
+                f"{settings.dash_scan_budget_idle_sec:.0f}s once the page sits idle) "
+                f"is the lever if the collector keeps the database busy."
             )
 
 # Counts of what each filter step removed, per tier — see `_pair_list_funnel`.

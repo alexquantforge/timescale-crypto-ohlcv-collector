@@ -299,6 +299,29 @@ class Settings(BaseSettings):
     dash_scan_inventory_ttl_sec: float = Field(
         default=600.0, alias="DASH_SCAN_INVENTORY_TTL_SEC"
     )
+    # How long ONE catalog listing read may take before the sweep stops waiting
+    # for it: with a previous listing in hand that listing is reused for this
+    # pass, without one the pass reports a failed read (never "no pairs"). Their
+    # log: the first sweep after a restart spent 27.3s of its 28.7s on
+    # pg_catalog and answered 0 of 69 chunks — an unbounded catalog read is a
+    # scan budget leak, and it is the one read a sweep cannot work around.
+    dash_scan_catalog_timeout_sec: float = Field(
+        default=45.0, alias="DASH_SCAN_CATALOG_TIMEOUT_SEC"
+    )
+    # Sweep budget for a revalidation while nobody is touching the page. The
+    # FIRST paint always uses dash_scan_budget_sec, so opening the dashboard
+    # costs exactly what it cost before; later passes run while the browser is
+    # idle, and a sweep never re-reads a chunk it already answered, so a longer
+    # pass is FEWER passes rather than more work.
+    #
+    # 120s is sized by their measurements, not by taste: 8 245 pair tables at
+    # ~0.05s a table on 6 pooled connections is one pass of ~70-110s, which is
+    # the whole 15m tier in ONE idle pass instead of the ~20 passes of 25s that
+    # took their list half an hour to build. A click still cuts in: a chunk
+    # re-checks the deadline after it is granted a connection, and
+    # dash_scan_yield_gap_sec pauses the sweep behind the interaction for at
+    # most 3s per pass whatever this is. 0 = never extend (pre-fix behaviour).
+    dash_scan_budget_idle_sec: float = Field(default=120.0, alias="DASH_SCAN_BUDGET_IDLE_SEC")
     # Keep the last good summary on disk and paint it instantly on startup,
     # refreshing in the background (stale-while-revalidate). A scan cut short
     # by the budget is NOT persisted, so a busy collector cannot shrink the
