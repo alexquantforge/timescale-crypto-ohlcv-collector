@@ -252,11 +252,17 @@ class Settings(BaseSettings):
     # left a chart with a hole long after the exchange was reachable again.
     dash_stitch_retry_sec: float = Field(default=20.0, alias="DASH_STITCH_RETRY_SEC")
     # How long ONE exchange's `load_markets()` may take in the dashboard. It is
-    # deliberately longer than a candle-fetch timeout (2-4 requests, gate pulls
-    # its currency table too), runs under a per-exchange lock, and only ever in a
-    # background thread when the caller is the render path — a failed load backs
-    # off exponentially instead of being retried by every pair every second.
-    dash_market_load_sec: float = Field(default=25.0, alias="DASH_MARKET_LOAD_TIMEOUT_SEC")
+    # deliberately longer than a candle-fetch timeout (2-4 requests), runs under a
+    # per-exchange lock, and only ever in a background thread when the caller is
+    # the render path — a failed load backs off exponentially instead of being
+    # retried by every pair every second. 60s, not 25: gate's own
+    # `GET /api/v4/spot/currency_pairs` (its market list — the currency table is
+    # no longer requested, see `ccxt_fetch_currencies`) measured 16s on a good
+    # minute and >25s on a bad one, and a market load that times out is not a
+    # slower chart, it is NO chart work at all: every gap stitch and live feed on
+    # that exchange answers MarketsUnavailable until it succeeds. A load that never
+    # completes costs one background thread its timeout, and nothing else.
+    dash_market_load_sec: float = Field(default=60.0, alias="DASH_MARKET_LOAD_TIMEOUT_SEC")
     # Wall-clock budget for the whole-database summary scan. Whatever came
     # back in time is rendered — the dashboard must stay usable while the
     # collector writes.
