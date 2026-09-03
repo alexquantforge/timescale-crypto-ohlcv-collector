@@ -1547,12 +1547,139 @@ def test_a_complete_tier_is_not_re_scanned_while_another_is_starving(monkeypatch
     monkeypatch.setattr(dapp.settings, "dash_scan_retry_max_sec", 1800.0)
     monkeypatch.setattr(dapp.settings, "dash_scan_rescan_complete_sec", 300.0)
 
-    dapp._SCAN_META["15m"] = {"partial": False}
+    # a complete scan WITH an answer is the only thing worth holding quiet
+    dapp._SCAN_META["15m"] = {"partial": False, "rows": 8312}
     dapp._SCAN_ATTEMPTS["15m"] = 0
     assert dapp._rescan_delay_sec("15m") == 300.0
 
-    dapp._SCAN_META["15m"] = {"partial": True}
+    dapp._SCAN_META["15m"] = {"partial": True, "rows": 6514}
     assert dapp._rescan_delay_sec("15m") == 30.0
+
+    # an "empty but complete" answer is NEVER worth 5 minutes of silence: that
+    # is how a blank selector stayed blank
+    dapp._SCAN_META["15m"] = {"partial": False, "rows": 0, "tables": 0}
+    assert dapp._rescan_delay_sec("15m") == 30.0
+
+
+def test_an_empty_pair_list_never_replaces_a_real_one(monkeypatch):
+    """The remaining hole after the last round, and the difference between
+    "the list is short" and "the tier is gone".
+
+    The monotonic merge used to be conditional on the scan calling itself
+    truncated. A scan that answers NOTHING because the catalog came back empty
+    does not call itself truncated (there is nothing to be missing, as far as it
+    knows) — so an empty frame was allowed to overwrite a 8 312-pair list, and it
+    was even persisted to disk as the startup snapshot, so a restart did not
+    help either."""
+    import pandas as pd
+
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_enabled", True)
+    saved = []
+    monkeypatch.setattr(dapp, "save_summary_snapshot",
+                        lambda path, df: saved.append(len(df)))
+    dapp._SUMMARY_STORE["15m"] = {
+        "df": pd.DataFrame({"db_name": ["a", "b", "c"],
+                            "table_name": ["t1", "t2", "t3"],
+                            "ticker": ["A/USDT", "B/USDT", "C/USDT"]}),
+        "meta": {"partial": True}, "at": 0.0}
+
+    async def blank(*a, **k):
+        # the worst case: the scan says "complete", and the answer is nothing
+        dapp._SCAN_META["15m"] = {"partial": False, "rows": 0, "tables": 0}
+        return pd.DataFrame()
+
+    monkeypatch.setattr(dapp, "_load_summary", blank)
+    df = dapp._scan_summary_now("h", 1, "u", "p", "15m")
+
+    assert len(df) == 3                       # the old list survives
+    assert dapp._SUMMARY_STORE["15m"]["meta"]["kept_rows"] == 3
+    assert saved == [], "an empty frame must never be persisted as the snapshot"
+
+
+def test_an_empty_catalog_is_reported_as_a_failed_read(monkeypatch, capsys):
+    """`_scan_database` used to `return []` silently when the inventory came back
+    empty, leaving `_SCAN_META[db]` at whatever the PREVIOUS pass wrote — so a
+    tier could be declared complete and empty by a catalog read that answered
+    nothing. A database that had tables a pass ago and now has none is a failed
+    read, and it has to be labelled as one."""
+    import asyncio
+
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    pool = _FakeScanPool({})          # catalog answers: no pair tables at all
+
+    async def fake_create_pool(**kw):
+        return pool
+
+    monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool)
+
+    # first pass: this database had never listed anything -> a real "no pairs"
+    rows = asyncio.run(dapp._scan_database(
+        "db_empty", "LOW", "h", 1, "u", "p", pool_size=1, chunk_size=120,
+        budget_sec=10.0, sweep={}))
+    assert rows == []
+    assert dapp._SCAN_META["db_empty"]["partial"] is False
+    assert "0 pair tables" not in capsys.readouterr().out
+
+    # second pass, after a pass that DID list tables -> suspected failed read
+    dapp._SCAN_META["db_empty"] = {"tables": 4173, "rows": 4173, "partial": False}
+    asyncio.run(dapp._scan_database(
+        "db_empty", "LOW", "h", 1, "u", "p", pool_size=1, chunk_size=120,
+        budget_sec=10.0, sweep={}))
+    meta = dapp._SCAN_META["db_empty"]
+    assert meta["partial"] is True
+    assert meta["missing_tables"] == 4173 and meta["tables"] == 0
+    out = capsys.readouterr().out
+    assert "the catalog answered 0 pair tables (previous pass: 4173)" in out
+    assert "NOT caching that as 'no pairs'" in out
+
+
+def test_the_pair_list_funnel_says_which_filter_ate_the_tier(capsys):
+    """"No 15m charts" with a database full of them was twice a mystery because
+    the page only warns when BOTH tiers are empty. The funnel has to name the
+    step, not the symptom."""
+    import pandas as pd
+
+    from dashboard import app as dapp
+
+    class _St:
+        def __init__(self):
+            self.warnings, self.captions = [], []
+
+        def warning(self, *a, **k):
+            self.warnings.append(a[0])
+
+        def caption(self, *a, **k):
+            self.captions.append(a[0])
+
+    st = _St()
+    orig = dapp.st
+    dapp.st = st
+    try:
+        assert dapp._pair_list_funnel("15m", 8312, pd.DataFrame()) == 8312
+        assert st.warnings and "8312" in st.warnings[0]
+        assert "Hide dead spot duplicates" in st.warnings[0]
+        assert "filter_sane_summary_rows" in st.warnings[0]
+
+        # a modest, legitimate shrink says nothing
+        st.warnings.clear(); st.captions.clear()
+        df = pd.DataFrame({"ticker": [f"P{i}/USDT" for i in range(8000)]})
+        assert dapp._pair_list_funnel("15m", 8312, df) == 312
+        assert not st.warnings and not st.captions
+
+        # most of the tier gone -> a caption, and the console line
+        st.warnings.clear(); st.captions.clear()
+        df2 = pd.DataFrame({"ticker": [f"P{i}/USDT" for i in range(40)]})
+        assert dapp._pair_list_funnel("1D", 800, df2) == 760
+        assert st.captions and "40 in the list" in st.captions[0]
+        assert not st.warnings
+        assert "[pairs] 1D: the scan answered 800 table(s)" in capsys.readouterr().out
+    finally:
+        dapp.st = orig
 
 
 def test_a_sweep_that_is_still_building_the_list_is_not_backed_off(monkeypatch):

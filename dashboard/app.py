@@ -519,6 +519,36 @@ async def _scan_database(
         tables = await _table_inventory(pool, db_name, db_host, db_port)
         catalog_secs = max(catalog_secs, time.time() - t_catalog)
         if not tables:
+            # An EMPTY CATALOG is not an empty database. `pg_catalog` can answer
+            # with nothing when the read was cut off or the cache expired onto a
+            # busy server, and a schema move (the zombie-prune's `SET SCHEMA`)
+            # takes tables out of `public` without deleting anything. Believing
+            # "0 pair tables" is exactly how a whole timeframe disappears from the
+            # selector while its candles sit untouched in Postgres — so the pass
+            # says what it saw, and is partial whenever this database had tables
+            # on the previous pass. Only a database that has NEVER listed one is
+            # allowed to be believed as empty.
+            had = int((_SCAN_META.get(db_name) or {}).get("tables") or 0)
+            _SCAN_META[db_name] = {
+                "tables": 0, "rows": 0, "chunks": 0, "skipped_chunks": 0,
+                "fallback_chunks": 0, "seconds": time.time() - started,
+                "sweep_seconds": 0.0, "catalog_seconds": catalog_secs,
+                "carried_rows": 0, "answered_chunks": 0,
+                "partial": had > 0,
+                "missing_tables": had,
+                "error": "" if had == 0 else
+                         "the catalog listed 0 pair tables after a pass that "
+                         "listed some — treated as a failed read, not as 'no pairs'",
+            }
+            if had > 0:
+                _market_log_once(
+                    ("scan-empty-catalog", db_name),
+                    f"[scan] {db_name}: the catalog answered 0 pair tables (previous "
+                    f"pass: {had}) — NOT caching that as 'no pairs'; keeping what "
+                    f"this database had and retrying. If the tables were moved out "
+                    f"of `public`, that is why: `ALTER TABLE <schema>.<tbl> SET "
+                    f"SCHEMA public` or clear the caches to re-read.",
+                )
             return []
 
         sem = asyncio.Semaphore(max(1, int(pool_size)))
@@ -842,7 +872,7 @@ def _rescan_delay_sec(timeframe: str) -> float:
         # left their 15m selector half-built for an hour: ~1 500 of 8 235 tables
         # rendered, then a 15-minute wait, then the carried rows expired.
         delay = min(delay, 2.0 * float(settings.dash_snapshot_refresh_sec))
-    if not meta.get("partial"):
+    if not meta.get("partial") and int(meta.get("rows") or 0) > 0:
         # The last scan answered everything, so the list it produced is the
         # truth for as long as anything can plausibly have changed. Re-asking
         # for 8k tables every refresh tick is what starved the OTHER tier's
@@ -904,16 +934,19 @@ def _scan_summary_now(db_host, db_port, db_user, db_pass, timeframe: str,
         df = asyncio.run(_load_summary(db_host, db_port, db_user, db_pass, timeframe))
         meta = dict(_SCAN_META.get(timeframe, {}))
         prev = (_SUMMARY_STORE.get(timeframe) or {}).get("df")
-        # The second half of the condition is the case a truncated scan does not
-        # cover: a database whose cached catalog still names pair tables but that
-        # answered NONE of them (an empty inventory read, a tier whose rows all
-        # failed) reports no `partial` and would still empty the selector.
-        # "0 of 8235 tables" is a scan that got nothing, not a database with
-        # nothing in it — and only the latter is allowed to shrink the list.
-        nothing_but_tables = (
-            len(df) == 0 and int(meta.get("tables") or 0) > 0
-        )
-        if (meta.get("partial") or nothing_but_tables) and prev is not None and not prev.empty:
+        # `len(df) == 0` is its OWN case: an empty pair list is never an
+        # acceptable replacement for a non-empty one inside a session, whatever
+        # the scan claims. The one deliberate exception is a database that really
+        # has no pair tables at all — there is nothing in the store to replace in
+        # that case, and "🔄 Refresh data" clears the store to allow it.
+        # Two conditions, and the second is the one that bit twice: a scan that
+        # came back EMPTY — whether the catalog named 8 235 tables and answered
+        # none, or the catalog itself answered 0 after a schema move — is a scan
+        # that got nothing, not a database with nothing in it. Only a database
+        # that never had pair tables may shrink the list to empty, and there is
+        # then no previous frame to replace anyway.
+        if ((meta.get("partial") or len(df) == 0)
+                and prev is not None and not prev.empty):
             # MONOTONIC serving: a truncated scan adds to the pair list, it
             # never replaces it. Without this the newest-but-partial answer won
             # and a busy hour turned the 15m selector into an empty box — the
@@ -936,7 +969,13 @@ def _scan_summary_now(db_host, db_port, db_user, db_pass, timeframe: str,
         _SUMMARY_STORE[timeframe] = {"df": df, "meta": meta, "at": time.time()}
         # The streak decides when we dare to try again.
         _SCAN_ATTEMPTS[timeframe] = _SCAN_ATTEMPTS.get(timeframe, 0) + 1 if meta.get("partial") else 0
-        if settings.dash_snapshot_enabled and not meta.get("partial"):
+        # …and the snapshot stays reserved for a pass that read the tables
+        # itself. A list assembled by merging carried rows (or by the
+        # never-shrink fallback) is a rendering decision, not a fresh reading of
+        # the database, and persisting it is how a stale pair list would survive a
+        # restart and look authoritative.
+        if (settings.dash_snapshot_enabled and not meta.get("partial")
+                and not df.empty and not meta.get("kept_rows")):
             save_summary_snapshot(
                 snapshot_path(settings.dash_snapshot_dir, timeframe), df
             )
@@ -2517,6 +2556,52 @@ def _fetch_trade_tape(ccxt_id: str, symbol: str, limit: int = 200):
         return None
 
 
+def _pair_list_funnel(tf: str, scanned: int, shown: pd.DataFrame) -> int:
+    """Say out loud where a pair list went, instead of letting a tier go silent.
+
+    Twice now the report was "пропали все 15m графики" and both times the
+    dashboard KNEW the answer and never said it: the scan had tables, and the
+    list was emptied downstream of it — an empty catalog read, `filter_sane_summary_rows`
+    throwing out rows whose `max_ts` it does not believe, the perp-first de-duplication
+    or the sidebar's exchange checkboxes. The page warns when BOTH tiers are empty;
+    when only one is, it used to render nothing at all, which is indistinguishable
+    from "the collector lost the data".
+
+    Returns how many rows the enabled-exchange step alone removed (the caller
+    already measured the earlier steps), and prints the funnel on the console and
+    in the UI whenever a tier ends up with no pair to open while the scan had some.
+    """
+    final = 0 if shown is None else len(shown)
+    # Worth saying when a tier has NOTHING to open, and when it lost most of what
+    # the scan answered — a 8 312 → 400 list is the same class of accident, just
+    # partially visible, and "the list looks short today" is otherwise
+    # indistinguishable from "the collector has fewer pairs now".
+    if scanned <= final or (final and final * 4 > scanned):
+        return scanned - final
+    line = (f"[pairs] {tf}: the scan answered {scanned} table(s), the pair list "
+            f"shows {final} — {scanned - final} dropped by the filters after the "
+            f"scan (enabled exchanges, timestamp sanity, perp-first de-dup); "
+            f"the tables themselves are unaffected")
+    print(line, flush=True)
+    where = ("the enabled 🌐 Exchanges checkboxes, `filter_sane_summary_rows` "
+             "(rows whose `max_ts` it does not believe) and 🚫 Hide dead spot "
+             "duplicates (perp-first suppression)")
+    if final == 0:
+        st.warning(
+            f"⚠️ **{tf}: the scan answered {scanned} pair table(s) but the pair "
+            f"list is empty** — {where} hid them. Nothing is missing from the "
+            f"database: turn 🚫 Hide dead spot duplicates off and enable all "
+            f"🌐 Exchanges to see which step dropped them, and read the "
+            f"`[scan]` lines in the console.",
+        )
+    else:
+        st.caption(
+            f"ℹ️ {tf}: {scanned} tables answered by the scan, {final} in the "
+            f"list — {scanned - final} hidden after the scan by {where}."
+        )
+    return scanned - final
+
+
 def _db_atr_label(row_is_15m: bool) -> str:
     """Which ATR a pair table's `ob_atr_*` columns were actually written with.
 
@@ -3393,6 +3478,9 @@ else:
                 f"keeps the DB busy."
             )
 
+# Counts of what each filter step removed, per tier — see `_pair_list_funnel`.
+_scan_rows_15m, _scan_rows_1d = len(df_15m), len(df_1d)
+
 # Keep only pairs of the exchanges enabled in the sidebar — charts tab,
 # Prev/Next list, live writer target set and the liquidity table all inherit it.
 if enabled_exs and not df_15m.empty:
@@ -3412,6 +3500,9 @@ df_1d = filter_sane_summary_rows(df_1d)
 if hide_spot_dupes:
     df_15m = drop_stale_spot_duplicates(df_15m)
     df_1d = drop_stale_spot_duplicates(df_1d)
+
+_funnel_15m = _pair_list_funnel("15m", _scan_rows_15m, df_15m)
+_funnel_1d = _pair_list_funnel("1D", _scan_rows_1d, df_1d)
 
 df_table = df_15m if table_tf == "15m" else df_1d
 
