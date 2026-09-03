@@ -117,6 +117,9 @@ def generate_demo_summary(timeframe: str) -> pd.DataFrame:
                 "ob_min_7d_volume_usd": float(rng.uniform(1e6, 5e8)),
                 "ob_spread_atr_pct": float(rng.uniform(0.5, 8)),
                 "ob_atr_no_paranormal": close * 0.02,
+                # synthetic numbers, but labelled with the estimator they imitate:
+                # the demo panel must not show a bare "ATR" the real UI outgrew
+                "atr_label": format_atr_label("1D", 5),
                 "table_name": f"demo_{t.replace('/', '_').replace(':', '').lower()}_on_{ex}",
                 "db_name": "demo_db",
                 "volume_tier": "HIGH" if rng.random() < 0.6 else "LOW",
@@ -460,8 +463,40 @@ def score_depth_usd(depth) -> float:
     return _clamp01((np.log10(float(depth)) - 3.0) / (np.log10(50_000.0) - 3.0))
 
 
+def format_atr_label(timeframe, period, style: str = "") -> str:
+    """The name every mention of ATR in the UI should print: `1D_ATR(5)`.
+
+    Which ATR is which matters here more than in most dashboards, because the
+    same column names are fed by three different estimators:
+
+    * `1D_ATR(n)` — median-seeded mean of True Range over the last n CLOSED
+      daily bars, iteratively trimmed to [0.5×ATR, 1.8×ATR]
+      (`compute_atr_no_paranormal_bars`) — used by the 1D engine and by the
+      health strip (whose n comes from the sidebar slider, not from `ATR_PERIOD`);
+    * `15m_ATR(n)` — the same window over 15-minute bars, smoothed Gerchik-style
+      (`compute_gerchik_atr`) — used by the 15m engine for `ob_atr_no_paranormal`
+      / `ob_spread_atr_pct` of 15m tables.
+
+    So the label is BUILT from the parameters that were actually used, never
+    hardcoded: a chip that says 5 while the setting says 14 is worse than no
+    label at all, because users read it as methodology.
+
+    `style` is for the rare case where the estimator itself is the point
+    (e.g. "Gerchik"); the long explanation belongs in the tooltip.
+    """
+    tf = str(timeframe or "?").upper().replace("M", "m") if timeframe else "?"
+    try:
+        n = int(period)
+    except (TypeError, ValueError):
+        n = 0
+    label = f"{tf}_ATR({n})" if n > 0 else f"{tf}_ATR(?)"
+    if style:
+        label += f"·{style}"
+    return label
+
+
 def score_spread_atr_pct(pct) -> float:
-    """1 = spread below 5% of daily filtered ATR, 0 = 15% or wider."""
+    """1 = spread below 5% of the ATR named in the chip, 0 = 15% or wider."""
     if pct is None:
         return 0.0
     pct = float(pct)
@@ -517,6 +552,11 @@ def build_health_strip_html(row: dict) -> str:
         except (TypeError, ValueError):
             return None
 
+    # Which ATR this frame's numbers came from, in the reader's terms. The live
+    # strip passes the label it computed the ATR with; a row read straight from a
+    # pair table carries no label, because the value was written by whichever
+    # engine owns that table (`_atr_label_for_db_row` fills that in).
+    atr_name = row.get("atr_label") or "ATR"
     tpm = _num("ob_trades_per_min")
     depth = _num("ob_total_depth_usd")
     spread_pct = _num("ob_spread_atr_pct")
@@ -538,14 +578,19 @@ def build_health_strip_html(row: dict) -> str:
                         "or unwatched pair is sampled with the ticker alone (bid/ask "
                         "only), and its table may hold no ob_* snapshot either"
                         if depth is None else "")),
-        _health_chip("↔ Spread % ATR",
+        _health_chip(f"↔ Spread % {atr_name}",
                      f"{spread_pct:.1f}%" if spread_pct is not None else "n/a",
                      score_spread_atr_pct(spread_pct),
-                     "Spread as % of daily filtered ATR: green < 5%, red ≥ 15%"
-                     + (" — n/a needs BOTH the bid/ask and a daily ATR; a pair whose "
-                        "1D table has fewer than 3 bars has no ATR to divide by. The "
-                        "raw bid-ask is on the LIVE line below, which is a different "
-                        "number" if spread_pct is None else "")),
+                     f"(Ask − Bid) / {atr_name} × 100 — the ATR is the filtered "
+                     f"mean of True Range over the named bars (paranormal and tiny "
+                     f"bars trimmed to [0.5×ATR, 1.8×ATR], ≥3 bars needed), NOT "
+                     f"Wilder's smoothing. Green < 5%, red ≥ 15%. The absolute "
+                     f"spread and its % of the mid price are on the LIVE line below "
+                     f"— same numerator, different denominator."
+                     + (" — n/a needs BOTH the bid/ask and a value for "
+                        f"{atr_name}: a pair with fewer than 3 bars on that "
+                        "timeframe has no ATR to divide by"
+                        if spread_pct is None else "")),
         _health_chip("💰 Min 7d $Vol", fmt_usd_compact(minvol), score_min_volume_usd(minvol),
                      "min(vol×low) over the last 7 days: HIGH tier ≥ $500K/day, LOW tier < $100K/day"),
     ]

@@ -1155,7 +1155,8 @@ def test_the_live_line_omits_what_the_exchange_never_answered():
 
     html = dapp._live_line_html(
         {"last": 0.1024, "bid": 0.1023, "ask": 0.1024, "pct": None})
-    assert "spread 0.0001 (0.098%)" in html
+    assert "spread 0.0001" in html
+    assert "(0.098% of mid)" in html          # the denominator is named
     assert "24h" not in html
 
     assert "24h" not in dapp._live_line_html(
@@ -1176,13 +1177,83 @@ def test_the_strip_says_which_input_a_missing_chip_is_waiting_for():
     html = build_health_strip_html({"ob_trades_per_min": 5.0,
                                     "ob_min_7d_volume_usd": 271_000.0})
     assert "no orderbook row" in html          # Depth chip explains itself
-    assert "daily ATR" in html                 # Spread chip explains itself
+    assert "fewer than 3 bars" in html         # Spread chip explains itself
     assert "5/min" in html and "$271K" in html
 
     filled = build_health_strip_html({"ob_trades_per_min": 5.0, "ob_total_depth_usd": 1e3,
                                       "ob_spread_atr_pct": 3.9,
                                       "ob_min_7d_volume_usd": 4.95e5})
     assert "no orderbook row" not in filled and "daily ATR" not in filled
+
+
+def test_every_atr_mention_names_the_timeframe_and_the_period(monkeypatch):
+    """"ATR" alone is not a metric. The dashboard has THREE estimators behind
+    similar-looking numbers — `1D_ATR(n)` filtered (strip + metric cards, n from
+    the sidebar slider), `1D_ATR(ATR_PERIOD)` filtered (what the 1D engine wrote
+    into the pair table) and `15m_ATR(ATR_PERIOD)` Gerchik-smoothed (what the 15m
+    engine wrote) — so every label must be BUILT from the values that produced the
+    number on screen, or a reader compares incomparable things."""
+    from dashboard import app as dapp
+    from dashboard.helpers import build_health_strip_html, format_atr_label
+
+    assert format_atr_label("1D", 5) == "1D_ATR(5)"
+    assert format_atr_label("15m", 10) == "15m_ATR(10)"
+    assert format_atr_label("1d", 5) == "1D_ATR(5)"        # the slider/DB differ in case
+    assert format_atr_label("1D", 0) == "1D_ATR(?)"         # never invent a period
+    assert format_atr_label("15m", 5, style="Gerchik") == "15m_ATR(5)·Gerchik"
+
+    monkeypatch.setattr(dapp.settings, "atr_period", 12)
+    # a pair row read from the database is labelled by its OWN timeframe, because
+    # the engine that wrote it is the only thing that decided the estimator
+    assert dapp._db_atr_label(row_is_15m=False) == "1D_ATR(12)"
+    assert dapp._db_atr_label(row_is_15m=True) == "15m_ATR(12)"
+
+    live = {"last": 0.1022, "bid": 0.1021, "ask": 0.1022,
+            "depth_usd": 45_000.0, "pct": -1.73, "trades_per_min": 4.0}
+    monkeypatch.setattr(dapp, "_db_live_read", lambda *a, **k: dict(live))
+    monkeypatch.setattr(dapp, "_feed_value", lambda *a, **k: None)
+    row = dapp._compute_live_health_row(
+        "1000000MOG/USDT", "bybit", None, 0.0036, {}, db_name="vol_15m_high",
+        atr_label=format_atr_label("1D", 5))
+    html = build_health_strip_html(row)
+    assert "↔ Spread % 1D_ATR(5)" in html                  # chip label
+    assert html.count("1D_ATR(5)") >= 2                    # label AND tooltip formula
+    assert "Wilder" in html                                # says what it is NOT
+    assert "$45K" in html                                  # depth came from the live row
+
+    # the same strip from a stored 15m row must not claim to be daily
+    row2 = dapp._compute_live_health_row(
+        "1000000MOG/USDT", "bybit", None, 0.0, {"ob_spread_atr_pct": 2.8},
+        db_name="vol_15m_high")
+    assert "15m_ATR(12)" in build_health_strip_html(row2)
+    assert dapp._live_line_html(live, "1D_ATR(5)").count("1D_ATR(5)") >= 1
+    assert "0.098% of mid" in dapp._live_line_html(live, "1D_ATR(5)")
+
+
+def test_no_bare_atr_label_is_left_in_the_ui():
+    """A guard, not a style rule: the user-visible ATR strings are built through
+    `format_atr_label`, so an edit that puts a bare "ATR" back into a chip, a
+    metric heading or a table header has to fail something. (Docstrings and
+    comments may still talk about ATR generically — they are not on screen.)"""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "dashboard"
+    banned = [
+        '"↔ Spread % ATR"',          # the chip, without a named estimator
+        '"Spread % of ATR"',         # the metric card / column header
+        '"ATR w/o Paranormal Bars',  # the metric card / column header
+        '"🎯 ATR Period (bars)"',    # the slider, which did not say WHICH bars
+        "### 1. ATR without Paranormal Bars",   # methodology section headings
+        "### 2. Spread % of ATR",               # ditto
+    ]
+    offenders = []
+    for name in ("app.py", "helpers.py"):
+        text = (root / name).read_text()
+        for lit in banned:
+            if lit in text:
+                line = text[: text.index(lit)].count("\n") + 1
+                offenders.append(f"dashboard/{name}:{line}: {lit}")
+    assert not offenders, offenders
 
 
 def test_feed_value_serves_cache_and_never_fetches_inline(monkeypatch):

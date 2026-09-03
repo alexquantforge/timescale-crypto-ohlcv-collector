@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from config.settings import settings
 from src.analytics.atr_filtered import compute_atr_no_paranormal_bars
+from dashboard.helpers import format_atr_label
 from src.analytics.orderbook import fetch_orderbook_snapshot
 from src.exchanges.client import create_exchange, close_exchange_safely
 from src.core.priority_pairs import lane_pulse, publish_priority_pairs
@@ -1587,7 +1588,8 @@ def _feed_value(kind: str, ccxt_id: str, symbol: str, max_age_sec: float = _FEED
     return ent["value"]
 
 
-def _render_live_panel(ticker: str, exchange: str, demo: bool, db_name: str = None):
+def _render_live_panel(ticker: str, exchange: str, demo: bool, db_name: str = None,
+                       atr_label: str = ""):
     """One-line LIVE chips: price, bid/ask, spread, 24h change.
 
     Reads the live row the background daemon keeps writing to TimescaleDB
@@ -1622,7 +1624,7 @@ def _render_live_panel(ticker: str, exchange: str, demo: bool, db_name: str = No
             ccxt_id = exchange_map.get(exchange, exchange)
             data = _feed_value("ticker", ccxt_id, ticker)
 
-    html = _live_line_html(data)
+    html = _live_line_html(data, atr_label)
     if not html:
         st.caption("🔴 LIVE: waiting for the first tick…")
         return
@@ -1638,7 +1640,7 @@ def _finite(v):
     return f if f == f and abs(f) != float("inf") else None
 
 
-def _live_line_html(data: dict) -> str:
+def _live_line_html(data: dict, atr_label: str = "") -> str:
     """Compose the one-line LIVE chips (price · bid/ask · spread · 24h change).
 
     Every part is optional and non-finite counts as missing, because that is what
@@ -1661,7 +1663,20 @@ def _live_line_html(data: dict) -> str:
         abs_sp = ask - bid
         mid = (ask + bid) / 2.0
         if mid > 0:
-            parts.append(f" &nbsp;·&nbsp; spread {abs_sp:.6g} ({abs_sp / mid * 100.0:.3f}%)")
+            # "0.098%" on its own reads as a percentage of whatever is nearby —
+            # the 24h change sits one clause away, and the chip above shows a
+            # spread percentage with a completely different denominator. So name
+            # the denominator, and name the other number too.
+            other = ""
+            if atr_label:
+                other = (f" The chip above divides the same {abs_sp:.6g} by "
+                         f"{atr_label} instead.")
+            tip = (f"(Ask - Bid) / mid x 100, mid = (Ask + Bid) / 2 = {mid:.6g} "
+                   f"- a property of the BOOK, not of the last trade, so a stale "
+                   f"print cannot move it.{other}")
+            parts.append(
+                f" &nbsp;·&nbsp; spread {abs_sp:.6g} "
+                f"<span title=\"{tip}\">({abs_sp / mid * 100.0:.3f}% of mid)</span>")
     pct = _finite(data.get("pct"))
     if pct is not None:
         color = "#66bb6a" if pct >= 0 else "#ef5350"
@@ -2502,7 +2517,23 @@ def _fetch_trade_tape(ccxt_id: str, symbol: str, limit: int = 200):
         return None
 
 
-def _compute_live_health_row(sym_ticker, sym_ex, hist_1d, atr_val, db_row, db_name: str = None):
+def _db_atr_label(row_is_15m: bool) -> str:
+    """Which ATR a pair table's `ob_atr_*` columns were actually written with.
+
+    The dashboard does not compute those: the engine that owns the table does,
+    with `ATR_PERIOD` bars of ITS timeframe — daily tables get the filtered
+    daily ATR, 15m tables a Gerchik-smoothed 15m ATR. Naming the chip
+    `1D_ATR(5)` because that is what the sidebar slider says would be a straight
+    lie for a 15m row, and a 15m row is exactly what the non-fragment path
+    renders when no 1D table exists for the pair.
+    """
+    if row_is_15m:
+        return format_atr_label("15m", settings.atr_period)
+    return format_atr_label("1D", settings.atr_period)
+
+
+def _compute_live_health_row(sym_ticker, sym_ex, hist_1d, atr_val, db_row,
+                             db_name: str = None, atr_label: str = ""):
     """
     Builds the health-strip row from the LIVE snapshot the background daemon
     writes to TimescaleDB every second (orderbook top + trade tape for the
@@ -2510,6 +2541,9 @@ def _compute_live_health_row(sym_ticker, sym_ex, hist_1d, atr_val, db_row, db_na
     fetches, and finally to the latest collector snapshot values in `db_row`.
     """
     row = dict(db_row or {})
+    # Every mention of ATR carries the name of the estimator that produced the
+    # number on screen — see `format_atr_label`.
+    row["atr_label"] = atr_label or _db_atr_label(hist_1d is None)
     exchange_map = settings.exchange_map_1d
     ccxt_id = exchange_map.get(sym_ex, sym_ex)
 
@@ -3503,7 +3537,17 @@ with tab_charts:
     # --- Chart options (collapsed by default to save vertical space) ---------
     with st.expander("⚙️ Chart options", expanded=False):
         opt1, opt2, opt3, opt4 = st.columns([2, 2, 2, 1])
-        atr_days = opt1.slider("🎯 ATR Period (bars)", min_value=1, max_value=30, value=5, step=1)
+        atr_days = opt1.slider(
+            "🎯 ATR Period (daily bars)", min_value=1, max_value=30, value=5, step=1,
+            help="How many CLOSED daily candles the strip's `1D_ATR(N)` and the "
+                 "metric cards below the charts average over. It renames the chip "
+                 "as you move it — the label is built from this value, so what "
+                 "you read is what was computed. The `ob_atr_no_paranormal` / "
+                 "`ob_spread_atr_pct` COLUMNS of the liquidity table are not "
+                 "affected: those were written by the engines with ATR_PERIOD on "
+                 "their own timeframe (1D_ATR for daily tables, 15m_ATR "
+                 "Gerchik-smoothed for 15m tables).",
+        )
         chart_engine = opt2.selectbox(
             "📈 Chart Engine",
             options=["TradingView Lightweight Canvas", "TradingView Official Widget", "Plotly Dark"],
@@ -3564,13 +3608,19 @@ with tab_charts:
             live_row = _compute_live_health_row(
                 sym_ticker, sym_ex, hist_1d_live, atr_live, row_1d or row_15m,
                 db_name=live_db,
+                atr_label=format_atr_label("1D", atr_days),
             )
             st.markdown(build_health_strip_html(live_row), unsafe_allow_html=True)
 
         _strip_fragment()
     else:
-        health_row = row_1d or row_15m
+        health_row = dict(row_1d or row_15m or {})
         if health_row:
+            # No live fetch behind this frame's numbers, so the label names the
+            # estimator that WROTE them into the pair table (`ATR_PERIOD` bars of
+            # that engine's timeframe) — not the sidebar slider, which is a
+            # different number and belongs to the live path only.
+            health_row.setdefault("atr_label", _db_atr_label(row_1d is None))
             st.markdown(build_health_strip_html(health_row), unsafe_allow_html=True)
 
     # --- Spot/Swap links + shortability badge --------------------------------
@@ -3581,13 +3631,17 @@ with tab_charts:
 
     # --- LIVE panel (auto-refreshing chips, ~1s) ------------------------------
     if live_interval > 0 and hasattr(st, "fragment"):
+        _live_lbl = format_atr_label("1D", atr_days)
+
         @st.fragment(run_every=live_interval)
         def _live_fragment():
-            _render_live_panel(sym_ticker, sym_ex, demo_mode, db_name=live_db)
+            _render_live_panel(sym_ticker, sym_ex, demo_mode, db_name=live_db,
+                               atr_label=_live_lbl)
 
         _live_fragment()
     else:
-        _render_live_panel(sym_ticker, sym_ex, demo_mode, db_name=live_db)
+        _render_live_panel(sym_ticker, sym_ex, demo_mode, db_name=live_db,
+                           atr_label=format_atr_label("1D", atr_days))
 
     def _render_stitch_caption(stitch_txt: str) -> None:
         # Always render the stitch caption line at a fixed height (empty when
@@ -3959,8 +4013,19 @@ with tab_charts:
             delta=f"Bid: ${g('ob_best_bid', mid_price):,.4f} | Ask: ${g('ob_best_ask', mid_price):,.4f}",
         )
         mcol2.metric("Live Spread", f"${spread_abs:.4f}", delta=f"{spread_pct:.3f}%")
-        mcol3.metric(f"ATR w/o Paranormal Bars ({atr_days}d)", f"${atr_val:.4f}")
-        mcol4.metric("Spread % of ATR", f"{spread_atr_pct:.2f}%", delta=f"Relative to {atr_days}d ATR")
+        _lbl = format_atr_label("1D", atr_days)
+        mcol3.metric(f"{_lbl} (no paranormal bars)", f"${atr_val:.4f}",
+                     help="Filtered mean of True Range over the last "
+                          f"{atr_days} CLOSED daily bars, tiny/paranormal bars "
+                          "trimmed to [0.5xATR, 1.8xATR]; needs >= 3 bars and is "
+                          "NOT Wilder smoothing. Rename the slider and this "
+                          "heading follows it.")
+        mcol4.metric(f"Spread % of {_lbl}", f"{spread_atr_pct:.2f}%",
+                     delta=f"(Ask-Bid)/{_lbl}",
+                     help="Same numerator as the percentage on the LIVE line, "
+                          "which measures the spread against the mid price — here "
+                          "the denominator is the daily ATR instead. Two numbers, "
+                          "one spread, different rulers.")
         mcol5.metric("Vitality Score", f"{g('ob_vitality_score'):.1f} / 10", delta=f"Grade {src.get('ob_vitality_grade', 'N/A')}")
 
         st.markdown("##### 📖 Live Orderbook & Trade Tape Metrics")
@@ -4112,8 +4177,30 @@ with tab_liquidity:
             column_config={
                 "close": st.column_config.NumberColumn("Close Price", format="$%.4f"),
                 "ob_spread_pct": st.column_config.NumberColumn("Spread %", format="%.3f%%"),
-                "ob_spread_atr_pct": st.column_config.NumberColumn("Spread % of ATR", format="%.2f%%"),
-                "ob_atr_no_paranormal": st.column_config.NumberColumn("ATR w/o Paranormal Bars", format="%.4f"),
+                "ob_spread_atr_pct": st.column_config.NumberColumn(
+                    f"Spread % of ATR ({format_atr_label('1D', settings.atr_period)} / "
+                    f"{format_atr_label('15m', settings.atr_period)})",
+                    format="%.2f%%",
+                    help="Written by the engine that owns each table, not computed "
+                         "in the browser: daily tables divide the spread by "
+                         f"{format_atr_label('1D', settings.atr_period)} (filtered "
+                         "mean of True Range), 15m tables by "
+                         f"{format_atr_label('15m', settings.atr_period)} "
+                         "(Gerchik-smoothed). A 15m row is therefore NOT "
+                         "comparable with a daily row on this column, and neither "
+                         "follows the sidebar's ATR Period.",
+                ),
+                "ob_atr_no_paranormal": st.column_config.NumberColumn(
+                    f"{format_atr_label('1D', settings.atr_period)} w/o paranormal bars",
+                    format="%.4f",
+                    help=f"Filtered mean of True Range over the last "
+                         f"{settings.atr_period} CLOSED daily bars "
+                         f"(ATR_PERIOD={settings.atr_period}, thresholds "
+                         f"{settings.atr_small_threshold}-"
+                         f"{settings.atr_large_threshold} of ATR). 15m tables store "
+                         f"their own estimate in ob_gerchik_atr "
+                         f"({format_atr_label('15m', settings.atr_period)}), not here.",
+                ),
                 "ob_cvd_5m": st.column_config.NumberColumn("CVD (5m $)", format="$%.2f"),
                 "ob_min_7d_volume_usd": st.column_config.NumberColumn("Min 7d Vol $", format="$%,.0f"),
             },
@@ -4122,18 +4209,25 @@ with tab_liquidity:
 with tab_info:
     st.subheader("ℹ️ Methodology & Key Algorithms")
     st.markdown(r"""
-    ### 1. ATR without Paranormal Bars (Filtered Robust ATR)
-    Standard **ATR (Average True Range)** is highly sensitive to single abnormal candles — *paranormal bars* (news spikes, squeezes, false breakouts).
+    ### 1. Which ATR, over which bars — `1D_ATR(N)` and `15m_ATR(N)`
+    "ATR" alone is not a metric, so every label in this dashboard carries the
+    timeframe and the bar count it was actually computed with:
 
-    Our algorithm filters out bars whose range falls outside the threshold window:
+    | label | computed over | estimator | who writes it |
+    |---|---|---|---|
+    | `1D_ATR(N)` | N closed **daily** candles | True Range per bar, bars outside `[0.5×ATR, 1.8×ATR]` trimmed iteratively, mean of the survivors (median-seeded; **not** Wilder smoothing) | the 1D engine into `ob_atr_no_paranormal` (N = `ATR_PERIOD`); the live strip and the metric cards use the sidebar's *ATR Period (daily bars)* |
+    | `15m_ATR(N)` | N closed **15-minute** candles | same trimming, Gerchik-style smoothing | the 15m engine into `ob_gerchik_atr` (N = `ATR_PERIOD`) |
+
+    Standard **ATR (Average True Range)** is highly sensitive to single abnormal candles — *paranormal bars* (news spikes, squeezes, false breakouts). Our algorithm filters out bars whose range falls outside the threshold window:
     $$\text{Bar Range} \notin [0.5 \times \text{ATR}, 1.8 \times \text{ATR}]$$
-    and iteratively recalculates robust volatility reflecting true average daily asset movement over the **user-selected calculation period (N bars)**.
+    and iteratively recalculates robust volatility reflecting true average asset movement over the **N bars named in the label**. Fewer than 3 bars of that timeframe exist → the chip reads `n/a` rather than dividing by a guess.
 
     ---
 
-    ### 2. Spread % of ATR
-    The ratio of current absolute orderbook spread to ATR without paranormal bars:
-    $$\text{Spread \% of ATR} = \frac{\text{Ask} - \text{Bid}}{\text{ATR}_{\text{robust}}} \times 100\%$$
+    ### 2. Spread % of `1D_ATR(N)`
+    The ratio of the current absolute orderbook spread to the ATR named in the heading:
+    $$\text{Spread \% of } ^{1D}\text{ATR}(N) = \frac{\text{Ask} - \text{Bid}}{\text{ATR}_{\text{robust}}} \times 100\%$$
+    Two neighbours on screen look alike and are **not** the same number: the LIVE line's `(0.0xx% of mid)` divides the same `Ask − Bid` by the mid price `(Ask + Bid) / 2`, and `ob_spread_pct` divides it by price too — same numerator, different rulers. In the liquidity table the column also mixes provenance: a row of a **15m** table was divided by `15m_ATR(ATR_PERIOD)`, a row of a **daily** table by `1D_ATR(ATR_PERIOD)`; those are not comparable with each other, and neither follows the sidebar slider.
 
     ---
 
@@ -4141,8 +4235,9 @@ with tab_info:
     The Charts tab renders the **15m chart on top and the 1D chart below** for the selected pair,
     with **⏪ Prev / Next ⏭** buttons flanking every chart. Table summaries are cached for 10 minutes,
     candle frames for 60 seconds, and each chart loads only the last N candles (configurable in the
-    sidebar) — so switching pairs is effectively instant. The filtered ATR value itself is still
-    computed live for the metrics cards below the charts.
+    sidebar) — so switching pairs is effectively instant. The `1D_ATR(N)` shown in the metric cards
+    below the charts is computed live from the daily candles, with N from the sidebar — that is why
+    the heading reprints itself when the slider moves.
 
     ---
 
