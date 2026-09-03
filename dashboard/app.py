@@ -1622,29 +1622,53 @@ def _render_live_panel(ticker: str, exchange: str, demo: bool, db_name: str = No
             ccxt_id = exchange_map.get(exchange, exchange)
             data = _feed_value("ticker", ccxt_id, ticker)
 
-    if not data or not data.get("last"):
+    html = _live_line_html(data)
+    if not html:
         st.caption("🔴 LIVE: waiting for the first tick…")
         return
+    st.markdown(html, unsafe_allow_html=True)
 
-    last = float(data["last"])
-    bid, ask = data.get("bid"), data.get("ask")
-    spread_html = ""
+
+def _finite(v):
+    """Float, or None when it is not a number the page can print."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f and abs(f) != float("inf") else None
+
+
+def _live_line_html(data: dict) -> str:
+    """Compose the one-line LIVE chips (price · bid/ask · spread · 24h change).
+
+    Every part is optional and non-finite counts as missing, because that is what
+    the live writer stores when the exchange had nothing to say: `fetch_ticker`
+    on mexc spot answers bid/ask but no `percentage` for some listings, and the
+    line used to render that as a dangling "· 24h" with no value — which reads as
+    a broken feed. The price line is the ticker; the health strip above it is a
+    different set of metrics (depth from the orderbook, spread against the daily
+    ATR), so the two are allowed to disagree ONLY when they are different metrics,
+    never when one of them could have been computed from the same numbers.
+    """
+    last = _finite((data or {}).get("last"))
+    if last is None:
+        return ""
+    bid = _finite(data.get("bid"))
+    ask = _finite(data.get("ask"))
+    parts = [f"<b style='color:#42a5f5;'>🔴 LIVE ${last:.6g}</b>"]
     if bid and ask:
+        parts.append(f" &nbsp;·&nbsp; bid {bid:.6g} / ask {ask:.6g}")
         abs_sp = ask - bid
-        pct_sp = abs_sp / ((ask + bid) / 2.0) * 100.0 if ask + bid else 0.0
-        spread_html = f" &nbsp;·&nbsp; spread {abs_sp:.6g} ({pct_sp:.3f}%)"
-    ba_html = f" &nbsp;·&nbsp; bid {bid:.6g} / ask {ask:.6g}" if bid and ask else ""
-    pct = data.get("pct")
-    chg_html = ""
+        mid = (ask + bid) / 2.0
+        if mid > 0:
+            parts.append(f" &nbsp;·&nbsp; spread {abs_sp:.6g} ({abs_sp / mid * 100.0:.3f}%)")
+    pct = _finite(data.get("pct"))
     if pct is not None:
         color = "#66bb6a" if pct >= 0 else "#ef5350"
         sign = "+" if pct >= 0 else ""
-        chg_html = f" &nbsp;·&nbsp; 24h <b style='color:{color}'>{sign}{pct:.2f}%</b>"
-
-    st.markdown(
-        f"<div style='font-size:13px;padding:0 0 6px 6px;'>"
-        f"<b style='color:#42a5f5;'>🔴 LIVE ${last:.6g}</b>{ba_html}{spread_html}{chg_html}</div>",
-        unsafe_allow_html=True,
+        parts.append(f" &nbsp;·&nbsp; 24h <b style='color:{color}'>{sign}{pct:.2f}%</b>")
+    return (
+        "<div style='font-size:13px;padding:0 0 6px 6px;'>" + "".join(parts) + "</div>"
     )
 
 
@@ -2260,8 +2284,8 @@ def _live_infra() -> dict:
             last, bid, ask, pct = (
                 t.get("last"), t.get("bid"), t.get("ask"), t.get("percentage")
             )
-        except Exception:
-            pass
+        except Exception as e:
+            _live_feed_note(entry["ccxt"], "fetch_ticker", f"{type(e).__name__}: {e}")
 
         depth = None
         try:
@@ -2281,8 +2305,10 @@ def _live_infra() -> dict:
                     sum(float(p) * float(a) for p, a in bids if float(p) >= lo)
                     + sum(float(p) * float(a) for p, a in asks if float(p) <= hi)
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            if not isinstance(e, StopIteration):    # `not full`, by design
+                _live_feed_note(entry["ccxt"], "fetch_order_book (depth ±1%)",
+                                f"{type(e).__name__}: {e}")
 
         tpm = None
         barcode = False
@@ -2299,8 +2325,10 @@ def _live_infra() -> dict:
             prices = [float(tr["price"]) for tr in trades if tr.get("price")]
             if len(trades) >= 30 and len(set(prices)) <= 4:
                 barcode = True
-        except Exception:
-            pass
+        except Exception as e:
+            if not isinstance(e, StopIteration):     # `not full`, by design
+                _live_feed_note(entry["ccxt"], "fetch_trades (tape)",
+                                f"{type(e).__name__}: {e}")
 
         if last is None and depth is None and tpm is None:
             return None
@@ -2400,6 +2428,23 @@ def _db_live_read(db_name: str, exchange: str, symbol: str):
     return _cached_read(_db_live_read_cached, db_name, exchange, symbol)
 
 
+def _live_feed_note(ccxt_id: str, what: str, err: str) -> None:
+    """One line per (exchange, feed) per minute when a live feed cannot be read.
+
+    The health strip's chips are only as good as the writer's three fetches, and
+    a failure used to be swallowed into a NULL with no trace — so "🌊 Depth ±1%
+    n/a" and "↔ Spread % ATR n/a" had no explanation anywhere, while the LIVE line
+    under them happily printed bid/ask from the ticker that DID answer. A rate
+    limited line is what turns "the dashboard is broken" into "mexc will not
+    answer fetch_order_book for this pair".
+    """
+    _market_log_once(
+        ("live-feed", ccxt_id, what),
+        f"[live] ⚠️ {ccxt_id}: {what} failed ({err}) — the chips that need it stay "
+        f"n/a for this exchange's pairs until it answers",
+    )
+
+
 def _live_tick_path(db_name: Optional[str], exchange: str, symbol: str) -> Optional[str]:
     """URL path for the dashboard's live-tick endpoint serving this pair."""
     from urllib.parse import urlencode
@@ -2470,41 +2515,54 @@ def _compute_live_health_row(sym_ticker, sym_ex, hist_1d, atr_val, db_row, db_na
 
     live_row = _db_live_read(db_name, sym_ex, sym_ticker) if db_name else None
 
-    # --- Depth ±1% & Spread % ATR (DB live row, else direct orderbook) ---
-    if live_row and live_row.get("depth_usd") is not None:
-        row["ob_total_depth_usd"] = live_row["depth_usd"]
-        bid, ask = live_row.get("bid"), live_row.get("ask")
-        if bid and ask:
-            try:
-                bid, ask = float(bid), float(ask)
-                row["ob_spread_abs"] = ask - bid
-                row["ob_best_bid"] = bid
-                row["ob_best_ask"] = ask
-                if atr_val and atr_val > 0:
-                    row["ob_spread_atr_pct"] = (ask - bid) / atr_val * 100.0
-            except (TypeError, ValueError):
-                pass
-    else:
-        # Serve-then-refresh (see _feed_value): no REST call on the render path.
+    # --- Depth ±1% and the two spread fields, from any of three sources ---
+    # The live snapshot row the writer keeps per pair, the orderbook the
+    # background feed thread last saw, and — if neither has anything — whatever
+    # the pair table's own collector snapshot already carried in `db_row`.
+    #
+    # Each FIELD is filled from the best source that has it, and the spread is
+    # NOT gated on the depth any more: the writer stores bid/ask from
+    # `fetch_ticker` for every pair but `depth_usd` only when a full orderbook
+    # came back for the pair that is open (neighbours get the ticker alone). So a
+    # pair could print "bid 0.1023 / ask 0.1024 · spread 0.0001 (0.098%)" on the
+    # LIVE line and "↔ Spread % ATR n/a" in the chip above it, because the chip
+    # was computed inside the branch that required the depth — the same bid/ask,
+    # refused. Serve-then-refresh: `_feed_value` reads the refresher's cache, so
+    # consulting it in more cases costs no request on the render path.
+    bid = ask = depth = None
+    if live_row:
+        bid, ask = _finite(live_row.get("bid")), _finite(live_row.get("ask"))
+        depth = _finite(live_row.get("depth_usd"))
+    ob = None
+    if depth is None or not (bid and ask):
         ob = _feed_value("orderbook", ccxt_id, sym_ticker)
-        if ob and ob["bids"] and ob["asks"]:
+        if ob and ob.get("bids") and ob.get("asks"):
             try:
-                bid = float(ob["bids"][0][0])
-                ask = float(ob["asks"][0][0])
-                if bid > 0 and ask > 0:
-                    mid = (bid + ask) / 2.0
-                    lo, hi = mid * 0.99, mid * 1.01
-                    depth = sum(float(p) * float(a) for p, a in ob["bids"] if float(p) >= lo) + sum(
-                        float(p) * float(a) for p, a in ob["asks"] if float(p) <= hi
-                    )
-                    row["ob_total_depth_usd"] = depth
-                    row["ob_spread_abs"] = ask - bid
-                    row["ob_best_bid"] = bid
-                    row["ob_best_ask"] = ask
-                    if atr_val and atr_val > 0:
-                        row["ob_spread_atr_pct"] = (ask - bid) / atr_val * 100.0
+                ob_bid = _finite(ob["bids"][0][0])
+                ob_ask = _finite(ob["asks"][0][0])
             except (TypeError, ValueError, IndexError):
-                pass
+                ob_bid = ob_ask = None
+            if ob_bid and ob_ask:
+                bid = bid or ob_bid
+                ask = ask or ob_ask
+                if depth is None:
+                    mid = (ob_bid + ob_ask) / 2.0
+                    lo, hi = mid * 0.99, mid * 1.01
+                    try:
+                        depth = sum(
+                            float(p) * float(a) for p, a in ob["bids"] if float(p) >= lo
+                        ) + sum(
+                            float(p) * float(a) for p, a in ob["asks"] if float(p) <= hi
+                        )
+                    except (TypeError, ValueError):
+                        depth = None
+    if depth is not None:
+        row["ob_total_depth_usd"] = depth
+    if bid and ask:
+        row["ob_best_bid"], row["ob_best_ask"] = bid, ask
+        row["ob_spread_abs"] = ask - bid
+        if atr_val and atr_val > 0:
+            row["ob_spread_atr_pct"] = (ask - bid) / atr_val * 100.0
 
     # --- Trades/min over a 300s window (DB live row, else direct tape) ---
     if live_row and live_row.get("trades_per_min") is not None:

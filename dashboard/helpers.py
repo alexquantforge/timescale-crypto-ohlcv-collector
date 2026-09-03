@@ -532,11 +532,20 @@ def build_health_strip_html(row: dict) -> str:
         _health_chip("⚡ Tape", tpm_txt, 0.02 if dead else score_trades_per_min(tpm),
                      "Trades per minute: live ≥ 42/min, dead < 3/min (barcode market)"),
         _health_chip("🌊 Depth ±1%", fmt_usd_compact(depth), score_depth_usd(depth),
-                     "Orderbook depth within ±1% of price: deep ≥ $50K, thin < $1K"),
+                     "Orderbook depth within ±1% of price: deep ≥ $50K, thin < $1K"
+                     + (" — n/a: no orderbook row for this pair. The live writer "
+                        "fetches the book for the pair you have OPEN; a neighbouring "
+                        "or unwatched pair is sampled with the ticker alone (bid/ask "
+                        "only), and its table may hold no ob_* snapshot either"
+                        if depth is None else "")),
         _health_chip("↔ Spread % ATR",
                      f"{spread_pct:.1f}%" if spread_pct is not None else "n/a",
                      score_spread_atr_pct(spread_pct),
-                     "Spread as % of daily filtered ATR: green < 5%, red ≥ 15%"),
+                     "Spread as % of daily filtered ATR: green < 5%, red ≥ 15%"
+                     + (" — n/a needs BOTH the bid/ask and a daily ATR; a pair whose "
+                        "1D table has fewer than 3 bars has no ATR to divide by. The "
+                        "raw bid-ask is on the LIVE line below, which is a different "
+                        "number" if spread_pct is None else "")),
         _health_chip("💰 Min 7d $Vol", fmt_usd_compact(minvol), score_min_volume_usd(minvol),
                      "min(vol×low) over the last 7 days: HIGH tier ≥ $500K/day, LOW tier < $100K/day"),
     ]

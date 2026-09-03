@@ -1101,6 +1101,90 @@ def test_stitched_candle_count_parsing():
     assert dapp._stitched_candle_count(None) == 0
 
 
+def test_the_spread_chips_do_not_need_the_orderbook_to_be_known(monkeypatch):
+    """"spread 0.0001 (0.098%)" on the LIVE line, "↔ Spread % ATR n/a" in the
+    chip above it — the user's question, and a real bug.
+
+    The writer stores bid/ask from `fetch_ticker` for every pair, but
+    `depth_usd` only when a full orderbook came back for the pair that is OPEN.
+    The strip computed the spread-vs-ATR fields INSIDE the
+    "depth_usd is not None" branch, so a pair with no book answered "n/a" from
+    numbers it had in hand. Each field now takes the best source that has it."""
+    from dashboard import app as dapp
+
+    live = {"last": 0.1024, "bid": 0.1023, "ask": 0.1024,
+            "depth_usd": None, "pct": None, "trades_per_min": 5.0}
+    monkeypatch.setattr(dapp, "_db_live_read", lambda *a, **k: dict(live))
+    monkeypatch.setattr(dapp, "_feed_value", lambda *a, **k: None)
+
+    row = dapp._compute_live_health_row(
+        "1000000MOG/USDT", "mexc", None, 0.0026, {}, db_name="vol_15m_low")
+
+    assert row["ob_best_bid"] == 0.1023 and row["ob_best_ask"] == 0.1024
+    assert row["ob_spread_abs"] == pytest.approx(0.0001)
+    assert row["ob_spread_atr_pct"] == pytest.approx(0.0001 / 0.0026 * 100.0)
+    # …and depth is NOT invented: it is missing, and the chip says so
+    assert "ob_total_depth_usd" not in row
+    assert row["ob_trades_per_min"] == 5.0
+
+    # no daily ATR (a pair whose 1D table is too short) must not lose the spread
+    # fields either — it only loses the ratio, which is what the chip means
+    row2 = dapp._compute_live_health_row(
+        "1000000MOG/USDT", "mexc", None, 0.0, {}, db_name="vol_15m_low")
+    assert row2["ob_spread_abs"] == pytest.approx(0.0001)
+    assert "ob_spread_atr_pct" not in row2
+
+    # a book from the background feed fills the depth, still with no request here
+    book = {"bids": [[0.1023, 4000.0], [0.1000, 9000.0]], "asks": [[0.1024, 2000.0]]}
+    calls = []
+    monkeypatch.setattr(dapp, "_feed_value",
+                        lambda kind, *a, **k: calls.append(kind) or book)
+    row3 = dapp._compute_live_health_row(
+        "1000000MOG/USDT", "mexc", None, 0.0026, {}, db_name="vol_15m_low")
+    # the chip is DEPTH WITHIN ±1%: 0.1000 is 2.3 % away from the mid, so it is
+    # counted out — a book 10x deeper than the visible top would still read thin
+    assert row3["ob_total_depth_usd"] == pytest.approx(0.1023 * 4000.0 + 0.1024 * 2000.0)
+    assert calls and set(calls) <= {"orderbook", "tape"}
+
+
+def test_the_live_line_omits_what_the_exchange_never_answered():
+    """A missing `percentage` in the ticker printed a dangling "· 24h" with no
+    value — the reader's conclusion being that the live feed is broken, while
+    the writer simply stored NULL. Only finite, present fields are printed."""
+    from dashboard import app as dapp
+
+    html = dapp._live_line_html(
+        {"last": 0.1024, "bid": 0.1023, "ask": 0.1024, "pct": None})
+    assert "spread 0.0001 (0.098%)" in html
+    assert "24h" not in html
+
+    assert "24h" not in dapp._live_line_html(
+        {"last": 1.0, "bid": 0.9, "ask": 1.1, "pct": float("nan")})
+    assert "bid" not in dapp._live_line_html({"last": 1.0, "bid": None, "ask": float("nan")})
+    assert dapp._live_line_html({"last": None, "bid": 1.0}) == ""
+    assert dapp._live_line_html({}) == ""
+    assert dapp._live_line_html({"last": 2.0, "pct": -0.27}) .count("24h") == 1
+
+
+def test_the_strip_says_which_input_a_missing_chip_is_waiting_for():
+    """"n/a" on its own reads as "the dashboard is broken"; the chip has to name
+    the missing input, because for a live pair these are three different
+    problems (no book for this pair, no daily ATR yet, or a NULL collector
+    snapshot)."""
+    from dashboard.helpers import build_health_strip_html
+
+    html = build_health_strip_html({"ob_trades_per_min": 5.0,
+                                    "ob_min_7d_volume_usd": 271_000.0})
+    assert "no orderbook row" in html          # Depth chip explains itself
+    assert "daily ATR" in html                 # Spread chip explains itself
+    assert "5/min" in html and "$271K" in html
+
+    filled = build_health_strip_html({"ob_trades_per_min": 5.0, "ob_total_depth_usd": 1e3,
+                                      "ob_spread_atr_pct": 3.9,
+                                      "ob_min_7d_volume_usd": 4.95e5})
+    assert "no orderbook row" not in filled and "daily ATR" not in filled
+
+
 def test_feed_value_serves_cache_and_never_fetches_inline(monkeypatch):
     from dashboard import app as dapp
 
