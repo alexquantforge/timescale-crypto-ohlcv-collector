@@ -1561,6 +1561,51 @@ def test_a_complete_tier_is_not_re_scanned_while_another_is_starving(monkeypatch
     assert dapp._rescan_delay_sec("15m") == 30.0
 
 
+def test_an_expired_catalog_is_not_reread_mid_sweep(monkeypatch, capsys):
+    """`+catalog 14.2s`, `+catalog 17.0s` on every single 15m/LOW pass — that is
+    a third of each pass spent re-listing 8 243 tables the sweep is still busy
+    walking. While the sweep has not wrapped, the previous listing is reused:
+    the table set does not change on that timescale, and the budget and pool
+    connections go to the tables that have no answer yet."""
+    import asyncio
+    import time as _time
+
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_scan_inventory_ttl_sec", 600.0)
+    monkeypatch.setattr(dapp, "_MARKET_LOG_AT", {})
+    schema = {f"p{i}_usdt_on_bybit": {"Timestamp": "timestamptz"} for i in range(3)}
+    pool = _FakeScanPool(schema)
+
+    async def fake_create_pool(**kw):
+        return pool
+
+    monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool)
+
+    # a sweep in progress with a stale-but-present cache: no catalog query
+    dapp._SCAN_INVENTORY[("h", 1, "db_grace")] = {
+        "at": _time.time() - 5000.0, "tables": dict(schema)}
+    rows = asyncio.run(dapp._scan_database(
+        "db_grace", "HIGH", "h", 1, "u", "p", pool_size=1, chunk_size=120,
+        budget_sec=10.0, sweep={"start": 3}))
+    assert len(rows) == 3
+    assert pool.catalog_queries == [], "the catalog must not be re-read mid-sweep"
+    assert "reusing it instead of paying another 15s read" in capsys.readouterr().out
+
+    # a fresh sweep (no cursor) pays the read, so a new listing is seen promptly
+    pool2 = _FakeScanPool(schema)
+
+    async def fake_create_pool2(**kw):
+        return pool2
+
+    monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool2)
+    asyncio.run(dapp._scan_database(
+        "db_grace", "HIGH", "h", 1, "u", "p", pool_size=1, chunk_size=120,
+        budget_sec=10.0, sweep={}))
+    assert pool2.catalog_queries, "a wrapped sweep must re-read the catalog"
+
+
 def test_an_empty_pair_list_never_replaces_a_real_one(monkeypatch):
     """The remaining hole after the last round, and the difference between
     "the list is short" and "the tier is gone".
@@ -1685,24 +1730,33 @@ def test_the_pair_list_funnel_says_which_filter_ate_the_tier(capsys):
 def test_a_sweep_that_is_still_building_the_list_is_not_backed_off(monkeypatch):
     """A truncated scan has two very different causes, and the schedule must
     tell them apart: a sweep that ANSWERS chunks but runs out of budget is
-    converging and the next pass should come soon, while a database that answers
-    nothing needs the doubling backoff. Conflating them left an 8 235-table tier
-    rendering 1 560 pairs, then 600, then 120 — an hour of "the charts are
-    missing" on a healthy database."""
+    converging, while a database that answers nothing needs the doubling backoff.
+
+    The converging case must not be paced at all beyond letting clicks cut in
+    front: their log shows `rendering 720/8243 … chunk 6/69`, then 1080 at
+    chunk 9, then 1560 at chunk 14 — real progress, ~6 chunks per pass — with
+    `retry in ~173 s (backoff)` between the passes. 69 chunks at that pace is
+    ~40 minutes of half-built selector, which reads as "15m не загружается"
+    even though the sweep re-reads nothing the pass before it answered.
+    Conflating the two cases is also what left an 8 235-table tier rendering
+    1 560 pairs, then 600, then 120 — an hour of "the charts are missing"."""
     from dashboard import app as dapp
 
     _summary_stores(monkeypatch, dapp)
     monkeypatch.setattr(dapp.settings, "dash_snapshot_refresh_sec", 120.0)
     monkeypatch.setattr(dapp.settings, "dash_scan_retry_max_sec", 1800.0)
     monkeypatch.setattr(dapp.settings, "dash_scan_rescan_complete_sec", 300.0)
+    monkeypatch.setattr(dapp.settings, "dash_scan_defer_retry_sec", 8.0)
     dapp._SCAN_ATTEMPTS["15m"] = 6
 
-    # converging: partial, cursor unwrapped, chunks answered
+    # converging: partial, cursor unwrapped, chunks answered → keep going soon,
+    # whatever the failure streak says (the pause is for clicks, not for pacing)
     dapp._SCAN_META["15m"] = {"partial": True, "sweep_incomplete": True,
                               "answered_chunks": 4}
-    assert dapp._rescan_delay_sec("15m") == 240.0
+    assert dapp._rescan_delay_sec("15m") == 8.0
 
-    # stuck: same streak, but the last pass answered nothing
+    # stuck: same streak, but the last pass answered nothing → back off, the
+    # database is the problem and hammering it makes everyone slower
     dapp._SCAN_META["15m"] = {"partial": True, "sweep_incomplete": True,
                               "answered_chunks": 0}
     assert dapp._rescan_delay_sec("15m") > 240.0

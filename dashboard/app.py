@@ -279,7 +279,8 @@ def _mark_interaction() -> None:
 _SCAN_INVENTORY: dict = _state("scan_inventory", dict)
 
 
-async def _table_inventory(pool, db_name: str, db_host: str = "", db_port: int = 0) -> dict:
+async def _table_inventory(pool, db_name: str, db_host: str = "", db_port: int = 0,
+                           mid_sweep: bool = False) -> dict:
     """
     Which pair tables exist and what their columns are typed as.
 
@@ -307,6 +308,22 @@ async def _table_inventory(pool, db_name: str, db_host: str = "", db_port: int =
     cache_key = (db_host, db_port, db_name)
     ent = _SCAN_INVENTORY.get(cache_key)
     if ent and time.time() - ent["at"] < ttl:
+        return ent["tables"]
+    if ent and mid_sweep:
+        # An expired catalog is REUSED for the rest of an unfinished sweep.
+        # Reading it costs 14–17 s on an 8k-table database (their log: every
+        # 15m/LOW pass carried `+catalog 14.2s`, `+catalog 17.0s` — a third of the
+        # pass spent on a list it had read minutes ago), the table set does not
+        # change on that timescale, and every re-read steals budget and pool
+        # connections from the sweep it interrupts. A fresh sweep re-reads it, and
+        # a table the database says is gone is still dropped immediately by
+        # `forget_missing_relations`.
+        _market_log_once(
+            ("inv-reuse", db_name),
+            f"[scan] {db_name}: catalog is {time.time() - ent['at']:.0f}s old but the "
+            f"sweep has not wrapped — reusing it instead of paying another 15s read "
+            f"per pass",
+        )
         return ent["tables"]
 
     async with pool.acquire(timeout=20.0) as conn:
@@ -516,7 +533,10 @@ async def _scan_database(
 
     try:
         t_catalog = time.time()
-        tables = await _table_inventory(pool, db_name, db_host, db_port)
+        tables = await _table_inventory(
+            pool, db_name, db_host, db_port,
+            mid_sweep=bool(sweep is not None and "start" in sweep),
+        )
         catalog_secs = max(catalog_secs, time.time() - t_catalog)
         if not tables:
             # An EMPTY CATALOG is not an empty database. `pg_catalog` can answer
@@ -838,6 +858,8 @@ async def _load_summary(db_host, db_port, db_user, db_pass, timeframe: str) -> p
         # sweep that ADDS tables must not be paced by the failure backoff, while
         # one that gets nothing on a loaded server must be.
         "answered_chunks": sum(m.get("answered_chunks", 0) for m in metas),
+        "chunks": sum(m.get("chunks", 0) for m in metas),
+        "chunk_start": max([m.get("chunk_start") or 0 for m in metas] or [0]),
         "missing_tables": sum(m.get("missing_tables", 0) for m in metas),
         "carry_ttl": max([m.get("carry_ttl") or 0.0 for m in metas] or [0.0]),
         "sweep_incomplete": any("start" in _SCAN_SWEEP_STATE.get(db, {})
@@ -871,7 +893,14 @@ def _rescan_delay_sec(timeframe: str) -> float:
         # doubling (which exists for a database that cannot answer at all) is what
         # left their 15m selector half-built for an hour: ~1 500 of 8 235 tables
         # rendered, then a 15-minute wait, then the carried rows expired.
-        delay = min(delay, 2.0 * float(settings.dash_snapshot_refresh_sec))
+        # The pause between passes exists so clicks and candle queries can cut
+        # in front — NOT to slow the build down. Nothing here is a retry storm:
+        # the cursor and the carry mean each pass reads chunks the previous one
+        # did not, so 69 chunks at ~4 s each is a few minutes of database time
+        # ONCE, after which the complete-scan floor takes over for the rest of
+        # the session. Backing that off by doubling (120 s, 240 s…) is what made
+        # their selector load in ~40 minutes and read as "15m не загружается".
+        delay = min(delay, float(settings.dash_scan_defer_retry_sec))
     if not meta.get("partial") and int(meta.get("rows") or 0) > 0:
         # The last scan answered everything, so the list it produced is the
         # truth for as long as anything can plausibly have changed. Re-asking
@@ -3440,7 +3469,16 @@ else:
             # a promise the app does not keep.
             _since = time.time() - _LAST_SCAN_AT.get(_tf, 0.0)
             _delay = _rescan_delay_sec(_tf)
-            if _since < 5.0:
+            if _pm.get("sweep_incomplete") and int(_pm.get("answered_chunks") or 0) > 0:
+                # Not a failure, a sweep in progress — and the badge has to say
+                # that, because "(backoff)" reads as "the app gave up", which is
+                # exactly what "15минутка не загружается" was while the list grew
+                # by 6 chunks every pass.
+                _n = int(_pm.get("chunks") or 0)
+                _at = int(_pm.get("chunk_start") or 0)
+                _when = (f"the sweep is at chunk {_at}/{_n} and continues in "
+                         f"~{max(0, int(_delay - _since))} s")
+            elif _since < 5.0:
                 _when = "a full rescan is running now"
             elif not _LAST_SCAN_AT.get(_tf):
                 _when = f"first retry within {int(_delay)} s"
@@ -3473,9 +3511,11 @@ else:
                 f"{_pm.get('tables', 0)} tables have an answer — the budget read "
                 f"{_fresh} of them this sweep{_carried}{_holes_txt} "
                 f"({settings.dash_scan_budget_sec:.0f}s scan budget) — {_when}. "
-                f"The charts are unaffected (they query the "
-                f"tables directly). Raise DASH_SCAN_BUDGET_SEC if your collector "
-                f"keeps the DB busy."
+                f"The candles are unaffected (a chart queries its own table), but "
+                f"a pair this sweep has not reached yet is not in the selector — "
+                f"that is the only way this line can cost you a chart. "
+                f"DASH_SCAN_BUDGET_SEC (now {settings.dash_scan_budget_sec:.0f}s) is "
+                f"the lever if the collector keeps the database busy."
             )
 
 # Counts of what each filter step removed, per tier — see `_pair_list_funnel`.
