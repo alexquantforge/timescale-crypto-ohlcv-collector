@@ -11,6 +11,10 @@ Async Crypto Market Data Collector (**Perpetual Swaps & Spot Markets**) with Fil
 
 ## 🌟 Key Features
 
+(Working on this repo with an AI assistant? [`AGENTS.md`](AGENTS.md) records the standing
+contract for `dashboard/`, the invariants that each cost a debugging round, and the dead ends
+that must not be re-opened.)
+
 * 🔄 **Perp-First & Spot Fallback Architecture:** Automatically prefers linear perpetual swaps (`BTC/USDT:USDT`) for each base asset, seamlessly falling back to spot (`BTC/USDT`) when no perpetual contract exists.
 * 📊 **ATR without Paranormal Bars (Filtered Robust ATR):** Robust volatility calculation that filters out news spikes, squeezes, and abnormal outlier candles outside $[0.5 \times \text{ATR}, 1.8 \times \text{ATR}]$. The dashboard labels every one of them, because three estimators live here: `1D_ATR(N)` (mean of True Range over N closed **daily** candles — the strip and the metric cards take N from the sidebar's *ATR Period (daily bars)*, the daily tables from `ATR_PERIOD`) and `15m_ATR(N)` (Gerchik-smoothed over N **15-minute** bars, written by the 15m engine into `ob_gerchik_atr`). Labels are built by `format_atr_label()` from the values actually used, so moving the slider renames the chip; a stored column never silently claims to follow it.
 * ⚡ **TimescaleDB Hypertables:** Time-series storage with automated chunk partitioning and **Columnar Compression**, reducing DB disk footprint by up to 90%+.
