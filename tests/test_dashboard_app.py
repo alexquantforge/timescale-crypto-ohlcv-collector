@@ -3060,7 +3060,7 @@ def test_the_market_probe_names_the_slow_category_and_leaves_no_partial_catalog(
     out = capsys.readouterr().out
     assert "spot ok, 1 markets" in out, out
     assert "swap FAILED after" in out and "RequestTimeout" in out, out
-    assert "[markets] gate: probe with timeout" in out, out
+    assert "[markets] gate: probe, 4 categories, 60s per request" in out, out
     # one request per category, and only ever for the categories ccxt declares
     assert [c for c in calls] == [["spot"], ["swap"], ["future"], ["option"]], calls
     # the instance ends EMPTY and its own config is restored, siblings included
