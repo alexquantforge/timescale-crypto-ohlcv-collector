@@ -2822,8 +2822,6 @@ def test_the_badge_quotes_the_database_that_is_still_being_read(monkeypatch):
     one, so the position comes from the database that is actually starving."""
     import asyncio
 
-    import pandas as pd
-
     from dashboard import app as dapp
 
     monkeypatch.setattr(dapp.settings, "db_high_15m", "db_hi")
@@ -2851,7 +2849,7 @@ def test_the_badge_quotes_the_database_that_is_still_being_read(monkeypatch):
         return []
 
     monkeypatch.setattr(dapp, "_scan_database", fake_scan)
-    df = asyncio.run(dapp._load_summary("h", 1, "u", "p", "15m"))
+    asyncio.run(dapp._load_summary("h", 1, "u", "p", "15m"))
     m = dapp._SCAN_META["15m"]
     assert m["starving_chunks"] == 69 and m["starving_chunk_start"] == 14, m
     assert m["budget"] == 90.0, "the badge must quote the budget the pass ran on"
@@ -2883,17 +2881,21 @@ def test_a_converging_pair_list_is_progress_and_not_an_outage(monkeypatch):
     dapp._SCAN_META["15m"] = dict(conv)
     dapp._LAST_SCAN_AT["15m"] = _time.time() - 5.0
 
-    sev, txt = dapp._pair_list_notice("15m", conv)
-    assert sev == "info", txt
-    assert "Progress, not a fault" in txt
-    assert "1080 of 8345 tables have no answer yet and the last pass added 3212" in txt
-    assert "in about 1 more pass(es)" in txt, txt
-    assert "5372/8345" in txt and "chunk 35/69" in txt
-    assert "DASH_SCAN_BUDGET_SEC" not in txt, "no knob while the sweep is working"
+    sev, line, details = dapp._pair_list_notice("15m", conv)
+    assert sev == "info", line
+    # the page gets a caption; the arithmetic goes behind the expander
+    assert "5372/8345" in line and "nothing to do" in line, line
+    assert len(line) < 200, "one line while the sweep is healthy: " + line
+    assert "DASH_SCAN_BUDGET_SEC" not in line + details, "no knob while it works"
+    assert "Progress, not a fault" in details
+    assert ("1080 of 8345 tables have no answer yet and the last pass added 3212"
+            in details), details
+    assert "in about 1 more pass(es)" in details and "chunk 35/69" in details, details
 
     stuck = dict(conv, sweep_incomplete=False, answered_chunks=0)
     dapp._SCAN_META["15m"] = dict(stuck)
     dapp._LAST_SCAN_AT["15m"] = _time.time() - 400.0
-    sev2, txt2 = dapp._pair_list_notice("15m", stuck)
+    sev2, txt2, det2 = dapp._pair_list_notice("15m", stuck)
     assert sev2 == "warning" and "DASH_SCAN_BUDGET_SEC" in txt2, txt2
+    assert det2 == "", "the case that needs action has nothing to hide"
     assert "(backoff)" in txt2, "the stuck case must still say it is waiting"

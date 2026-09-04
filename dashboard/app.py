@@ -1004,8 +1004,8 @@ def _rescan_delay_sec(timeframe: str) -> float:
 
 
 def _pair_list_notice(tf: str, pm: dict) -> tuple:
-    """(severity, text) for the "pair list is incomplete" line, kept out of the
-    render path so it can be tested without a database.
+    """(severity, one-line text, details) for the "pair list is incomplete" line,
+    kept out of the render path so it can be tested without a database.
 
     The severity is the point. A sweep that answers chunks and moves its cursor
     is a progress bar, and it used to be painted as a warning ending in
@@ -1067,13 +1067,28 @@ def _pair_list_notice(tf: str, pm: dict) -> tuple:
         # tables missing, 7 chunks of cursor left, both printed one line apart).
         _left = int(pm.get("missing_tables") or 0)
         _passes = max(1, -(-_left // max(1, int(_fresh)))) if _left else 1
-        return "info", head + (
+        # A healthy sweep gets ONE line on the page, not a paragraph: the numbers
+        # are for the person who owns the collector, and a wall of them on a
+        # working page reads as a bug report (the second question about this badge
+        # was literally "это показывается отладочная информация в дашборде?"). The
+        # fact stays visible — a partial list may never be silent — but the
+        # arithmetic goes behind an expander.
+        _eta = _passes * (float(pm.get("budget") or settings.dash_scan_budget_sec)
+                          + max(0.0, _delay - _since))
+        _in = f"{_eta / 60.0:.0f} min" if _eta >= 90 else f"{_eta:.0f} s"
+        short = (
+            f"\u23f3 {tf} pair list is still being built: {pm.get('rows', 0)}/"
+            f"{pm.get('tables', 0)} tables read — about {_in} ({_passes} pass(es)) "
+            f"left, nothing to do."
+        )
+        details = head + (
             f" Progress, not a fault: {_left} of {pm.get('tables', 0)} tables have "
             f"no answer yet and the last pass added {max(0, int(_fresh))}, so this "
             f"clears by itself in about {_passes} more pass(es). Charts already "
             f"open are unaffected (a chart queries its own table); only a pair the "
             f"sweep has not reached is missing from the selector. Nothing to do."
         )
+        return "info", short, details
     return "warning", head + (
         f" The candles are unaffected (a chart queries its own table), but a pair "
         f"this sweep has not reached yet is not in the selector — that is the only "
@@ -1081,7 +1096,7 @@ def _pair_list_notice(tf: str, pm: dict) -> tuple:
         f"({settings.dash_scan_budget_sec:.0f}s per pass, "
         f"{settings.dash_scan_budget_idle_sec:.0f}s once the page sits idle) is "
         f"the lever if the collector keeps the database busy."
-    )
+    ), ""
 
 
 def _rescan_due(timeframe: str, now: float) -> bool:
@@ -3632,8 +3647,13 @@ else:
             # `info` while the sweep is advancing, `warning` when it is not — and
             # no knob advice in the first case: a progress bar must not read like
             # an outage the user has to fix. See `_pair_list_notice`.
-            _sev, _txt = _pair_list_notice(_tf, _pm)
-            if _sev == "info":
+            _sev, _txt, _det = _pair_list_notice(_tf, _pm)
+            if _det:
+                st.caption(_txt)
+                with st.expander(f"{_tf} pair list \u2014 how it is being built",
+                                 expanded=False):
+                    st.write(_det)
+            elif _sev == "info":
                 st.info(_txt)
             else:
                 st.warning(_txt)
