@@ -1598,6 +1598,57 @@ def _market_log_once(key: str, msg: str) -> None:
     print(msg, flush=True)
 
 
+def _market_load_probe(ccxt_id: str, ex, timeout_ms) -> None:
+    """`DASH_MARKET_LOAD_DEBUG=true` — after a whole-load failure, time each
+    market category on its own and print which leg actually eats the seconds.
+
+    Because gate's `load_markets()` is a SEQUENCE of list requests (spot
+    `…/spot/currency_pairs`, swap `…/futures/usdt/contracts`, future
+    `…/delivery/usdt/contracts`) that all share one per-request timeout, the
+    message `RequestTimeout: gate GET …/spot/currency_pairs` does not by itself
+    say whether the spot list is slow or the connection to gate is being
+    throttled/blackholed — and their own `curl` answered that exact URL in
+    3.0-5.8s five times out of five, so the guess had to become a measurement.
+
+    Only the lists the load was going to ask for anyway, only on a path that
+    already failed, and only when the knob is on. The instance is left EMPTY: a
+    probe that loaded `spot` alone would otherwise leave a catalog without perps,
+    which every later `market()` lookup would report as a delisting.
+    """
+    fm = (getattr(ex, "options", None) or {}).get("fetchMarkets") or {}
+    types = fm.get("types")
+    if not isinstance(types, list):
+        types = ["spot", "swap", "future", "option"]
+    parts = []
+    # The timeout the probe runs under is the LOAD one, not the tightened fetch
+    # one that the caller restores afterwards — the printed number has to be the
+    # one that was in force while the legs were being timed.
+    _probe_to = int(getattr(ex, "timeout", 0) or 0)
+    for one in types:
+        started = time.time()
+        try:
+            ex.options["fetchMarkets"] = {**fm, "types": [one]}
+            ex.markets = None
+            ex.load_markets()
+            parts.append(f"{one} ok, {len(ex.markets or {})} markets, "
+                         f"{time.time() - started:.1f}s")
+        except BaseException as e:
+            parts.append(f"{one} FAILED after {time.time() - started:.1f}s: "
+                         f"{type(e).__name__}: {str(e)[:120]}")
+    try:
+        ex.options["fetchMarkets"] = {**fm, "types": types} if fm else {"types": types}
+        ex.set_markets([])        # drop the partial catalog the probe left behind
+    except Exception:
+        pass
+    if timeout_ms:
+        try:
+            ex.timeout = timeout_ms
+        except Exception:
+            pass
+    print(f"[markets] {ccxt_id}: probe, {len(types)} categories, "
+          f"{_probe_to / 1000:.0f}s per request — " + "; ".join(parts), flush=True)
+
+
 def _load_markets_locked(ccxt_id: str, ex, who: str) -> str:
     """Performs the load while holding the gate lock. Returns '' or a reason."""
     g = _market_gate(ccxt_id)
@@ -1620,6 +1671,8 @@ def _load_markets_locked(ccxt_id: str, ex, who: str) -> str:
                          f"[markets] ⚠️ {ccxt_id}: load_markets failed "
                          f"({g['err']}) — retrying after a backoff, feeds and "
                          f"stitching stay empty until it works")
+        if settings.dash_market_load_debug:
+            _market_load_probe(ccxt_id, ex, old_timeout)
         return g["err"]
     finally:
         if old_timeout is not None:

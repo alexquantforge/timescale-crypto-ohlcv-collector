@@ -390,6 +390,15 @@ class Settings(BaseSettings):
     # them as per-type flags (mexc) or declares nothing is left exactly as ccxt
     # configured it. "" = never trim (ccxt's own behaviour).
     ccxt_market_types_skip: str = Field(default="option", alias="CCXT_MARKET_TYPES_SKIP")
+    # Diagnostics for a market load that fails. On: after a failed load, each
+    # market category is timed separately and printed as
+    #   [markets] gate: probe with timeout 60s — spot ok, 1809 markets, 3.1s;
+    #               swap FAILED after 60.0s: RequestTimeout: …
+    # which is the only way to tell "this list is big and slow" from "the
+    # connection to this exchange is being throttled/blackholed" — the two need
+    # opposite answers (more timeout vs. fewer requests / another route). Costs
+    # one load per category, only after a failure, so it stays off in production.
+    dash_market_load_debug: bool = Field(default=False, alias="DASH_MARKET_LOAD_DEBUG")
     # Coordination database holding the tiny handshake table (empty = 15m HIGH).
     priority_lane_db: str = Field(default="", alias="PRIORITY_LANE_DB")
     # How far back the lane may bridge a hole in the pair you are LOOKING at.

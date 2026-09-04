@@ -3019,3 +3019,52 @@ def test_the_live_line_says_why_there_is_no_tick(monkeypatch):
     dapp._MARKET_GATE["mexc"] = {"fails": 0, "at": 0.0, "err": "", "loading": True}
     assert "loading its market list now" in dapp._live_wait_text("mexc")
     assert dapp._MARKET_GATE["mexc"].get("lock") is None
+
+
+def test_the_market_probe_names_the_slow_category_and_leaves_no_partial_catalog(monkeypatch, capsys):
+    """`RequestTimeout: gate GET …/spot/currency_pairs` is not evidence that the
+    spot list is slow: gate's load is a SEQUENCE of list calls behind one
+    per-request timeout, and their curl of that URL took 3.0-5.8s. The probe turns
+    the ambiguity into a measurement, and must not leave a half-loaded instance
+    behind — a catalog without perps would come back as `BadSymbol` on every swap
+    pair and read like a delisting."""
+    import types as pytypes
+
+    from dashboard import app as dapp
+
+    calls = []
+
+    class _Ex:
+        timeout = 60_000
+        markets = {"BTC/USDT": {}}                     # a loaded instance, pre-probe
+
+        def __init__(self):
+            self.options = {"fetchMarkets": {"types": ["spot", "swap", "future", "option"],
+                                             "keepme": 1}}
+
+        def load_markets(self):
+            fm = self.options["fetchMarkets"]
+            calls.append(list(fm["types"]))
+            t = fm["types"][0]
+            if t == "swap":
+                raise RuntimeError("RequestTimeout: gate GET /futures/usdt/contracts")
+            self.markets = {f"{t}/X": {}}
+
+        def set_markets(self, m):
+            self.markets = {x["id"]: x for x in m}
+
+    ex = _Ex()
+    monkeypatch.setattr(dapp.settings, "dash_market_load_debug", True)
+    dapp._market_load_probe("gate", ex, 8_000)
+
+    out = capsys.readouterr().out
+    assert "spot ok, 1 markets" in out, out
+    assert "swap FAILED after" in out and "RequestTimeout" in out, out
+    assert "[markets] gate: probe with timeout" in out, out
+    # one request per category, and only ever for the categories ccxt declares
+    assert [c for c in calls] == [["spot"], ["swap"], ["future"], ["option"]], calls
+    # the instance ends EMPTY and its own config is restored, siblings included
+    assert not ex.markets, ex.markets
+    assert ex.options["fetchMarkets"] == {"types": ["spot", "swap", "future", "option"],
+                                          "keepme": 1}
+    assert ex.timeout == 8_000
