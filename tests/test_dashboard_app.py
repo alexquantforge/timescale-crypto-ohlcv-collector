@@ -2856,3 +2856,44 @@ def test_the_badge_quotes_the_database_that_is_still_being_read(monkeypatch):
     assert m["starving_chunks"] == 69 and m["starving_chunk_start"] == 14, m
     assert m["budget"] == 90.0, "the badge must quote the budget the pass ran on"
     assert m["sweep_incomplete"] is True
+
+
+def test_a_converging_pair_list_is_progress_and_not_an_outage(monkeypatch):
+    """Their question about the badge, verbatim: "что значит эта ошибка в
+    дашборде и как ее исправить?"
+
+    The line it quoted was 5372/8345 with 27 of 69 chunks answered in a 120s pass
+    and "continues in ~3 s" — a progress bar, 9 chunks from the end — drawn as a
+    `st.warning` that ends by naming a knob to tune. Of course it reads as an
+    error to fix. So the converging case is severity `info`, says how many passes
+    are left, and keeps the tuning advice out of it; the advice stays on the case
+    it was written for, a sweep that is not advancing (the doubling backoff)."""
+    import time as _time
+
+    from dashboard import app as dapp
+
+    for name in ("_LAST_SCAN_AT", "_SCAN_META", "_SCAN_DEFER_AT", "_SCAN_DEFER_TRIES"):
+        monkeypatch.setattr(dapp, name, {}, raising=False)
+    conv = {
+        "rows": 5372, "tables": 8345, "carried_rows": 2160, "missing_tables": 1080,
+        "missing_sample": [], "carry_ttl": float("inf"), "budget": 120.0,
+        "sweep_incomplete": True, "answered_chunks": 27, "partial": True,
+        "starving_chunks": 69, "starving_chunk_start": 35,
+    }
+    dapp._SCAN_META["15m"] = dict(conv)
+    dapp._LAST_SCAN_AT["15m"] = _time.time() - 5.0
+
+    sev, txt = dapp._pair_list_notice("15m", conv)
+    assert sev == "info", txt
+    assert "Progress, not a fault" in txt
+    assert "1080 of 8345 tables have no answer yet and the last pass added 3212" in txt
+    assert "in about 1 more pass(es)" in txt, txt
+    assert "5372/8345" in txt and "chunk 35/69" in txt
+    assert "DASH_SCAN_BUDGET_SEC" not in txt, "no knob while the sweep is working"
+
+    stuck = dict(conv, sweep_incomplete=False, answered_chunks=0)
+    dapp._SCAN_META["15m"] = dict(stuck)
+    dapp._LAST_SCAN_AT["15m"] = _time.time() - 400.0
+    sev2, txt2 = dapp._pair_list_notice("15m", stuck)
+    assert sev2 == "warning" and "DASH_SCAN_BUDGET_SEC" in txt2, txt2
+    assert "(backoff)" in txt2, "the stuck case must still say it is waiting"

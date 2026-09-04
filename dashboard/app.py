@@ -1003,6 +1003,87 @@ def _rescan_delay_sec(timeframe: str) -> float:
     return delay
 
 
+def _pair_list_notice(tf: str, pm: dict) -> tuple:
+    """(severity, text) for the "pair list is incomplete" line, kept out of the
+    render path so it can be tested without a database.
+
+    The severity is the point. A sweep that answers chunks and moves its cursor
+    is a progress bar, and it used to be painted as a warning ending in
+    "DASH_SCAN_BUDGET_SEC (25s per pass, 120s once the page sits idle) is the
+    lever" — which reads as a fault to fix, in the middle of the run finishing
+    itself 9 chunks later. Tuning advice belongs to the case where the sweep is
+    NOT advancing (the doubling backoff, a database that answers nothing); while
+    it advances the honest message is how many passes are left.
+    """
+    _since = time.time() - _LAST_SCAN_AT.get(tf, 0.0)
+    _delay = _rescan_delay_sec(tf)
+    _n = int(pm.get("starving_chunks") or pm.get("chunks") or 0)
+    _at = int(pm.get("starving_chunk_start") or 0)
+    _got = int(pm.get("answered_chunks") or 0)
+    _converging = bool(pm.get("sweep_incomplete")) and _got > 0
+    if _converging:
+        _when = (f"the sweep is at chunk {_at}/{_n} and continues in "
+                 f"~{max(0, int(_delay - _since))} s")
+    elif _since < 5.0:
+        _when = "a full rescan is running now"
+    elif not _LAST_SCAN_AT.get(tf):
+        _when = f"first retry within {int(_delay)} s"
+    else:
+        _when = f"retry in ~{max(0, int(_delay - _since))} s (backoff)"
+
+    _fresh = pm.get("rows", 0) - pm.get("carried_rows", 0)
+    # The carry window is not the setting as printed: while a sweep is still
+    # unfinished the rows it has read are kept until it wraps (that is what stops
+    # the pair list from shrinking mid-pass), so "for up to 900s" would describe a
+    # rule the app is deliberately not applying.
+    _ct = float(pm.get("carry_ttl") or 0.0)
+    if _ct == float("inf"):
+        _win = "until this sweep wraps"
+    else:
+        _win = f"for up to {_ct:.0f}s"
+    _carried = ""
+    if pm.get("carried_rows"):
+        _carried = (f", {pm['carried_rows']} of them carried from the "
+                    f"previous sweeps of this database ({_win})")
+    _holes = int(pm.get("missing_tables") or 0)
+    _holes_txt = ""
+    if _holes:
+        _sample = list(pm.get("missing_sample") or [])
+        _holes_txt = f" \u2014 {_holes} table(s) still unanswered"
+        if _sample:
+            _more = "\u2026" if _holes > len(_sample) else ""
+            _holes_txt += f" ({', '.join(_sample)}{_more})"
+    head = (
+        f"\u23f3 {tf} pair list is incomplete this frame: {pm.get('rows', 0)}/"
+        f"{pm.get('tables', 0)} tables have an answer — the budget read "
+        f"{_fresh} of them this sweep{_carried}{_holes_txt} "
+        f"({pm.get('budget') or settings.dash_scan_budget_sec:.0f}s scan "
+        f"budget) — {_when}."
+    )
+    if _converging:
+        # Passes, not chunks: `missing_tables / rows added last pass` is the same
+        # two numbers the sentence above already shows the user, so the estimate
+        # cannot disagree with them (the cursor arithmetic did: 9 chunks of
+        # tables missing, 7 chunks of cursor left, both printed one line apart).
+        _left = int(pm.get("missing_tables") or 0)
+        _passes = max(1, -(-_left // max(1, int(_fresh)))) if _left else 1
+        return "info", head + (
+            f" Progress, not a fault: {_left} of {pm.get('tables', 0)} tables have "
+            f"no answer yet and the last pass added {max(0, int(_fresh))}, so this "
+            f"clears by itself in about {_passes} more pass(es). Charts already "
+            f"open are unaffected (a chart queries its own table); only a pair the "
+            f"sweep has not reached is missing from the selector. Nothing to do."
+        )
+    return "warning", head + (
+        f" The candles are unaffected (a chart queries its own table), but a pair "
+        f"this sweep has not reached yet is not in the selector — that is the only "
+        f"way this line can cost you a chart. DASH_SCAN_BUDGET_SEC "
+        f"({settings.dash_scan_budget_sec:.0f}s per pass, "
+        f"{settings.dash_scan_budget_idle_sec:.0f}s once the page sits idle) is "
+        f"the lever if the collector keeps the database busy."
+    )
+
+
 def _rescan_due(timeframe: str, now: float) -> bool:
     return snapshot_refresh_due(
         _LAST_SCAN_AT.get(timeframe, 0.0), now, _rescan_delay_sec(timeframe)
@@ -3548,61 +3629,14 @@ else:
         _entry = st.session_state.get(f"_partial_scan_{_tf}")
         _pm = _entry[1] if _entry and time.time() - _entry[0] < 180 else None
         if _pm:
-            # Honest about WHEN the list gets better: the retry is backed off
-            # while the database stays busy, so "refresh in a moment" would be
-            # a promise the app does not keep.
-            _since = time.time() - _LAST_SCAN_AT.get(_tf, 0.0)
-            _delay = _rescan_delay_sec(_tf)
-            if _pm.get("sweep_incomplete") and int(_pm.get("answered_chunks") or 0) > 0:
-                # Not a failure, a sweep in progress — and the badge has to say
-                # that, because "(backoff)" reads as "the app gave up", which is
-                # exactly what "15минутка не загружается" was while the list grew
-                # by 6 chunks every pass.
-                _n = int(_pm.get("starving_chunks") or _pm.get("chunks") or 0)
-                _at = int(_pm.get("starving_chunk_start") or 0)
-                _when = (f"the sweep is at chunk {_at}/{_n} and continues in "
-                         f"~{max(0, int(_delay - _since))} s")
-            elif _since < 5.0:
-                _when = "a full rescan is running now"
-            elif not _LAST_SCAN_AT.get(_tf):
-                _when = f"first retry within {int(_delay)} s"
+            # `info` while the sweep is advancing, `warning` when it is not — and
+            # no knob advice in the first case: a progress bar must not read like
+            # an outage the user has to fix. See `_pair_list_notice`.
+            _sev, _txt = _pair_list_notice(_tf, _pm)
+            if _sev == "info":
+                st.info(_txt)
             else:
-                _when = f"retry in ~{max(0, int(_delay - _since))} s (backoff)"
-            _fresh = _pm.get("rows", 0) - _pm.get("carried_rows", 0)
-            # The carry window is not the setting as printed: while a sweep is
-            # still unfinished the rows it has read are kept until it wraps (that
-            # is what stops the pair list from shrinking mid-pass), so "for up to
-            # 900s" would describe a rule the app is deliberately not applying.
-            _ct = float(_pm.get("carry_ttl") or 0.0)
-            if _ct == float("inf"):
-                _win = "until this sweep wraps"
-            else:
-                _win = f"for up to {_ct:.0f}s"
-            _carried = ""
-            if _pm.get("carried_rows"):
-                _carried = (f", {_pm['carried_rows']} of them carried from the "
-                            f"previous sweeps of this database ({_win})")
-            _holes = int(_pm.get("missing_tables") or 0)
-            _holes_txt = ""
-            if _holes:
-                _sample = list(_pm.get("missing_sample") or [])
-                _holes_txt = f" \u2014 {_holes} table(s) still unanswered"
-                if _sample:
-                    _more = "…" if _holes > len(_sample) else ""
-                    _holes_txt += f" ({', '.join(_sample)}{_more})"
-            st.warning(
-                f"⏳ {_tf} pair list is incomplete this frame: {_pm.get('rows', 0)}/"
-                f"{_pm.get('tables', 0)} tables have an answer — the budget read "
-                f"{_fresh} of them this sweep{_carried}{_holes_txt} "
-                f"({_pm.get('budget') or settings.dash_scan_budget_sec:.0f}s scan "
-                f"budget) — {_when}. "
-                f"The candles are unaffected (a chart queries its own table), but "
-                f"a pair this sweep has not reached yet is not in the selector — "
-                f"that is the only way this line can cost you a chart. "
-                f"DASH_SCAN_BUDGET_SEC ({settings.dash_scan_budget_sec:.0f}s per pass, "
-                f"{settings.dash_scan_budget_idle_sec:.0f}s once the page sits idle) "
-                f"is the lever if the collector keeps the database busy."
-            )
+                st.warning(_txt)
 
 # Counts of what each filter step removed, per tier — see `_pair_list_funnel`.
 _scan_rows_15m, _scan_rows_1d = len(df_15m), len(df_1d)
