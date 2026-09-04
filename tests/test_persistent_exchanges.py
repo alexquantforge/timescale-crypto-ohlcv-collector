@@ -107,3 +107,44 @@ def test_1d_exchange_reused(monkeypatch):
 def test_release_memory_is_safe_noop():
     updater.release_memory()      # must never raise (any OS)
     updater_15m.release_memory()
+
+
+def test_option_markets_are_never_asked_for():
+    """ccxt's market load asks for every category an exchange declares and —
+    synchronously — one after another inside a single timeout, so ONE slow
+    category means no markets at all. gate's list is spot, swap, future, option:
+    an exchange this project never trades options on, and their
+    `BLUR/USDT:USDT` perp sat in "waiting for the first tick" while the *spot*
+    leg timed out. Dropping a category drops a request; that is the only kind of
+    speed-up allowed here.
+
+    The trim is a DENY list because the names are not universal — bybit calls its
+    linear perpetuals `linear`, so an allow-list of ["spot","swap"] would have
+    deleted every bybit perp from the market cache and produced a `BadSymbol`
+    that reads like a delisting.
+    """
+    import ccxt
+
+    from src.exchanges.client import apply_market_type_trim
+
+    gate = ccxt.gate()
+    assert gate.options["fetchMarkets"]["types"] == ["spot", "swap", "future", "option"]
+    assert apply_market_type_trim(gate) == ["spot", "swap", "future"]
+    assert gate.options["fetchMarkets"]["types"] == ["spot", "swap", "future"]
+
+    bybit = ccxt.bybit()                      # perps are "linear" here, and must stay
+    kept = apply_market_type_trim(bybit)
+    assert kept == ["spot", "linear", "inverse"], kept
+    assert bybit.options["fetchMarkets"]["types"] == kept
+    # the sibling keys of that dict are ccxt's own settings: preserved, not
+    # replaced by a dict we invented
+    assert "usePrivateInstrumentsInfo" in bybit.options["fetchMarkets"]
+
+    mexc = ccxt.mexc()                        # flags, not a list -> untouched
+    before = mexc.options["fetchMarkets"]["types"]
+    assert apply_market_type_trim(mexc) == []
+    assert mexc.options["fetchMarkets"]["types"] == before
+
+    okx = ccxt.okx()
+    assert apply_market_type_trim(okx, skip="") == [], "the knob off = ccxt default"
+    assert okx.options["fetchMarkets"]["types"] == ["spot", "future", "swap", "option"]

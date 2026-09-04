@@ -2987,3 +2987,35 @@ def test_a_wave_the_budget_cannot_pay_for_is_never_started(monkeypatch, capsys):
     assert "2 never started" in out, out
     assert "1/3 tables covered" in out, out
     assert "rendering" not in out, "the row count is not a coverage number"
+
+
+def test_the_live_line_says_why_there_is_no_tick(monkeypatch):
+    """"🔴 LIVE: waiting for the first tick…" was on the page for hours while the
+    console said `gate: load_markets failed (RequestTimeout: …/spot/currency_pairs)
+    — retrying after a backoff`. Both sentences were true, only one of them was
+    actionable, and the user could not see it ("почему вечно висит waiting for the
+    first tick"). So the caption reads the market gate it already has and names
+    the reason — without starting a load, which is what `ensure_markets` is for
+    and is not the render path's business."""
+    import time as _time
+
+    from dashboard import app as dapp
+
+    monkeypatch.setattr(dapp, "_MARKET_GATE", {}, raising=True)
+
+    # nothing known about this exchange: the honest sentence is still "waiting"
+    assert dapp._live_wait_text("gate") == "\U0001f534 LIVE: waiting for the first tick…"
+
+    dapp._MARKET_GATE["gate"] = {"fails": 3, "at": _time.time() - 40.0,
+                                 "err": "RequestTimeout: gate GET …/spot/currency_pairs",
+                                 "loading": False}
+    txt = dapp._live_wait_text("gate")
+    assert "no tick, and none can arrive" in txt
+    assert "RequestTimeout" in txt and "next try in" in txt, txt
+    # the backoff clock is the SAME formula the console line uses (20s * 2**(n-1),
+    # cap 900s) — a third number on screen would be a lie
+    assert "attempt 3" in txt and "failed 40s ago" in txt, txt
+
+    dapp._MARKET_GATE["mexc"] = {"fails": 0, "at": 0.0, "err": "", "loading": True}
+    assert "loading its market list now" in dapp._live_wait_text("mexc")
+    assert dapp._MARKET_GATE["mexc"].get("lock") is None

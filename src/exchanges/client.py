@@ -40,7 +40,46 @@ def create_exchange(ccxt_id: str, proxy: Optional[str] = None) -> ccxt_async.Exc
             exchange.has = {**(exchange.has or {}), "fetchCurrencies": False}
         except Exception:
             pass
+    apply_market_type_trim(exchange)
     return exchange
+
+
+def apply_market_type_trim(exchange, skip: Optional[str] = None) -> list:
+    """Drop whole market CATEGORIES from ccxt's `load_markets()`, and return what
+    was kept ('' = nothing changed).
+
+    ccxt's gate/okx/bybit market load iterates
+    `exchange.options["fetchMarkets"]["types"]` and issues one request per
+    category, sequentially for a sync instance — so the load is only as fast as
+    its slowest category, and ONE timed-out category means no markets at all.
+    That is how a gate `…/spot/currency_pairs` timeout starves a *perpetual*
+    chart, and how a collector cycle ends up fetching nothing while its log
+    looks healthy.
+
+    A deny-list, not an allow-list, because the category names are not
+    universal: bybit calls its linear perpetuals `linear`, and an allow-list of
+    ["spot","swap"] would have deleted every bybit perp from the market cache.
+    Exchanges that express this as per-type flags (mexc) or not at all are left
+    untouched — the point is to skip requests, not to guess schemas.
+    """
+    raw = settings.ccxt_market_types_skip if skip is None else skip
+    drop = {t.strip().lower() for t in str(raw or "").split(",") if t.strip()}
+    if not drop:
+        return []
+    try:
+        fm = (getattr(exchange, "options", None) or {}).get("fetchMarkets")
+        types = fm.get("types") if isinstance(fm, dict) else None
+        if not isinstance(types, list):
+            return []
+        keep = [t for t in types if str(t).lower() not in drop]
+        if not keep or len(keep) == len(types):
+            return []
+        fm = dict(fm)
+        fm["types"] = keep
+        exchange.options["fetchMarkets"] = fm
+        return keep
+    except Exception:
+        return []      # a market-load optimisation must never break an exchange
 
 
 async def close_exchange_safely(exchange: ccxt_async.Exchange, name: str = "") -> None:

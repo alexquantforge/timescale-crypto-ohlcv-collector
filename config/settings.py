@@ -376,6 +376,20 @@ class Settings(BaseSettings):
     # exchange is skipped for the whole cycle. Keep it off unless you are
     # debugging precision/limits issues.
     ccxt_fetch_currencies: bool = Field(default=False, alias="CCXT_FETCH_CURRENCIES")
+    # Market categories to REMOVE from ccxt's market load. `load_markets()` asks
+    # an exchange for every category it declares in
+    # `options["fetchMarkets"]["types"]` — for gate that is
+    # spot, swap, future AND option, and a synchronous instance runs them one
+    # after another inside ONE timeout: the load is as slow as its slowest
+    # category, and if any one of them times out there are no markets at all, so
+    # every chart, tape and gap stitch on that exchange answers
+    # "markets are loading" (their BLUR/USDT:USDT perp was starved by the SPOT
+    # leg). This project stores spot and linear perpetual candles and never an
+    # option contract, so the option list is not fetched by default. Only
+    # exchanges that declare the types as a list are touched; one that models
+    # them as per-type flags (mexc) or declares nothing is left exactly as ccxt
+    # configured it. "" = never trim (ccxt's own behaviour).
+    ccxt_market_types_skip: str = Field(default="option", alias="CCXT_MARKET_TYPES_SKIP")
     # Coordination database holding the tiny handshake table (empty = 15m HIGH).
     priority_lane_db: str = Field(default="", alias="PRIORITY_LANE_DB")
     # How far back the lane may bridge a hole in the pair you are LOOKING at.

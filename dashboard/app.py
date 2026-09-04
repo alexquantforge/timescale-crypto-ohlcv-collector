@@ -37,7 +37,8 @@ from config.settings import settings
 from src.analytics.atr_filtered import compute_atr_no_paranormal_bars
 from dashboard.helpers import format_atr_label
 from src.analytics.orderbook import fetch_orderbook_snapshot
-from src.exchanges.client import create_exchange, close_exchange_safely
+from src.exchanges.client import (apply_market_type_trim,
+                          close_exchange_safely, create_exchange)
 from src.core.priority_pairs import lane_pulse, publish_priority_pairs
 from dashboard.helpers import (
     shift_option,
@@ -1535,6 +1536,9 @@ def _new_sync_exchange(ccxt_id: str, timeout_ms: int = 8000):
         ex.has["fetchCurrencies"] = False
     except Exception:
         pass
+    # …and it does not fetch whole market categories this dashboard cannot use
+    # (gate's option-contract list is one request of four inside one timeout).
+    apply_market_type_trim(ex)
     return ex
 
 
@@ -1893,6 +1897,38 @@ def _feed_value(kind: str, ccxt_id: str, symbol: str, max_age_sec: float = _FEED
     return ent["value"]
 
 
+def _live_wait_text(ccxt_id: str) -> str:
+    """What to print instead of "waiting for the first tick", read from the
+    market-load gate — no request, no side effect, no new waiting.
+
+    "Waiting" is only honest while a tick is possible. On gate it was not, for
+    hours: the console said `[markets] gate: load_markets failed (RequestTimeout:
+    … /spot/currency_pairs) — retrying after a backoff` while the page said
+    "waiting for the first tick…", and the operator's question today was exactly
+    that. No ticker can exist while the exchange has no market list — the feeds,
+    the tape and the gap stitch all answer `MarketsUnavailable` first — so the
+    line says so, with the same retry clock the console shows.
+    """
+    g = _MARKET_GATE.get(ccxt_id) or {}
+    fails = int(g.get("fails") or 0)
+    if fails:
+        backoff = min(900.0, 20.0 * (2 ** max(0, fails - 1)))
+        since = time.time() - float(g.get("at") or 0.0)
+        left = max(0.0, backoff - since)
+        return (
+            f"\U0001f534 LIVE: no tick, and none can arrive yet — `{ccxt_id}` has "
+            f"not loaded its market list ({g.get('err') or 'load failed'}; attempt "
+            f"{fails}, failed {since:.0f}s ago, next try in {left:.0f}s). Until it "
+            f"loads, this exchange also returns no catch-up candles and no tape, "
+            f"and the collector skips it for this cycle — that is why the chart "
+            f"stays behind too. Nothing to fetch here: the retry is automatic."
+        )
+    if g.get("loading"):
+        return (f"\U0001f534 LIVE: waiting for the first tick — `{ccxt_id}` is "
+                f"loading its market list now.")
+    return "\U0001f534 LIVE: waiting for the first tick…"
+
+
 def _render_live_panel(ticker: str, exchange: str, demo: bool, db_name: str = None,
                        atr_label: str = ""):
     """One-line LIVE chips: price, bid/ask, spread, 24h change.
@@ -1912,6 +1948,8 @@ def _render_live_panel(ticker: str, exchange: str, demo: bool, db_name: str = No
         data = {"last": px, "bid": px * 0.99995, "ask": px * 1.00005,
                 "pct": st.session_state.get(f"demo_pct_{ticker}_{exchange}", 2.4)}
     else:
+        exchange_map = settings.exchange_map_1d
+        ccxt_id = exchange_map.get(exchange, exchange)
         data = None
         live_row = _db_live_read(db_name, exchange, ticker) if db_name else None
         if live_row and live_row.get("last"):
@@ -1925,13 +1963,11 @@ def _render_live_panel(ticker: str, exchange: str, demo: bool, db_name: str = No
             # Serve-then-refresh: ask what the background feed thread last saw
             # instead of fetching here, so a pair switch never pays a ticker
             # round trip before the first paint.
-            exchange_map = settings.exchange_map_1d
-            ccxt_id = exchange_map.get(exchange, exchange)
             data = _feed_value("ticker", ccxt_id, ticker)
 
     html = _live_line_html(data, atr_label)
     if not html:
-        st.caption("🔴 LIVE: waiting for the first tick…")
+        st.caption(_live_wait_text(ccxt_id if not demo else ""))
         return
     st.markdown(html, unsafe_allow_html=True)
 
