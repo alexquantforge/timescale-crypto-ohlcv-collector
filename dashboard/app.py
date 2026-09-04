@@ -1950,6 +1950,22 @@ def _feed_value(kind: str, ccxt_id: str, symbol: str, max_age_sec: float = _FEED
     return ent["value"]
 
 
+def _short_err(text: str, limit: int = 150) -> str:
+    """An error string for the page: the endpoint without its scheme and host.
+
+    `RequestTimeout: gate GET https://api.gateio.ws/api/v4/spot/currency_pairs`
+    is the right thing to print in a console. In a Streamlit caption the URL is
+    auto-linked, and a linked URL that is also inside italic markdown renders as
+    `++[https://…]` — so the operator sees markup noise exactly where the
+    sentence was supposed to explain something. The path is the informative half
+    anyway: the host is the exchange they are already looking at.
+    """
+    import re as _re
+    out = _re.sub(r"https?://[^/\s]+", "", str(text or ""))
+    out = " ".join(out.split())
+    return out if len(out) <= limit else out[:limit - 1] + "\u2026"
+
+
 def _live_wait_text(ccxt_id: str) -> str:
     """What to print instead of "waiting for the first tick", read from the
     market-load gate — no request, no side effect, no new waiting.
@@ -1970,8 +1986,9 @@ def _live_wait_text(ccxt_id: str) -> str:
         left = max(0.0, backoff - since)
         return (
             f"\U0001f534 LIVE: no tick, and none can arrive yet — `{ccxt_id}` has "
-            f"not loaded its market list ({g.get('err') or 'load failed'}; attempt "
-            f"{fails}, failed {since:.0f}s ago, next try in {left:.0f}s). Until it "
+            f"not loaded its market list ({_short_err(g.get('err') or 'load failed')}; "
+            f"attempt {fails}, failed {since:.0f}s ago, next try in {left:.0f}s). "
+            f"Until it "
             f"loads, this exchange also returns no catch-up candles and no tape, "
             f"and the collector skips it for this cycle — that is why the chart "
             f"stays behind too. Nothing to fetch here: the retry is automatic."

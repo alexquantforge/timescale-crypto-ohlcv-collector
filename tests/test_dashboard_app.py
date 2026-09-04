@@ -3006,12 +3006,15 @@ def test_the_live_line_says_why_there_is_no_tick(monkeypatch):
     # nothing known about this exchange: the honest sentence is still "waiting"
     assert dapp._live_wait_text("gate") == "\U0001f534 LIVE: waiting for the first tick…"
 
-    dapp._MARKET_GATE["gate"] = {"fails": 3, "at": _time.time() - 40.0,
-                                 "err": "RequestTimeout: gate GET …/spot/currency_pairs",
-                                 "loading": False}
+    dapp._MARKET_GATE["gate"] = {
+        "fails": 3, "at": _time.time() - 40.0, "loading": False,
+        "err": "RequestTimeout: gate GET https://api.gateio.ws/api/v4/spot/currency_pairs"}
     txt = dapp._live_wait_text("gate")
     assert "no tick, and none can arrive" in txt
     assert "RequestTimeout" in txt and "next try in" in txt, txt
+    assert "https://" not in txt, "a URL on a caption becomes a link and the " \
+                                  "markdown around it shows up as ++[…] markup"
+    assert "/api/v4/spot/currency_pairs" in txt, txt
     # the backoff clock is the SAME formula the console line uses (20s * 2**(n-1),
     # cap 900s) — a third number on screen would be a lie
     assert "attempt 3" in txt and "failed 40s ago" in txt, txt
