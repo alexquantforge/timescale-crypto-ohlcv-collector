@@ -638,6 +638,8 @@ async def _scan_database(
         errors: list = []
         skipped: list = []
         out: list = []
+        # Chunks the remaining time could not pay for, so they were never asked.
+        not_started = [0]
         # Tables this sweep has a DIRECT answer for: their chunk query returned,
         # whether or not it produced rows (an empty pair table is an answer, and
         # `partial` used to treat "the budget cut the sweep" as a missing answer
@@ -764,10 +766,41 @@ async def _scan_database(
         start = int(sweep.get("start", 0)) % n_chunks if (sweep is not None and n_chunks) else 0
         if start:
             chunks = chunks[start:] + chunks[:start]
-        for result in await asyncio.gather(
-            *[run_chunk(ci, c) for ci, c in enumerate(chunks)]
-        ):
-            out.extend(result)
+        # Run the chunks in WAVES of one pool-full instead of queueing all 69 at
+        # once. Their measurement: `124.4s — 42 chunk(s) skipped (db busy)` for
+        # ~3 300 tables gained — with 69 chunks behind 6 connections, a chunk
+        # granted a connection a minute into the pass has almost nothing left and
+        # is cancelled MID-QUERY. Postgres still did the UNION over 120 tables,
+        # the collector still paid for it, and the answer was thrown away: the
+        # worst of both worlds, and the reason a 120s pass covered less than half
+        # the tier it had time for. One wave at a time lets the sweep stop BEFORE
+        # admitting work the remaining budget cannot finish, using the duration of
+        # its own previous waves — no new setting, no guess, no query removed from
+        # the sweep, only queries that were guaranteed to be wasted.
+        wave_n = max(1, int(pool_size))
+        wave_secs = 0.0
+        ci = 0
+        while ci < n_chunks:
+            left = deadline - time.time()
+            if ci and wave_secs > 0.0 and left < wave_secs + 1.0:
+                break
+            t_wave = time.time()
+            got = await asyncio.gather(
+                *[run_chunk(i, c) for i, c in enumerate(chunks[ci:ci + wave_n], start=ci)]
+            )
+            for r in got:
+                out.extend(r)
+            d = time.time() - t_wave
+            wave_secs = d if wave_secs <= 0.0 else 0.4 * wave_secs + 0.6 * d
+            ci += wave_n
+        if ci < n_chunks:
+            # Left where they are: `skipped` keeps the tail out of `answered_chunks`
+            # and therefore out of the cursor advance, so a pass that ran out of
+            # time resumes at the first chunk it never asked about — it does not
+            # skip a third of the tier and call the list complete.
+            for _i, _c in enumerate(chunks[ci:], start=ci):
+                skipped.append(len(_c))
+            not_started[0] = n_chunks - ci
 
         answered_chunks = max(0, n_chunks - len(skipped))
         # Carry the rows earlier sweeps of THIS database answered: a sweep cut
@@ -818,6 +851,7 @@ async def _scan_database(
             "rows": len(out),
             "chunks": len(chunks),
             "skipped_chunks": len(skipped),
+            "not_started_chunks": not_started[0],
             "fallback_chunks": len([t for t, _ in errors if t.startswith("chunk[")]),
             "seconds": secs,
             "sweep_seconds": sweep_secs,
@@ -846,17 +880,32 @@ async def _scan_database(
             preview = "; ".join(f"{t}: {e}" for t, e in errors[:3])
             busy = len({t for t, e in errors if scan_failure_is_transient(str(e))})
             broken = len({t for t, e in errors if not scan_failure_is_transient(str(e))})
+            _na = (f", {not_started[0]} chunk(s) never started "
+                   f"(~{wave_secs:.1f}s a wave, {max(0.0, deadline - time.time()):.1f}s "
+                   f"left)") if not_started[0] else ""
             print(
                 f"[scan] {db_name}: {sweep_secs:.1f}s — {busy} chunk(s) skipped (db busy), "
-                f"{broken} chunk(s) needed retry/recovery: {preview}{tail}",
+                f"{broken} chunk(s) needed retry/recovery{_na}: {preview}{tail}",
                 flush=True,
             )
-        elif sweep_secs > 3.0:
-            print(
-                f"[scan] {db_name}: {len(chunks)} chunk(s) / {len(out)} tables in "
-                f"{sweep_secs:.1f}s{tail}",
-                flush=True,
-            )
+        elif sweep_secs > 3.0 or not_started[0]:
+            # A pass that STOPPED because the budget could not pay for another
+            # wave is worth a line even when nothing failed: it is the number
+            # that says how long the list still needs.
+            if not_started[0]:
+                print(
+                    f"[scan] {db_name}: {n_chunks - not_started[0]}/{n_chunks} "
+                    f"chunk(s) / {len(out)} tables in {sweep_secs:.1f}s — stopped "
+                    f"with {not_started[0]} chunk(s) not started "
+                    f"(~{wave_secs:.1f}s a wave){tail}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[scan] {db_name}: {len(chunks)} chunk(s) / {len(out)} tables "
+                    f"in {sweep_secs:.1f}s{tail}",
+                    flush=True,
+                )
         if partial:
             resume = ""
             if sweep is not None and n_chunks:
@@ -871,10 +920,18 @@ async def _scan_database(
             held = ""
             if carried and missing:
                 held = f", {len(missing)} of them only carried from earlier passes"
+            # COVERAGE, not row count: `rendering 5296` twice in a row looks like
+            # a stalled sweep while coverage grows, because `out` is the rows this
+            # pass read and a re-read chunk of an already-carried table does not
+            # add a row. `len(tables) - len(missing)` is the number the badge and
+            # the selector actually move on.
+            _cov = len(tables) - len(missing)
+            _na_txt = f", {not_started[0]} never started" if not_started[0] else ""
             print(
-                f"[scan] {db_name}: {budget_sec:.0f}s budget exhausted — rendering "
-                f"{len(out)}/{len(tables)} tables ({len(skipped)} chunk(s) skipped on "
-                f"budget/busy db{held}); the list will be retried with backoff{resume}",
+                f"[scan] {db_name}: {budget_sec:.0f}s budget exhausted — "
+                f"{_cov}/{len(tables)} tables covered ({len(out)} row(s) this pass, "
+                f"{len(skipped)} chunk(s) skipped on budget/busy db{_na_txt}"
+                f"{held}); the list will be retried with backoff{resume}",
                 flush=True,
             )
         return out

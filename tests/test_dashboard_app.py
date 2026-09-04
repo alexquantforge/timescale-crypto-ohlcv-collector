@@ -2899,3 +2899,91 @@ def test_a_converging_pair_list_is_progress_and_not_an_outage(monkeypatch):
     assert sev2 == "warning" and "DASH_SCAN_BUDGET_SEC" in txt2, txt2
     assert det2 == "", "the case that needs action has nothing to hide"
     assert "(backoff)" in txt2, "the stuck case must still say it is waiting"
+
+
+class _WavePool:
+    """A pool whose every query takes `delay` seconds: lets a test see what the
+    sweep believes a wave costs, instead of trusting a wall clock."""
+
+    def __init__(self, tables, delay=1.8):
+        self.delay = delay
+        self.tables = list(tables)
+        self.union_queries: list = []
+
+    def acquire(self, *a, **kw):
+        outer = self
+
+        class _Conn:
+            async def fetch(self, query, *args):
+                import asyncio as _a
+                await _a.sleep(outer.delay)
+                if "pg_catalog" in query:
+                    return [{"table_name": t, "column_name": "Timestamp",
+                             "data_type": "timestamptz"} for t in outer.tables]
+                outer.union_queries.append(query)
+                return []      # an answer of "no rows" is still an answer
+
+        class _Ctx:
+            async def __aenter__(self_inner):
+                return _Conn()
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        return _Ctx()
+
+    async def release(self, conn):
+        return None
+
+    async def close(self):
+        return None
+
+
+def test_a_wave_the_budget_cannot_pay_for_is_never_started(monkeypatch, capsys):
+    """Their pass, measured: `124.4s — 42 chunk(s) skipped (db busy)` for ~3 300
+    tables gained. All 69 chunks sit behind 6 connections, so a chunk granted one
+    a minute late is cancelled MID-QUERY — Postgres did the UNION over 120 tables,
+    the collector paid, and the result was thrown away. Waves are admitted one at
+    a time now, using the sweep's own observed wave duration, so the remaining
+    time never buys a doomed query; and the chunks that were not started do NOT
+    count as answered, which is what keeps the resume cursor honest.
+
+    (Coverage is reported as `N/M tables covered` rather than
+    `rendering <rows>`, for the same reason: their console showed
+    `rendering 5296/8270` twice while the selector grew, because re-reading a
+    chunk of already-carried tables adds no row.)"""
+    import asyncio
+    import time as _time
+
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_scan_yield_gap_sec", 0.0)
+    tables = [f"p{i}_usdt_on_bybit" for i in range(3)]
+    pool = _WavePool(tables)          # ~1.8s per wave, one chunk per wave
+    dapp._SCAN_INVENTORY[("h", 1, "db_wave")] = {
+        "at": _time.time(), "tables": {t: {"Timestamp": "timestamptz"} for t in tables}}
+
+    async def fake_create_pool(**kw):
+        return pool
+
+    monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool)
+    st = {}
+    # 4s of budget buys exactly one 1.8s wave; the guard needs wave+1s to start
+    # the next one, and 2.2s left is not that — so waves 2 and 3 are never asked.
+    asyncio.run(dapp._scan_database("db_wave", "LOW", "h", 1, "u", "p",
+                                    pool_size=1, chunk_size=1, budget_sec=4.0,
+                                    sweep=st))
+    out = capsys.readouterr().out
+    assert len(pool.union_queries) == 1, (
+        "the second wave had ~2.2s left against a ~1.8s wave, so starting it "
+        "means another cancelled-at-deadline query the collector paid for: "
+        f"{len(pool.union_queries)} queries")
+    meta = dapp._SCAN_META["db_wave"]
+    assert meta["not_started_chunks"] == 2, meta
+    assert meta["answered_chunks"] == 1, meta
+    assert st.get("start") == 1, f"the cursor must stop after what was ASKED: {st}"
+    assert "stopped with 2 chunk(s) not started" in out, out
+    assert "2 never started" in out, out
+    assert "1/3 tables covered" in out, out
+    assert "rendering" not in out, "the row count is not a coverage number"
