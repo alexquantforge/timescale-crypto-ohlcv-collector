@@ -2,6 +2,14 @@
 asyncpg>=0.28.0
 ccxt>=4.2.0
 aiohttp-socks>=0.8.4
+# …and the OTHER proxy library, for the other half of the app: `aiohttp-socks`
+# serves the async clients (engines/collector), while the dashboard's sync clients
+# go through `requests`, which needs PySocks to accept a socks5:// URL at all.
+# Without it, DASH_SYNC_PROXY=socks5h://… is refused with a log line (see
+# `_new_sync_exchange`), and the dashboard stays on the direct route — which on a
+# link that delivers 382 B/s for a large body (measured 2026-09-05) means gate
+# never loads there. Both are runtime necessities, so both are declared.
+PySocks>=1.7.1
 pandas>=2.0.0
 numpy>=1.24.0
 pydantic>=2.0.0
