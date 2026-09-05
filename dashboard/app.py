@@ -76,6 +76,9 @@ from dashboard.helpers import (
     chunked,
     snapshot_path,
     inventory_path,
+    markets_path,
+    save_markets_snapshot,
+    load_markets_snapshot,
     save_inventory_snapshot,
     load_inventory_snapshot,
     save_summary_snapshot,
@@ -1036,13 +1039,20 @@ async def _load_summary(db_host, db_port, db_user, db_pass, timeframe: str) -> p
     # finished in one chunk and a LOW tier at 0/69 — a diagnostic that miscounts
     # its own progress is how a converging sweep gets read as a stalled one.
     _starving = [
-        m for (_tier, _db), m in zip(dbs, metas)
+        (_db, m) for (_tier, _db), m in zip(dbs, metas)
         if "start" in (_SCAN_SWEEP_STATE.get(_db) or {}) and m.get("missing_tables")
     ]
     if _starving:
-        _m = max(_starving, key=lambda m: m.get("missing_tables") or 0)
+        _db, _m = max(_starving, key=lambda pair: pair[1].get("missing_tables") or 0)
         meta_tf["starving_chunks"] = int(_m.get("chunks") or 0)
-        meta_tf["starving_chunk_start"] = int(_m.get("chunk_start") or 0)
+        # The CURSOR, not "where this pass began". `chunk_start` is the first
+        # chunk the reported pass read, so the badge said "the sweep is at chunk
+        # 0/70" while the terminal said "next sweep continues at chunk 25/70" and
+        # 789 tables were already rendered — a progress line that appears to move
+        # backwards is read as a stalled sweep, which is the one thing this
+        # notice exists to rule out.
+        meta_tf["starving_chunk_start"] = int(
+            (_SCAN_SWEEP_STATE.get(_db) or {}).get("start", _m.get("chunk_start") or 0))
         meta_tf["budget"] = _m.get("budget")
     else:
         meta_tf["starving_chunks"] = meta_tf["starving_chunk_start"] = 0
@@ -1623,7 +1633,7 @@ def _market_gate(ccxt_id: str) -> dict:
         g = _MARKET_GATE.get(ccxt_id)
         if g is None:
             g = {"lock": threading.Lock(), "at": 0.0, "fails": 0,
-                 "err": "", "loading": False}
+                 "err": "", "loading": False, "markets_from": ""}
             _MARKET_GATE[ccxt_id] = g
         return g
 
@@ -1689,6 +1699,66 @@ def _market_load_probe(ccxt_id: str, ex, timeout_ms) -> None:
           f"{_probe_to / 1000:.0f}s per request — " + "; ".join(parts), flush=True)
 
 
+def _seed_markets_from_disk(ccxt_id: str, ex, g: dict) -> bool:
+    """Give a cold process the catalog it loaded yesterday, without asking.
+
+    Their restarts looked like this for four rounds:
+
+        [markets] ⚠️ gate: load_markets failed (RequestTimeout: gate GET
+                  https://api.gateio.ws/api/v4/spot/currency_pairs)
+
+    under a 60 s PER-REQUEST timeout, while the operator's own `curl` of that
+    exact URL answered in 2.7–5.8 s — so it is something in this process that
+    makes the request slow, and while that is being measured, every gate chart,
+    every tape and every gap stitch in the process is empty, on every restart,
+    forever. A market catalog changes on the scale of listings and delistings; a
+    chart needs `precision`/`contractSize`, not freshness. So the last catalog a
+    REAL load produced is applied from disk in milliseconds, the age is printed
+    instead of hidden, and `DASH_MARKETS_REFRESH_SEC` decides whether a true
+    reload is also started in the background right away (usable immediately
+    either way — this is not a request the click path waits for).
+    """
+    if not settings.dash_snapshot_enabled:
+        return False
+    ttl = float(settings.dash_markets_disk_ttl_sec)
+    markets, age = load_markets_snapshot(
+        markets_path(settings.dash_snapshot_dir, ccxt_id), ttl)
+    if not markets:
+        return False
+    try:
+        ex.set_markets(markets)
+    except Exception as e:
+        _market_log_once(("seed", ccxt_id),
+                         f"[markets] {ccxt_id}: the disk catalog could not be "
+                         f"applied ({type(e).__name__}: {str(e)[:120]}) — loading "
+                         f"from the exchange instead")
+        return False
+    n = len(getattr(ex, "markets", None) or {})
+    if not n:
+        return False
+    g.update(at=time.time(), fails=0, err="", markets_from=f"disk ({age:.0f}s old)")
+    refresh = float(settings.dash_markets_refresh_sec)
+    if age > refresh and not g.get("loading"):
+        # Stale enough to be worth fixing now, but the refresh runs behind the
+        # same one-loader-per-exchange lock and never in front of a user.
+        g["loading"] = True
+
+        def _bg_refresh(ccxt_id=ccxt_id, ex=ex):
+            g2 = _market_gate(ccxt_id)
+            with g2["lock"]:
+                _load_markets_locked(ccxt_id, ex, "disk-refresh")
+
+        threading.Thread(target=_bg_refresh, daemon=True,
+                         name=f"markets-refresh-{ccxt_id}").start()
+        _what = f"a real reload is running now (the file is {age:.0f}s old > {refresh:.0f}s)"
+    else:
+        _what = f"a real reload follows at {refresh:.0f}s of age"
+    print(f"[markets] {ccxt_id}: {n} markets taken from disk ({age:.0f}s old, "
+          f"accepted up to {ttl:.0f}s) — no exchange request needed on the click "
+          f"path; {_what}", flush=True)
+    return True
+
+
 def _load_markets_locked(ccxt_id: str, ex, who: str) -> str:
     """Performs the load while holding the gate lock. Returns '' or a reason."""
     g = _market_gate(ccxt_id)
@@ -1700,8 +1770,17 @@ def _load_markets_locked(ccxt_id: str, ex, who: str) -> str:
         # keeps the tight timeout where it belongs (on the fetches).
         ex.timeout = max(int(old_timeout or 0), int(_market_load_sec() * 1000))
         ex.load_markets()
-        g.update(at=time.time(), fails=0, err="", loading=False)
-        print(f"[markets] {ccxt_id}: {len(ex.markets or {})} markets loaded "
+        g.update(at=time.time(), fails=0, err="", loading=False,
+                 markets_from="exchange")
+        n_loaded = len(ex.markets or {})
+        # Only a REAL load writes the file (see `_seed_markets_from_disk`): a
+        # disk-seeded catalog re-saving itself would let a permanently broken
+        # endpoint keep its own cache warm and turn a stale listing into the
+        # permanent truth.
+        if n_loaded:
+            save_markets_snapshot(
+                markets_path(settings.dash_snapshot_dir, ccxt_id), ex.markets)
+        print(f"[markets] {ccxt_id}: {n_loaded} markets loaded "
               f"in {time.time() - started:.1f}s (by {who})", flush=True)
         return ""
     except BaseException as e:            # ccxt lets a CancelledError escape here
@@ -1711,6 +1790,22 @@ def _load_markets_locked(ccxt_id: str, ex, who: str) -> str:
                          f"[markets] ⚠️ {ccxt_id}: load_markets failed "
                          f"({g['err']}) — retrying after a backoff, feeds and "
                          f"stitching stay empty until it works")
+        if int(g["fails"]) >= 2:
+            # One abandoned request (an orderbook or tape fetch cut by its own
+            # 8s budget) can poison a reused HTTP session: the next request then
+            # waits for the SERVER's keep-alive idle timeout, which is exactly
+            # what "RequestTimeout at 60s on an endpoint curl finishes in 3s"
+            # looks like. Drop the connections before the next attempt — it costs
+            # nothing (no request is in flight) and replaces nothing.
+            try:
+                ex.close()
+                _market_log_once(("reclose", ccxt_id),
+                                 f"[markets] {ccxt_id}: dropped its HTTP "
+                                 f"connections before the next load attempt "
+                                 f"(a stale pooled connection can eat a whole "
+                                 f"timeout)")
+            except Exception:
+                pass
         if settings.dash_market_load_debug:
             _market_load_probe(ccxt_id, ex, old_timeout)
         return g["err"]
@@ -1740,6 +1835,11 @@ def ensure_markets(ccxt_id: str, ex=None, wait_sec: float = 0.0, who: str = "fee
     try:
         if getattr(ex, "markets", None):
             return ""                       # loaded while we waited
+        if _seed_markets_from_disk(ccxt_id, ex, g):
+            # Must come BEFORE the backoff test: a failed live load used to keep
+            # the page unusable for the whole 20–900 s window even though the
+            # catalog it needed was sitting in the cache directory.
+            return ""
         backoff = min(900.0, 20.0 * (2 ** max(0, int(g["fails"]) - 1)))
         since = time.time() - float(g["at"])
         if int(g["fails"]) and since < backoff:
@@ -2006,6 +2106,16 @@ def _short_err(text: str, limit: int = 150) -> str:
     return out if len(out) <= limit else out[:limit - 1] + "\u2026"
 
 
+def _since_txt(seconds: float) -> str:
+    """`42s` / `6.2m` / `3.1h`, for sentences that must not print `0.7m`."""
+    v = max(0.0, float(seconds or 0.0))
+    if v < 90.0:
+        return f"{v:.0f}s"
+    if v < 5400.0:
+        return f"{v / 60.0:.1f}m"
+    return f"{v / 3600.0:.1f}h"
+
+
 def _live_wait_text(ccxt_id: str) -> str:
     """What to print instead of "waiting for the first tick", read from the
     market-load gate — no request, no side effect, no new waiting.
@@ -2020,7 +2130,11 @@ def _live_wait_text(ccxt_id: str) -> str:
     """
     g = _MARKET_GATE.get(ccxt_id) or {}
     fails = int(g.get("fails") or 0)
-    if fails:
+    # `markets_from` is the difference between "nothing can arrive" and "the
+    # refresh failed but the feeds have a catalog to work with". Saying the first
+    # about the second is the same mistake as saying "waiting" about a blocked
+    # load — and a disk-seeded catalog makes that pair of states common.
+    if fails and not g.get("markets_from"):
         backoff = min(900.0, 20.0 * (2 ** max(0, fails - 1)))
         since = time.time() - float(g.get("at") or 0.0)
         left = max(0.0, backoff - since)
@@ -2033,6 +2147,14 @@ def _live_wait_text(ccxt_id: str) -> str:
             f"and the collector skips it for this cycle — that is why the chart "
             f"stays behind too. Nothing to fetch here: the retry is automatic."
         )
+    if fails:
+        since = time.time() - float(g.get("at") or 0.0)
+        return (f"\U0001f534 LIVE: waiting for the first tick — `{ccxt_id}` is "
+                f"reading its market list from disk ({g.get('markets_from')}); the "
+                f"refresh failed {_since_txt(since)} ago "
+                f"({_short_err(g.get('err') or 'load failed')}) and is retried "
+                f"automatically. Feeds and stitching are running against the "
+                f"catalog on disk, so a stale listing is the only risk here.")
     if g.get("loading"):
         return (f"\U0001f534 LIVE: waiting for the first tick — `{ccxt_id}` is "
                 f"loading its market list now.")

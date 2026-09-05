@@ -502,6 +502,66 @@ def load_inventory_snapshot(path: str, max_age_sec: float):
         return None, None
 
 
+def markets_path(directory: str, ccxt_id: str) -> str:
+    """File the last market catalog of one exchange is cached in."""
+    base = directory or os.path.join(
+        os.path.expanduser("~"), ".cache", "timescale-ohlcv-dashboard"
+    )
+    return os.path.join(base, f"markets_{_safe_component(ccxt_id)}.pkl")
+
+
+def save_markets_snapshot(path: str, markets) -> bool:
+    """Persist the PARSED market dicts after a real `load_markets()`.
+
+    A ccxt market load is a sequence of large list requests (gate: spot
+    `…/spot/currency_pairs` ~94 KB plus a ~1.3 MB swap list, each under one
+    per-request timeout) — the slowest thing the dashboard does before it can
+    show a price, and the reason one unreachable endpoint used to blank every
+    gate chart, tape and gap stitch in the process. The catalog itself changes
+    on the scale of listings and delistings, so the last good one is worth more
+    than a live one on a page that only needs symbol metadata to draw candles.
+    Only a network load writes this: a disk-seeded catalog must never refresh
+    its own file, or a broken API would keep the cache warm forever.
+    """
+    if markets is None:
+        return False
+    try:
+        values = list(markets.values()) if isinstance(markets, dict) else list(markets)
+        payload = [dict(m) for m in values if isinstance(m, dict)]
+        if not payload:
+            return False
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as fh:
+            pickle.dump({"at": _time.time(), "markets": payload}, fh,
+                        protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def load_markets_snapshot(path: str, max_age_sec: float):
+    """Returns (list_of_market_dicts, age_sec) or (None, None).
+
+    A list, not the dict: ccxt's `set_markets()` derives the symbol keys and the
+    `markets_by_id` index itself, and feeding it the exact shape `fetch_markets`
+    would have returned is what keeps `precision`/`contractSize` defaults intact.
+    """
+    try:
+        age = _time.time() - os.path.getmtime(path)
+        if age > float(max_age_sec):
+            return None, None
+        with open(path, "rb") as fh:
+            blob = pickle.load(fh)
+        markets = blob.get("markets") if isinstance(blob, dict) else None
+        if not isinstance(markets, list) or not markets:
+            return None, None
+        return markets, age
+    except Exception:
+        return None, None
+
+
 # ---------------------------------------------------------------------------
 # Health strip (compact green→red indicators at the top of the Charts tab)
 # ---------------------------------------------------------------------------

@@ -2838,7 +2838,11 @@ def test_the_badge_quotes_the_database_that_is_still_being_read(monkeypatch):
     monkeypatch.setattr(dapp.settings, "db_high_15m", "db_hi")
     monkeypatch.setattr(dapp.settings, "db_low_15m", "db_lo")
     dapp._SCAN_SWEEP_STATE.clear()
-    dapp._SCAN_SWEEP_STATE["db_lo"] = {"start": 14}
+    # 15 = the chunk the NEXT pass will read (what the terminal prints as
+    # "continues at chunk 15/69"), 14 = where the reported pass began. Quoting
+    # the second is what read as "the sweep is at chunk 0/70" on their screen
+    # while the log already said `chunk 25/70`.
+    dapp._SCAN_SWEEP_STATE["db_lo"] = {"start": 15}
 
     async def fake_scan(db_name, tier, *a, **kw):
         # The rows do not matter here: the tier meta is written before the frame
@@ -2862,7 +2866,7 @@ def test_the_badge_quotes_the_database_that_is_still_being_read(monkeypatch):
     monkeypatch.setattr(dapp, "_scan_database", fake_scan)
     asyncio.run(dapp._load_summary("h", 1, "u", "p", "15m"))
     m = dapp._SCAN_META["15m"]
-    assert m["starving_chunks"] == 69 and m["starving_chunk_start"] == 14, m
+    assert m["starving_chunks"] == 69 and m["starving_chunk_start"] == 15, m
     assert m["budget"] == 90.0, "the badge must quote the budget the pass ran on"
     assert m["sweep_incomplete"] is True
 
@@ -3080,6 +3084,122 @@ def test_the_market_probe_names_the_slow_category_and_leaves_no_partial_catalog(
     assert ex.options["fetchMarkets"] == {"types": ["spot", "swap", "future", "option"],
                                           "keepme": 1}
     assert ex.timeout == 8_000
+
+
+def test_a_cold_process_applies_the_disk_catalog_without_a_request(monkeypatch, tmp_path,
+                                                                    capsys):
+    """Restart while gate is blackholed: the chart must still know its symbols.
+
+    Four rounds of `[markets] ⚠️ gate: load_markets failed (RequestTimeout …
+    /spot/currency_pairs)` under a 60s per-request timeout, while the operator's
+    own curl of that URL took 3s — and every gate chart, tape and gap stitch in
+    the process stayed empty on every restart. The catalog a REAL load produced
+    is on disk, so a cold process must not need the exchange to be reachable.
+    """
+    import os
+
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_enabled", True)
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_dir", str(tmp_path))
+    monkeypatch.setattr(dapp.settings, "dash_markets_refresh_sec", 3600.0)
+
+    markets = {
+        "BTC/USDT": {"id": "BTC_USDT", "symbol": "BTC/USDT", "base": "BTC",
+                     "quote": "USDT", "type": "spot", "spot": True, "swap": False,
+                     "precision": {"amount": 8, "price": 2},
+                     "contract": False, "contractSize": None},
+        "BTC/USDT:USDT": {"id": "BTC_USDT", "symbol": "BTC/USDT:USDT", "base": "BTC",
+                          "quote": "USDT", "settle": "USDT", "type": "swap",
+                          "spot": False, "swap": True, "linear": True,
+                          "contract": True, "contractSize": 1.0},
+    }
+    path = dapp.markets_path(str(tmp_path), "gate")
+    assert dapp.save_markets_snapshot(path, markets)
+    stamp = os.path.getmtime(path)
+
+    asked = []
+
+    def boom(*a, **kw):
+        asked.append("load_markets")
+        raise RuntimeError("RequestTimeout: gate GET https://api.gateio.ws/api/v4/"
+                           "spot/currency_pairs")
+
+    # a REAL ccxt instance, so `set_markets` is ccxt's own symbol/by-id indexing
+    ex = dapp._new_sync_exchange("gate")
+    ex.load_markets = boom
+
+    assert dapp.ensure_markets("gate", ex, who="click") == ""
+    assert asked == [], "a fresh disk catalog must not wake the exchange"
+    assert "BTC/USDT" in (ex.markets or {}), ex.markets and list(ex.markets)[:4]
+    # the perp survives the round trip, or the ⏱ chip and the links would flip
+    assert "BTC/USDT:USDT" in ex.markets
+    assert ex.market("BTC/USDT:USDT")["contractSize"] == 1.0
+    assert dapp._market_gate("gate")["markets_from"].startswith("disk")
+    assert os.path.getmtime(path) == stamp, "a seeded load must not re-save the file"
+    out = capsys.readouterr().out
+    assert "markets taken from disk" in out and "no exchange request needed" in out
+
+
+def test_a_stale_disk_catalog_is_reloaded_in_the_background_not_on_the_click(
+        monkeypatch, tmp_path):
+    """Usable now, true soon: the refresh is scheduled, the click never waits."""
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_enabled", True)
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_dir", str(tmp_path))
+    monkeypatch.setattr(dapp.settings, "dash_markets_refresh_sec", 0.0)
+
+    path = dapp.markets_path(str(tmp_path), "gate")
+    assert dapp.save_markets_snapshot(path, {
+        "BTC/USDT": {"id": "BTC_USDT", "symbol": "BTC/USDT", "type": "spot",
+                     "spot": True, "base": "BTC", "quote": "USDT"}})
+
+    started = []
+
+    class _Thread:
+        def __init__(self, target=None, daemon=None, name=None):
+            self.target, self.name = target, name
+
+        def start(self):
+            started.append(self.name)          # NOT run: it takes the load lock
+
+    monkeypatch.setattr(dapp.threading, "Thread", _Thread)
+
+    def boom(*a, **kw):
+        raise RuntimeError("RequestTimeout")
+
+    ex = dapp._new_sync_exchange("gate")
+    ex.load_markets = boom
+    assert dapp.ensure_markets("gate", ex, who="click") == ""
+    assert started == ["markets-refresh-gate"], started
+    assert "BTC/USDT" in (ex.markets or {}), "the refresh must not undo the usable catalog"
+
+
+def test_the_live_line_does_not_claim_a_missing_market_list_when_disk_has_one(
+        monkeypatch):
+    """`markets are loading elsewhere` and `nothing can arrive` are different
+    facts; a disk-seeded catalog makes the pair of states common, and a label
+    that disagrees with the method is worse than no label."""
+    import threading
+
+    from dashboard import app as dapp
+
+    _summary_stores(monkeypatch, dapp)
+    g = {"lock": threading.Lock(), "at": time.time() - 40.0, "fails": 2,
+         "err": "RequestTimeout: gate GET https://api.gateio.ws/api/v4/spot/"
+                "currency_pairs",
+         "loading": False, "markets_from": "disk (400s old)"}
+    dapp._MARKET_GATE["gate"] = g
+    txt = dapp._live_wait_text("gate")
+    assert "reading its market list from disk" in txt
+    assert "none can arrive yet" not in txt
+    assert "api.gateio.ws" not in txt, "the URL still renders as link markup"
+
+    g["markets_from"] = ""
+    assert "none can arrive yet" in dapp._live_wait_text("gate")
 
 
 def test_a_cold_process_does_not_read_the_catalog_before_the_first_chunk(monkeypatch, tmp_path, capsys):

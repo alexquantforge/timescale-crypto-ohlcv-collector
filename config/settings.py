@@ -263,6 +263,20 @@ class Settings(BaseSettings):
     # that exchange answers MarketsUnavailable until it succeeds. A load that never
     # completes costs one background thread its timeout, and nothing else.
     dash_market_load_sec: float = Field(default=60.0, alias="DASH_MARKET_LOAD_TIMEOUT_SEC")
+    # A market catalog is the most expensive thing the dashboard fetches (gate: a
+    # ~94 KB spot list and a ~1.3 MB swap list, in sequence, each under the load
+    # timeout) and the first thing a cold process needs before it can show a
+    # price. The last catalog a REAL load produced is therefore kept in the cache
+    # directory and applied without asking the exchange, as long as it is younger
+    # than this. Delistings and precision changes are the cost; an hour of chart
+    # availability per endpoint outage is the benefit.
+    dash_markets_disk_ttl_sec: float = Field(default=86400.0,
+                                             alias="DASH_MARKETS_DISK_TTL_SEC")
+    # …and a disk-seeded catalog older than this also triggers a real reload in
+    # the background (never on the click path). Set it to 0 to reload on every
+    # start, or above the TTL to never reload while the process lives.
+    dash_markets_refresh_sec: float = Field(default=3600.0,
+                                            alias="DASH_MARKETS_REFRESH_SEC")
     # Wall-clock budget for the whole-database summary scan. Whatever came
     # back in time is rendered — the dashboard must stay usable while the
     # collector writes.
