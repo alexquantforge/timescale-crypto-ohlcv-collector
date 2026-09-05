@@ -691,7 +691,16 @@ def build_health_strip_html(row: dict) -> str:
 
     dead = bool(row.get("ob_is_barcode")) or (tpm is not None and tpm < 3.0)
 
-    tpm_txt = f"{tpm:.0f}/min" if tpm is not None else "n/a"
+    # Below the dead threshold the number has to be readable AT the threshold:
+    # a 0.6/min market was painted `1/min · DEAD` beside a metric card that said
+    # `0.6 trades/min`, and two renderings of one value is how a chip gets
+    # believed or disbelieved by accident.
+    if tpm is None:
+        tpm_txt = "n/a"
+    elif tpm < 3.0:
+        tpm_txt = f"{tpm:.1f}/min"
+    else:
+        tpm_txt = f"{tpm:.0f}/min"
     if dead:
         tpm_txt += " · DEAD"
 

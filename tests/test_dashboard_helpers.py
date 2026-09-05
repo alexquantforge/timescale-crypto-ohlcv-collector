@@ -147,6 +147,15 @@ def test_build_health_strip_dead_market():
     assert "DEAD" in html
     # red chips (score ~0 -> hsl(0))
     assert "hsl(0" in html
+    # …and the chip quotes the number at the precision the threshold needs: a
+    # 0.6/min market must not read `1/min` next to a card saying `0.6 trades/min`
+    assert "1.2/min · DEAD" in html
+
+
+def test_a_sub_minute_tape_is_not_rounded_up_to_alive():
+    from dashboard.helpers import build_health_strip_html
+    html = build_health_strip_html({"ob_trades_per_min": 0.6, "ob_is_barcode": True})
+    assert "0.6/min · DEAD" in html and "1/min" not in html
 
 
 def test_build_health_strip_empty_row_is_safe():
