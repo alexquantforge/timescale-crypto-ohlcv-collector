@@ -3176,6 +3176,7 @@ def test_the_markets_lines_say_which_route_they_took(monkeypatch, capsys):
 
     from dashboard import app as dapp
 
+    monkeypatch.setattr(dapp, "_MARKET_LOG_AT", {}, raising=False)
     for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy",
               "all_proxy"):
         monkeypatch.delenv(k, raising=False)
@@ -3206,6 +3207,16 @@ def test_the_markets_lines_say_which_route_they_took(monkeypatch, capsys):
     assert ex.proxies == {"http": "http://127.0.0.1:10809",
                           "https": "http://127.0.0.1:10809"}, ex.proxies
     assert dapp._route_note(ex) == "via http://127.0.0.1:10809"
+
+    # …and a SOCKS URL there is REFUSED OUT LOUD, not half-applied: a setting that
+    # is silently ignored is how "we set the proxy" and "we did not" become the
+    # same sentence in two different panels.
+    monkeypatch.setattr(dapp.settings, "dash_sync_proxy", "socks5://127.0.0.1:10808")
+    monkeypatch.setattr(dapp, "_pysocks_available", lambda: False)
+    ex_s = dapp._new_sync_exchange("gate")
+    assert getattr(ex_s, "proxies", None) in (None, {}), ex_s.proxies
+    refused = capsys.readouterr().out
+    assert "needs the `pysocks` package" in refused, refused
 
 
 
