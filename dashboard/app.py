@@ -1633,7 +1633,7 @@ def _market_gate(ccxt_id: str) -> dict:
         g = _MARKET_GATE.get(ccxt_id)
         if g is None:
             g = {"lock": threading.Lock(), "at": 0.0, "fails": 0,
-                 "err": "", "loading": False, "markets_from": ""}
+                 "err": "", "loading": False, "markets_from": "", "variant": ""}
             _MARKET_GATE[ccxt_id] = g
         return g
 
@@ -1664,12 +1664,20 @@ def _market_load_probe(ccxt_id: str, ex, timeout_ms) -> None:
     already failed, and only when the knob is on. The instance is left EMPTY: a
     probe that loaded `spot` alone would otherwise leave a catalog without perps,
     which every later `market()` lookup would report as a delisting.
+
+    A leg that hangs is asked ONCE more with `Accept-Encoding: identity`, because
+    that is the only difference between our request and the operator's `curl` of
+    the same URL (which answers 94 KB in 3.0s): if the bare response arrives, the
+    endpoint is not slow, the *compressed stream* is — and the caller can then
+    retry the load that way instead of waiting out the backoff. Returns "identity"
+    when every hanging leg answered bare, "" otherwise.
     """
     fm = (getattr(ex, "options", None) or {}).get("fetchMarkets") or {}
     types = fm.get("types")
     if not isinstance(types, list):
         types = ["spot", "swap", "future", "option"]
     parts = []
+    bare_ok, bare_failed = [], []
     # The timeout the probe runs under is the LOAD one, not the tightened fetch
     # one that the caller restores afterwards — the printed number has to be the
     # one that was in force while the legs were being timed.
@@ -1685,6 +1693,25 @@ def _market_load_probe(ccxt_id: str, ex, timeout_ms) -> None:
         except BaseException as e:
             parts.append(f"{one} FAILED after {time.time() - started:.1f}s: "
                          f"{type(e).__name__}: {str(e)[:120]}")
+            bare_failed.append(one)
+            undo_bare = _apply_header(ex, "Accept-Encoding", "identity")
+            t_bare = time.time()
+            try:
+                ex.markets = None
+                ex.load_markets()
+                n_bare = len(ex.markets or {})
+                parts.append(f"{one} ok UNCOMPRESSED, {n_bare} markets, "
+                             f"{time.time() - t_bare:.1f}s")
+                if n_bare:
+                    bare_ok.append(one)
+            except BaseException as e2:
+                parts.append(f"{one} also failed UNCOMPRESSED after "
+                             f"{time.time() - t_bare:.1f}s: {type(e2).__name__}")
+            finally:
+                try:
+                    undo_bare()
+                except Exception:
+                    pass
     try:
         ex.options["fetchMarkets"] = {**fm, "types": types} if fm else {"types": types}
         ex.set_markets([])        # drop the partial catalog the probe left behind
@@ -1697,6 +1724,18 @@ def _market_load_probe(ccxt_id: str, ex, timeout_ms) -> None:
             pass
     print(f"[markets] {ccxt_id}: probe, {len(types)} categories, "
           f"{_probe_to / 1000:.0f}s per request — " + "; ".join(parts), flush=True)
+    if bare_failed and len(bare_ok) == len(bare_failed):
+        print(f"[markets] {ccxt_id}: every list that hung arrived once asked "
+              f"uncompressed ({', '.join(bare_ok)}) — the response ENCODING is the "
+              "variable, not the endpoint. Set DASH_MARKET_LOAD_ACCEPT_ENCODING="
+              "identity (and turn the debug knob back off) to keep that answer.",
+              flush=True)
+        return "identity"
+    if bare_ok:
+        print(f"[markets] {ccxt_id}: uncompressed answered {', '.join(bare_ok)} but "
+              f"not {', '.join(o for o in bare_failed if o not in bare_ok)} — no "
+              f"single-header explanation", flush=True)
+    return ""
 
 
 def _seed_markets_from_disk(ccxt_id: str, ex, g: dict) -> bool:
@@ -1759,29 +1798,71 @@ def _seed_markets_from_disk(ccxt_id: str, ex, g: dict) -> bool:
     return True
 
 
+def _apply_header(ex, key: str, value):
+    """Set one header on a ccxt instance, returning an undo that never raises."""
+    hdrs = getattr(ex, "headers", None)
+    if not isinstance(hdrs, dict):
+        return lambda: None
+    old = hdrs.get(key)
+
+    def undo():
+        if old is None:
+            hdrs.pop(key, None)
+        else:
+            hdrs[key] = old
+    hdrs[key] = value
+    return undo
+
+
+def _apply_loaded_catalog(ccxt_id: str, ex, g: dict, who: str, started: float,
+                          note: str = "") -> None:
+    """One place where a loaded catalog becomes the state the feeds use.
+
+    Only a REAL load writes the disk snapshot (see `_seed_markets_from_disk`): a
+    disk-seeded catalog re-saving itself would let a permanently broken endpoint
+    keep its own cache warm and turn a stale listing into the permanent truth.
+    """
+    n_loaded = len(ex.markets or {})
+    g.update(at=time.time(), fails=0, err="", loading=False, markets_from="exchange")
+    if n_loaded:
+        save_markets_snapshot(
+            markets_path(settings.dash_snapshot_dir, ccxt_id), ex.markets)
+    print(f"[markets] {ccxt_id}: {n_loaded} markets loaded "
+          f"in {time.time() - started:.1f}s (by {who})"
+          + (f" — {note}" if note else ""), flush=True)
+
+
 def _load_markets_locked(ccxt_id: str, ex, who: str) -> str:
     """Performs the load while holding the gate lock. Returns '' or a reason."""
     g = _market_gate(ccxt_id)
     g["loading"] = True
     started = time.time()
     old_timeout = getattr(ex, "timeout", None)
+    # The request SHAPE of the load is configurable because their measurement
+    # pinned it: `DASH_MARKET_LOAD_DEBUG=true` timed 90s per request and got
+    # `spot FAILED after 91.8s`, `swap FAILED after 92.3s`, `future ok, 30
+    # markets, 2.8s` — the big lists hang, the small one does not, on the same
+    # host, the same instance, seconds apart. curl of the same URL answers in 3s,
+    # and curl sends no `Accept-Encoding`. Setting `DASH_MARKET_LOAD_ACCEPT_
+    # ENCODING=identity` therefore asks for those lists the way curl does: it
+    # changes one header and adds zero requests.
+    _enc = (settings.dash_market_load_accept_encoding or "").strip()
+    if not _enc and g.get("variant") == "identity":
+        # The probe's conclusion, kept for the rest of the process: the request
+        # that hung once is not repeated just to prove it still hangs. An
+        # explicit setting wins over it — no need to measure what is chosen.
+        _enc = "identity"
+    undo_enc = _apply_header(ex, "Accept-Encoding", _enc) if _enc else (lambda: None)
     try:
         # A market load needs longer than a candle fetch; restoring it after
         # keeps the tight timeout where it belongs (on the fetches).
         ex.timeout = max(int(old_timeout or 0), int(_market_load_sec() * 1000))
         ex.load_markets()
-        g.update(at=time.time(), fails=0, err="", loading=False,
-                 markets_from="exchange")
-        n_loaded = len(ex.markets or {})
-        # Only a REAL load writes the file (see `_seed_markets_from_disk`): a
-        # disk-seeded catalog re-saving itself would let a permanently broken
-        # endpoint keep its own cache warm and turn a stale listing into the
-        # permanent truth.
-        if n_loaded:
-            save_markets_snapshot(
-                markets_path(settings.dash_snapshot_dir, ccxt_id), ex.markets)
-        print(f"[markets] {ccxt_id}: {n_loaded} markets loaded "
-              f"in {time.time() - started:.1f}s (by {who})", flush=True)
+        if not (getattr(ex, "markets", None) or {}):
+            # An empty dict here would look like "loaded" to every caller and
+            # then come back as BadSymbol for every pair on this exchange.
+            raise RuntimeError("the exchange answered with an EMPTY market list")
+        _apply_loaded_catalog(ccxt_id, ex, g, who, started)
         return ""
     except BaseException as e:            # ccxt lets a CancelledError escape here
         g.update(at=time.time(), fails=int(g["fails"]) + 1, loading=False,
@@ -1806,10 +1887,42 @@ def _load_markets_locked(ccxt_id: str, ex, who: str) -> str:
                                  f"timeout)")
             except Exception:
                 pass
-        if settings.dash_market_load_debug:
-            _market_load_probe(ccxt_id, ex, old_timeout)
+        _fix = ""
+        if settings.dash_market_load_debug and int(g["fails"]) == 1:
+            # The measurement AND its consequence, both behind the knob, both
+            # bounded: one request per category plus one bare retry per hanging
+            # category, once per process. It ends with the feeds having a catalog
+            # in this cycle instead of after a 20-900s pause — a failure costs
+            # fewer total requests than the backoff it replaces, which is the only
+            # kind of retry this dashboard is allowed.
+            _fix = _market_load_probe(ccxt_id, ex, old_timeout)
+        if _fix == "identity" and not (settings.dash_market_load_accept_encoding
+                                       or "").strip():
+            g["variant"] = "identity"
+            undo_v = _apply_header(ex, "Accept-Encoding", "identity")
+            try:
+                ex.timeout = max(int(old_timeout or 0), int(_market_load_sec() * 1000))
+                ex.load_markets()
+            except BaseException:
+                g["variant"] = ""
+            finally:
+                try:
+                    undo_v()
+                except Exception:
+                    pass
+            if getattr(ex, "markets", None):
+                _apply_loaded_catalog(ccxt_id, ex, g, "bare-retry", started,
+                                      "Accept-Encoding: identity answered the "
+                                      "lists that hung; set "
+                                      "DASH_MARKET_LOAD_ACCEPT_ENCODING=identity "
+                                      "to keep it without the debug knob")
+                return ""
         return g["err"]
     finally:
+        try:
+            undo_enc()
+        except Exception:
+            pass
         if old_timeout is not None:
             try:
                 ex.timeout = old_timeout

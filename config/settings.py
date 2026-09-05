@@ -413,6 +413,12 @@ class Settings(BaseSettings):
     # opposite answers (more timeout vs. fewer requests / another route). Costs
     # one load per category, only after a failure, so it stays off in production.
     dash_market_load_debug: bool = Field(default=False, alias="DASH_MARKET_LOAD_DEBUG")
+    # "" = leave ccxt's own headers alone. `identity` asks for the market lists
+    # uncompressed, which is what `curl` does — see the size-shaped failure the
+    # timing probe measures (`spot FAILED after 91.8s … future ok, 2.8s`). Costs no
+    # extra requests; costs more bytes on a healthy connection.
+    dash_market_load_accept_encoding: str = Field(
+        default="", alias="DASH_MARKET_LOAD_ACCEPT_ENCODING")
     # Coordination database holding the tiny handshake table (empty = 15m HIGH).
     priority_lane_db: str = Field(default="", alias="PRIORITY_LANE_DB")
     # How far back the lane may bridge a hole in the pair you are LOOKING at.

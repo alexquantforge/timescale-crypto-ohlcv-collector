@@ -472,9 +472,12 @@ def test_a_failing_market_load_backs_off_instead_of_beating_the_exchange(monkeyp
 
     first = app.ensure_markets("gate", ex, wait_sec=5.0)
     assert "RequestTimeout" in first
+    assert _Ex.loads == 1, "a failure costs one request unless the knob is on"
+    for _ in range(8):                           # a minute of live chips
+        app.ensure_markets("gate", ex, wait_sec=5.0)
     second = app.ensure_markets("gate", ex, wait_sec=5.0)
     assert "next try in" in second
-    assert _Ex.loads == 1                      # the backoff ate the second attempt
+    assert _Ex.loads == 1                        # the backoff ate every later try
     assert app._MARKET_GATE["gate"]["fails"] == 1
 
 
@@ -3077,13 +3080,135 @@ def test_the_market_probe_names_the_slow_category_and_leaves_no_partial_catalog(
     assert "spot ok, 1 markets" in out, out
     assert "swap FAILED after" in out and "RequestTimeout" in out, out
     assert "[markets] gate: probe, 4 categories, 60s per request" in out, out
-    # one request per category, and only ever for the categories ccxt declares
-    assert [c for c in calls] == [["spot"], ["swap"], ["future"], ["option"]], calls
+    # one request per category, and only ever for the categories ccxt declares —
+    # plus ONE bare retry for the leg that hung (the encoding is the variable the
+    # operator's curl differs in, so the probe tests it instead of theorising)
+    assert [c for c in calls] == [["spot"], ["swap"], ["swap"], ["future"],
+                                  ["option"]], calls
     # the instance ends EMPTY and its own config is restored, siblings included
     assert not ex.markets, ex.markets
     assert ex.options["fetchMarkets"] == {"types": ["spot", "swap", "future", "option"],
                                           "keepme": 1}
     assert ex.timeout == 8_000
+
+
+def _isolate_market_gate(monkeypatch, dapp):
+    monkeypatch.setattr(dapp, "_MARKET_GATE", {}, raising=False)
+    monkeypatch.setattr(dapp, "_MARKET_LOG_AT", {}, raising=False)
+    # no disk catalog: these tests are about the network path
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_enabled", False)
+
+
+class _ShapeExchange:
+    """A ccxt-shaped fake whose endpoint only answers uncompressed responses.
+
+    `session` starts as None on purpose: ccxt creates the requests session
+    lazily, and the `noproxy` variant has to cope with both states.
+    """
+
+    def __init__(self, fail_identity=False):
+        self.timeout = 8_000
+        self.headers = {"Accept-Encoding": "gzip, deflate", "User-Agent": "ccxt/4.5.77"}
+        self.options = {"fetchMarkets": {"types": ["spot", "swap"]}}
+        self.markets = None
+        self.session = None
+        self.calls = []
+        self._fail_identity = fail_identity
+
+    def load_markets(self):
+        enc = self.headers.get("Accept-Encoding")
+        self.calls.append({"types": list(self.options["fetchMarkets"]["types"]),
+                           "enc": enc, "ua": self.headers.get("User-Agent"),
+                           "trust_env": getattr(self.session, "trust_env", None)})
+        if self._fail_identity or enc != "identity":
+            raise RuntimeError("RequestTimeout: gate GET https://api.gateio.ws/"
+                               "api/v4/spot/currency_pairs")
+        self.markets = {"BTC/USDT": {"id": "BTC_USDT", "symbol": "BTC/USDT"}}
+
+    def set_markets(self, m):
+        vals = list(m.values()) if isinstance(m, dict) else list(m)
+        self.markets = {v["symbol"]: v for v in vals} if vals else {}
+
+    def close(self):
+        pass
+
+
+def test_a_failed_market_load_probes_the_encoding_and_keeps_the_answer(monkeypatch,
+                                                                        capsys):
+    """`spot FAILED after 91.8s`, `swap FAILED after 92.3s`, `future ok, 30
+    markets, 2.8s` — under `DASH_MARKET_LOAD_TIMEOUT_SEC=90` on one host, one
+    instance, seconds apart: the shape of the response, not its latency. The only
+    thing the operator's 3s `curl` does differently is not ask for gzip, so a
+    hanging leg is re-asked bare — ONE request, once per process, on a path that
+    already burned the whole timeout — and if that answers, the load is retried
+    that way instead of waiting out 20-900s with no charts."""
+    from dashboard import app as dapp
+
+    _isolate_market_gate(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_market_load_debug", True)
+    ex = _ShapeExchange()
+
+    assert dapp._load_markets_locked("gate", ex, "stitch") == ""
+    out = capsys.readouterr().out
+    assert "spot FAILED after" in out and "spot ok UNCOMPRESSED" in out, out
+    assert "every list that hung arrived once asked uncompressed (spot, swap)" in out
+    assert "(by bare-retry)" in out, out
+    # the real load, then one request per category, then a bare retry per HANGING
+    # category, then the load again — 1 + 2 + 2 + 1, and never a burst per pair
+    assert [c["enc"] for c in ex.calls] == [
+        "gzip, deflate", "gzip, deflate", "identity", "gzip, deflate", "identity",
+        "identity"], ex.calls
+    assert [c["types"] for c in ex.calls[1:5]] == [["spot"], ["spot"], ["swap"],
+                                                   ["swap"]], ex.calls
+    assert ex.calls[5]["types"] == ["spot", "swap"], "the retry is a full load"
+    # the conclusion is kept (so the next reload does not re-ask a hanging shape)…
+    assert dapp._market_gate("gate")["variant"] == "identity"
+    assert dapp._market_gate("gate")["fails"] == 0
+    assert dapp._market_gate("gate")["markets_from"] == "exchange"
+    # …but only for the load: the 1s feeds keep gzip, which is what makes them cheap
+    assert ex.headers["Accept-Encoding"] == "gzip, deflate", ex.headers
+    # and a probe that ends with a partial catalog must not leave it behind
+    assert set(ex.markets) == {"BTC/USDT"}
+
+
+def test_the_bare_probe_finding_nothing_costs_no_retry_and_says_so(monkeypatch, capsys):
+    """A measurement that indicts nothing must still clear the encoding theory —
+    that is what the next message can be built on."""
+    from dashboard import app as dapp
+
+    _isolate_market_gate(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_market_load_debug", True)
+    ex = _ShapeExchange(fail_identity=True)
+
+    assert "RequestTimeout" in dapp._load_markets_locked("gate", ex, "stitch")
+    out = capsys.readouterr().out
+    assert "also failed UNCOMPRESSED" in out, out
+    assert "the response ENCODING is the variable" not in out
+    assert len(ex.calls) == 1 + 2 + 2, ex.calls     # load, 2 legs, 2 bare retries
+    assert dapp._market_gate("gate")["variant"] == ""
+    assert dapp._market_gate("gate")["fails"] == 1
+
+    # the SECOND failure does not probe again: one burst per process, however
+    # long the operator leaves the knob on
+    assert "RequestTimeout" in dapp._load_markets_locked("gate", ex, "stitch")
+    assert len(ex.calls) == 1 + 2 + 2 + 1, ex.calls
+    assert dapp._market_gate("gate")["fails"] == 2
+
+
+def test_the_load_encoding_setting_costs_no_extra_request(monkeypatch, capsys):
+    """The remedy for a size-shaped hang must not be another request: it is one
+    header, and `DASH_MARKET_LOAD_DEBUG` stays the thing that measures."""
+    from dashboard import app as dapp
+
+    _isolate_market_gate(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_market_load_accept_encoding", "identity")
+    ex = _ShapeExchange()
+
+    assert dapp._load_markets_locked("gate", ex, "stitch") == ""
+    assert [c["enc"] for c in ex.calls] == ["identity"], ex.calls
+    assert ex.calls[0]["types"] == ["spot", "swap"], "the real load, not a probe"
+    assert dapp._market_gate("gate")["variant"] == "", "nothing was probed"
+    assert ex.headers["Accept-Encoding"] == "gzip, deflate", "the feeds keep gzip"
 
 
 def test_a_cold_process_applies_the_disk_catalog_without_a_request(monkeypatch, tmp_path,
