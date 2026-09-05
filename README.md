@@ -42,7 +42,7 @@ same cycle instead of after a 20–900 s backoff. What actually moves a narrow p
 (`DASH_MARKET_LOAD_TIMEOUT_SEC=180`, then back to 60), trim what is fetched at all
 (`CCXT_MARKET_TYPES_SKIP`, `CCXT_FETCH_CURRENCIES=false`) and let `markets_<exchange>.pkl` carry every
 later restart — with `DASH_MARKETS_REFRESH_SEC=21600` so a reload is not re-burning the link hourly.
-The same reasoning now covers the *exchange* side of a restart: a `load_markets()` is the
+A restart gets the same treatment from the other side: a `load_markets()` is the
 slowest thing the dashboard does before it can draw a price (gate: a ~94 KB spot list and a
 ~1.3 MB swap list, in sequence, each under `DASH_MARKET_LOAD_TIMEOUT_SEC`), and one endpoint
 that stalls blanks that exchange's charts, tape and gap stitches for the life of the process.
