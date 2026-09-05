@@ -189,8 +189,21 @@ they were measured on different paths — so any network number the dashboard pr
 must name its route (`_route_note`, `create_exchange`'s `route=` log), and any proxy
 setting that cannot be honoured is reported as ignored, never obeyed silently.
 
+A timeout that is shorter than payload_bytes ÷ measured_throughput is not a timeout
+setting, it is a permanent failure with a log line — and the number has to be applied
+to every ceiling in front of the request, not just the outer one: gate's ~1.4 MB of
+market lists at 7.6 KB/s needs minutes, so the engines' 20-40 s per-request timeout
+inside a 30 s `hard_wait_for` made `load_markets for gateio` fail forever on both
+timeframes. Widen the per-request timeout for the load and restore it in a `finally`
+(a 4-minute candle timeout turns one slow exchange into a stalled cycle), read the
+budget from settings at the decision site rather than freezing it in a module
+constant, and change it in BOTH engines — they hold separate instances, so a
+one-sided fix leaves one engine market-less.
+
 A timeout longer than the operator's own measurement of the same endpoint is not
-a timeout problem — but check which measurement they actually made. The
+a timeout problem — but check which measurement they actually made, and whether it
+was made on the same route (see above: `--noproxy` and `-x socks5h://` are different
+answers about the same URL). The
 falsified version of this round's theory, recorded so it is not re-derived:
 "the gzip stream is broken, because curl (no `Accept-Encoding`) was fast" — the
 operator then timed BOTH shapes of the same URL and identity was *slower in wall

@@ -432,6 +432,33 @@ class Settings(BaseSettings):
     # for `requests`, which this project does not depend on (it is checked and
     # reported, not silently ignored).
     dash_sync_proxy: str = Field(default="", alias="DASH_SYNC_PROXY")
+
+    # The same question on the ENGINE side, where it was silently fatal. Market
+    # lists travel at the speed of the slowest byte, and the measured figure on
+    # this box is 92,784 B in 12.2 s through the SOCKS5 tunnel = 7.6 KB/s, while
+    # the identical request DIRECT delivered 17,226 B in 45 s and never finished
+    # (both via curl against /api/v4/spot/currency_pairs, one with -x and one
+    # with --noproxy). gate's whole `fetchMarkets` — spot + perp + delivery — is
+    # ~1.4 MB compressed, so it needs MINUTES, whereas the clients were built with
+    # a 20 s (`updater_15m._make_exchange`) or 40 s (`exchanges.client`)
+    # per-request timeout and a 30 s total wait: `Failed to load markets for
+    # gateio after 3 attempts` was permanent in both engines while the same URL
+    # answered in a browser. This knob covers the LOAD ONLY — the engines widen the
+    # client's own timeout to it for the duration and put it straight back, so a
+    # dead exchange still cannot hold a candle fetch for minutes. Healthy
+    # exchanges answer in 1-3 s and never notice.
+    exchange_markets_load_sec: float = Field(default=240.0,
+                                             alias="EXCHANGE_MARKETS_LOAD_SEC")
+    # …and how often an engine re-downloads lists it already holds. 1800 keeps
+    # today's behaviour; at the speed above, ONE gate reload is ~3 minutes of the
+    # link, so every-30-minutes is roughly a 10% duty cycle spent on market lists
+    # before a single candle is fetched. Raising it to 21600 (what
+    # DASH_MARKETS_REFRESH_SEC now defaults to) is the throughput answer; the price
+    # is that a newly listed pair is picked up up to one TTL later. A negative value is ignored; 0 means
+    # "re-download the lists every cycle", which is the honest way to watch a new
+    # listing appear without waiting for a TTL.
+    exchange_markets_ttl_sec: float = Field(default=1800.0,
+                                           alias="EXCHANGE_MARKETS_TTL_SEC")
     # "" = leave ccxt's own headers alone. `identity` asks for the market lists
     # uncompressed, which is what `curl` does — see the size-shaped failure the
     # timing probe measures (`spot FAILED after 91.8s … future ok, 2.8s`). Costs no

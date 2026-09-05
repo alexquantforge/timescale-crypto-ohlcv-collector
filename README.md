@@ -54,6 +54,16 @@ its own route, `DASH_LIVE_SNAPSHOT_VIA_PROXY=false` moves the card off the tunne
 `DASH_SYNC_PROXY=http://127.0.0.1:10809` moves the sync clients onto it — with the HTTP port, or an explicit
 warning that a SOCKS URL is being ignored.
 
+**The engines had the same bug with a different symptom.** `load_markets` was given a 30 s total wait around a
+client whose own per-request timeout is 20 s (15m engine) or 40 s (1d), while gate's market lists — spot *and*
+linear perps, ~1.4 MB compressed — need minutes on a 7.6 KB/s link. So gate never loaded in either engine,
+which is not "the exchange is flaky" but arithmetic: at the measured speed no timeout under a few hundred
+seconds could have worked, and no retry count would change that. `EXCHANGE_MARKETS_LOAD_SEC` (default 240) now
+sizes the load, the client timeout is widened to it for the load and restored right after, and
+`EXCHANGE_MARKETS_TTL_SEC` (default 1800, the previous constant) says how often a reload is worth those minutes
+at all — raise it to 21600 to match `DASH_MARKETS_REFRESH_SEC` if the only thing you miss is a listing that
+appeared hours ago.
+
 A restart gets the same treatment from the other side: a `load_markets()` is the
 slowest thing the dashboard does before it can draw a price (gate: a ~94 KB spot list and a
 ~1.3 MB swap list, in sequence, each under `DASH_MARKET_LOAD_TIMEOUT_SEC`), and one endpoint

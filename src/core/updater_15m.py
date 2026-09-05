@@ -1621,7 +1621,17 @@ def _make_exchange(ccxt_id: str):
 # process RSS up until the machine hit swap. Now: one long-lived instance
 # per exchange; markets reloaded at most every MARKETS_TTL_SECONDS; instance
 # recreated at most every EXCHANGE_MAX_AGE_SECONDS.
-MARKETS_TTL_SECONDS = 1800.0           # reload market lists at most every 30 min
+MARKETS_TTL_SECONDS = 1800.0           # documented default; see _markets_ttl_sec()
+
+
+def _markets_ttl_sec() -> float:
+    """Mirror of `src/core/updater.py` — both engines hold their own exchange
+    instances, so the refresh policy of the 1d engine and this one has to come
+    from the same knob (see there for why it is read per decision)."""
+    ttl = getattr(settings, "exchange_markets_ttl_sec", None)
+    if ttl is None or float(ttl) < 0:
+        return MARKETS_TTL_SECONDS
+    return float(ttl)        # 0 is a legitimate answer: "reload every cycle"
 EXCHANGE_MAX_AGE_SECONDS = 6 * 3600.0  # recreate each ccxt instance every 6 h
 _EXCHANGES: Dict[str, dict] = {}       # ccxt_name -> {ex, born_at, markets_at}
 
@@ -1640,7 +1650,7 @@ async def get_persistent_exchange(ccxt_name: str):
                  "born_at": now, "markets_at": 0.0}
         _EXCHANGES[ccxt_name] = entry
     ex = entry["ex"]
-    if now - entry["markets_at"] > MARKETS_TTL_SECONDS or not getattr(ex, "markets", None):
+    if now - entry["markets_at"] > _markets_ttl_sec() or not getattr(ex, "markets", None):
         ok = await load_markets_retries(ex, ccxt_name, reload=True)
         if ok:
             entry["markets_at"] = time.time()
@@ -1670,12 +1680,55 @@ def release_memory() -> None:
         pass
 
 
-async def load_markets_retries(exchange, ccxt_name, attempts: int = 3, timeout: float = 30.0, reload: bool = False) -> bool:
-    """Load markets with retries — gateio/htx occasionally time out on flaky networks."""
+def _markets_load_budget() -> float:
+    """Total seconds a `load_markets` may take (EXCHANGE_MARKETS_LOAD_SEC).
+    Mirror of `src/core/updater.py` — BOTH engines collect from gateio, so a
+    fix to the shared behaviour has to land in both files; a one-sided change
+    leaves one engine permanently market-less, which is what `test_both_engines_
+    *` guard against."""
+    return float(getattr(settings, "exchange_markets_load_sec", 240.0) or 240.0)
+
+
+async def _load_markets_widened(exchange, wait_sec: float, awaitable_factory) -> None:
+    """One `load_markets` with both ceilings lifted for its duration only.
+
+    At the tunnel's measured 7.6 KB/s, gate's ~1.4 MB of market lists needs
+    minutes, and `_make_exchange` gives the client a 20 s per-request timeout on
+    top of the outer wait — either one alone kills the load. The client timeout is
+    raised to `wait_sec` and restored in the `finally`, because a 20 s candle
+    fetch timeout is what keeps a dead exchange from stalling a cycle.
+    """
+    saved = getattr(exchange, "timeout", None)
+    widened = False
+    if saved is not None:
+        try:
+            want = int(wait_sec * 1000)
+            if int(saved) < want:
+                exchange.timeout = want
+                widened = True
+        except (TypeError, ValueError):
+            saved = None            # not an int-ish attribute: outer wait only
+    try:
+        await awaitable_factory()
+    finally:
+        if widened:
+            exchange.timeout = saved
+
+
+async def load_markets_retries(exchange, ccxt_name, attempts: int = 3,
+                               timeout: Optional[float] = None,
+                               reload: bool = False) -> bool:
+    """Load markets with retries — gateio/htx occasionally time out on flaky
+    networks, and at the speed of this tunnel a 30 s budget never covered gate's
+    market lists at all. `timeout=None` = EXCHANGE_MARKETS_LOAD_SEC."""
+    if timeout is None:
+        timeout = _markets_load_budget()
     last_err = None
     for attempt in range(1, attempts + 1):
         try:
-            await asyncio.wait_for(exchange.load_markets(reload), timeout=timeout)
+            await _load_markets_widened(
+                exchange, timeout,
+                lambda: asyncio.wait_for(exchange.load_markets(reload), timeout=timeout))
             return True
         except Exception as e:
             last_err = e

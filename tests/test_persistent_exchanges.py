@@ -8,6 +8,8 @@ reloaded at most every MARKETS_TTL_SECONDS, instances rotated by age.
 import asyncio
 import time
 
+import pytest
+
 from src.core import updater_15m, updater
 
 
@@ -179,3 +181,118 @@ def test_an_empty_socks5_proxy_means_direct_everywhere(monkeypatch):
 
     monkeypatch.setattr(settings, "socks5_proxy", "", raising=False)
     assert getattr(create_exchange("gate"), "socks_proxy", None) in (None, "")
+
+
+# --- the market-load budget: sized by a measurement, not by a guess ---------
+
+class _SlowCatalogue:
+    """A ccxt-shaped client whose `load_markets` needs `delay` seconds and which
+    records the per-request timeout in force at the moment it was asked.
+
+    The recording is the whole point: "the load got a bigger timeout" and "the
+    bigger timeout was left on the client for the rest of the cycle" are
+    indistinguishable from the return value, and the second one is the bug the
+    first one would introduce.
+    """
+
+    def __init__(self, delay: float = 0.05, timeout: int = 20_000):
+        self.timeout = timeout
+        self._delay = delay
+        self.asked = 0
+        self.timeouts_seen = []
+
+    async def load_markets(self, reload: bool = False):
+        self.asked += 1
+        self.timeouts_seen.append(self.timeout)
+        if self._delay:
+            await asyncio.sleep(self._delay)
+        return {"BTC/USDT": {"id": "BTC_USDT", "spot": True}}
+
+
+_ENGINES = [
+    pytest.param(updater, "load_markets_with_retry", id="1d-engine"),
+    pytest.param(updater_15m, "load_markets_retries", id="15m-engine"),
+]
+
+
+@pytest.mark.parametrize("mod,loader_name", _ENGINES)
+def test_a_market_list_that_needs_minutes_is_not_judged_by_a_30s_stopwatch(
+        mod, loader_name, monkeypatch):
+    """Measured on this box on 2026-09-05: 92,784 B in 12.2 s through the SOCKS5
+    tunnel (curl, `Accept-Encoding: gzip`), and the identical DIRECT request
+    delivered 17,226 B in 45 s and never finished. gate's whole `fetchMarkets` is
+    ~1.4 MB, so the load needs minutes; the engines had a 20 s (`_make_exchange`)
+    or 40 s (`exchanges.client`) per-request timeout inside a 30 s total wait, so
+    gate could never load there — permanently, on any network.
+
+    Both ceilings have to lift together: widening only the outer wait leaves the
+    load dying inside ccxt, and that failure is indistinguishable in the log from
+    "the exchange is down".
+    """
+    loader = getattr(mod, loader_name)
+    monkeypatch.setattr(mod.settings, "exchange_markets_load_sec", 240.0)
+    ex = _SlowCatalogue(delay=0.05, timeout=20_000)
+
+    assert asyncio.run(loader(ex, "gateio", attempts=1)) is True
+    assert ex.timeouts_seen == [240_000], "asked with the widened per-request timeout"
+    assert ex.timeout == 20_000, "…and the client is handed back as it was found"
+    assert ex.asked == 1, "a load that succeeded must not be repeated"
+
+
+@pytest.mark.parametrize("mod,loader_name", _ENGINES)
+def test_a_request_timeout_already_bigger_than_the_budget_is_never_lowered(
+        mod, loader_name, monkeypatch):
+    """`exchange_markets_load_sec` is a floor for the load, not a leash on the
+    operator: someone who set 300 s in ccxt itself wants 300 s."""
+    loader = getattr(mod, loader_name)
+    monkeypatch.setattr(mod.settings, "exchange_markets_load_sec", 5.0)
+    ex = _SlowCatalogue(delay=0.0, timeout=300_000)
+    assert asyncio.run(loader(ex, "mexc", attempts=1)) is True
+    assert ex.timeouts_seen == [300_000]
+
+
+@pytest.mark.parametrize("mod,loader_name", _ENGINES)
+def test_a_load_killed_by_its_budget_does_not_leave_that_budget_on_the_client(
+        mod, loader_name, monkeypatch):
+    """The failure path is where a `finally` earns its keep: an engine whose
+    market load was abandoned at 50 ms must go on fetching candles with its own
+    20 s, or one slow exchange turns every candle request of the cycle into a
+    50 ms one and the outage spreads instead of stopping."""
+    loader = getattr(mod, loader_name)
+    monkeypatch.setattr(mod.settings, "exchange_markets_load_sec", 0.05)
+    # A client configured below the budget, so the load IS widened — and dies
+    # anyway. That is the case a `finally` is written for.
+    ex = _SlowCatalogue(delay=1.0, timeout=1)
+
+    assert asyncio.run(loader(ex, "gateio", attempts=1)) is False
+    assert ex.timeouts_seen == [50], "widened to the budget before being given up on"
+    assert ex.timeout == 1, "a cancelled load must restore the client"
+    assert mod._markets_load_budget() == 0.05, "the budget came from settings, per call"
+
+
+def test_the_default_budget_is_the_measured_size_of_the_slowest_list():
+    """A default is a claim about the world: 240 s is gate's ~1.4 MB of market
+    lists at the measured 7.6 KB/s with room, and it must not be quietly rolled
+    back to a number that no exchange could satisfy on this link. The engine
+    refresh policy stays what it was (30 min) until the operator changes it."""
+    from config.settings import settings
+    assert settings.exchange_markets_load_sec >= 240.0
+    assert settings.exchange_markets_ttl_sec == 1800.0
+    for mod in (updater, updater_15m):
+        assert mod.MARKETS_TTL_SECONDS == 1800.0
+        assert mod._markets_load_budget() == settings.exchange_markets_load_sec
+
+
+def test_the_market_list_refresh_interval_is_a_setting_both_engines_read(monkeypatch):
+    """Same knob, both engines — a half-raised TTL leaves one engine re-burning
+    the link every 30 minutes, which is the throughput bug this exists to fix.
+    0 is honoured ("re-download every cycle", the honest way to watch a new
+    listing appear), and a negative value falls back to the default instead of
+    becoming "reload forever"."""
+    for mod in (updater, updater_15m):
+        monkeypatch.setattr(mod.settings, "exchange_markets_ttl_sec", 21600.0)
+        assert mod._markets_ttl_sec() == 21600.0
+        monkeypatch.setattr(mod.settings, "exchange_markets_ttl_sec", 0.0)
+        assert mod._markets_ttl_sec() == 0.0
+        monkeypatch.setattr(mod.settings, "exchange_markets_ttl_sec", -1.0)
+        assert mod._markets_ttl_sec() == 1800.0

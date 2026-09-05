@@ -143,18 +143,66 @@ def format_await_chain(task: asyncio.Task, max_depth: int = 12) -> str:
     return " <- ".join(parts) if parts else "<no suspension point>"
 
 
+def _markets_load_budget() -> float:
+    """Total seconds a `load_markets` may take, from EXCHANGE_MARKETS_LOAD_SEC.
+    Read per call, never cached in a constant, so a restart with a different
+    value in `.env` is what the operator sees in the log line."""
+    return float(getattr(settings, "exchange_markets_load_sec", 240.0) or 240.0)
+
+
+async def _load_markets_widened(exchange, name: str, wait_sec: float,
+                                reload: bool, awaitable_factory) -> None:
+    """Run one `load_markets` with BOTH ceilings that can kill it lifted, and
+    only for its duration.
+
+    A market list is not one API call to be patient about: `fetchMarkets` pulls
+    every market type as one large body, and at the tunnel's measured 7.6 KB/s
+    gate's ~1.4 MB needs minutes. Two independent timeouts stand in front of
+    that — the outer wait and the client's per-request `timeout` — and the
+    20-40 s defaults were the real reason gate "never loads" in the engines.
+    The client timeout is therefore widened to `wait_sec`, and put back in the
+    `finally`: leaving 4-minute request timeouts on a live client would turn one
+    hung exchange into a hung cycle, which is the opposite of the fix.
+    """
+    saved = getattr(exchange, "timeout", None)
+    widened = False
+    if saved is not None:
+        try:
+            want = int(wait_sec * 1000)
+            if int(saved) < want:
+                exchange.timeout = want
+                widened = True
+        except (TypeError, ValueError):
+            saved = None            # not an int-ish attribute: outer wait only
+    try:
+        await awaitable_factory()
+    finally:
+        if widened:
+            exchange.timeout = saved
+
+
 async def load_markets_with_retry(
-    exchange, name: str, attempts: int = 3, timeout: float = 30.0, reload: bool = False
+    exchange, name: str, attempts: int = 3, timeout: Optional[float] = None,
+    reload: bool = False
 ) -> bool:
     """
     Loads exchange markets with retries — gateio/htx/kucoin occasionally
     time out on flaky networks (empty exception messages are asyncio
     timeouts), which used to skip the whole exchange for the cycle.
+
+    `timeout=None` means "however long the exchange needs for its market
+    lists" (EXCHANGE_MARKETS_LOAD_SEC); an explicit number is a test or a
+    caller that knows better, and is honoured as given.
     """
+    if timeout is None:
+        timeout = _markets_load_budget()
     last_err: Optional[BaseException] = None
     for attempt in range(1, attempts + 1):
         try:
-            await hard_wait_for(exchange.load_markets(reload), timeout, label=f"{name}.load_markets")
+            await _load_markets_widened(
+                exchange, name, timeout, reload,
+                lambda: hard_wait_for(exchange.load_markets(reload), timeout,
+                                      label=f"{name}.load_markets"))
             return True
         except Exception as e:
             last_err = e
@@ -174,7 +222,22 @@ async def load_markets_with_retry(
 # up until the host swapped. Keep one long-lived instance per exchange;
 # reload markets at most every MARKETS_TTL_SECONDS; recreate instances at
 # most every EXCHANGE_MAX_AGE_SECONDS.
-MARKETS_TTL_SECONDS = 1800.0
+MARKETS_TTL_SECONDS = 1800.0          # documented default; see _markets_ttl_sec()
+
+
+def _markets_ttl_sec() -> float:
+    """How stale a held market list may get before this engine re-downloads it.
+
+    Read at the decision site, not frozen at import: one gate reload is minutes
+    of this tunnel at 7.6 KB/s, so an operator who raises EXCHANGE_MARKETS_TTL_SEC
+    (or sets it to 0 to force a reload every cycle while debugging a listing) has
+    to be able to do it in `.env` and restart — not hunt for a constant that was
+    already evaluated.
+    """
+    ttl = getattr(settings, "exchange_markets_ttl_sec", None)
+    if ttl is None or float(ttl) < 0:
+        return MARKETS_TTL_SECONDS
+    return float(ttl)        # 0 is a legitimate answer: "reload every cycle"
 EXCHANGE_MAX_AGE_SECONDS = 6 * 3600.0
 _EXCHANGES: Dict[str, dict] = {}  # ccxt_id -> {ex, born_at, markets_at}
 
@@ -192,7 +255,7 @@ async def get_persistent_exchange(ccxt_id: str, ccxt_name: str):
         entry = {"ex": create_exchange(ccxt_id), "born_at": now, "markets_at": 0.0}
         _EXCHANGES[ccxt_id] = entry
     ex = entry["ex"]
-    if now - entry["markets_at"] > MARKETS_TTL_SECONDS or not getattr(ex, "markets", None):
+    if now - entry["markets_at"] > _markets_ttl_sec() or not getattr(ex, "markets", None):
         ok = await load_markets_with_retry(ex, ccxt_name, reload=True)
         if ok:
             entry["markets_at"] = time.time()
