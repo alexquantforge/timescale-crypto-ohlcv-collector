@@ -766,7 +766,12 @@ def _run_scan(monkeypatch, pool, **kwargs):
 
     monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool)
     # the inventory (and any sweep cursor) is keyed by database name and lives in
-    # a process-wide store now; tests must not inherit it from each other
+    # a process-wide store now; tests must not inherit it from each other — and
+    # that includes the listing CACHED ON DISK (same db name, same directory),
+    # which is otherwise the last listing some other test's database had
+    import tempfile as _tf
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_dir",
+                        _tf.mkdtemp(prefix="dash-test-"), raising=False)
     monkeypatch.setattr(dapp, "_SCAN_INVENTORY", {}, raising=False)
     monkeypatch.setattr(dapp, "_SCAN_SWEEP_STATE", {}, raising=False)
     kwargs.setdefault("budget_sec", 10.0)
@@ -1463,6 +1468,12 @@ def _summary_stores(monkeypatch, dapp):
         monkeypatch.setattr(dapp, name, {}, raising=False)
     monkeypatch.setattr(dapp, "st", _types.SimpleNamespace(
         session_state={}, error=lambda *a, **k: None))
+    # …and a private cache directory per test: the summary snapshot and the
+    # table-listing snapshot are both read before the code under test decides to
+    # query anything, so a shared one would let another test's files answer here.
+    import tempfile as _tf
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_dir",
+                        _tf.mkdtemp(prefix="dash-test-"), raising=False)
     return dapp
 
 
@@ -3031,8 +3042,6 @@ def test_the_market_probe_names_the_slow_category_and_leaves_no_partial_catalog(
     the ambiguity into a measurement, and must not leave a half-loaded instance
     behind — a catalog without perps would come back as `BadSymbol` on every swap
     pair and read like a delisting."""
-    import types as pytypes
-
     from dashboard import app as dapp
 
     calls = []
@@ -3071,3 +3080,66 @@ def test_the_market_probe_names_the_slow_category_and_leaves_no_partial_catalog(
     assert ex.options["fetchMarkets"] == {"types": ["spot", "swap", "future", "option"],
                                           "keepme": 1}
     assert ex.timeout == 8_000
+
+
+def test_a_cold_process_does_not_read_the_catalog_before_the_first_chunk(monkeypatch, tmp_path, capsys):
+    """Their log, at the top of every restart, three rounds running:
+
+        [scan] …15m_low_vol…: 26.7s — … (+catalog 23.6s)
+        [scan] …15m_low_vol…: 25s budget exhausted — 480/8296 tables covered
+
+    The first paint is bounded by DASH_SCAN_BUDGET_SEC, but the pg_catalog read
+    that precedes it was not bounded by anything — so the listing of 8 296 tables
+    spent the whole budget, 0 chunks were answered, and the page said "the pair
+    list is incomplete" until the second pass. The listing barely changes, so the
+    one a previous process read is taken from disk (next to the summary snapshot)
+    in milliseconds, and the real read happens later, under the same TTL it
+    always had."""
+    import asyncio
+    import os
+    import time as _time
+
+    from dashboard import app as dapp
+    from dashboard.helpers import inventory_path, save_inventory_snapshot
+
+    _summary_stores(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_enabled", True)
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_dir", str(tmp_path))
+    monkeypatch.setattr(dapp.settings, "dash_scan_inventory_ttl_sec", 600.0)
+    schema = {f"p{i}_usdt_on_bybit": {"Timestamp": "timestamptz"} for i in range(3)}
+    path = inventory_path(str(tmp_path), "h", 1, "db_disk")
+    assert save_inventory_snapshot(path, schema)
+    stale_mtime = os.path.getmtime(path)
+
+    pool = _FakeScanPool(schema)
+
+    async def fake_create_pool(**kw):
+        return pool
+
+    monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool)
+    rows = asyncio.run(dapp._scan_database("db_disk", "LOW", "h", 1, "u", "p",
+                                          pool_size=1, chunk_size=120, budget_sec=10.0,
+                                          sweep={}))
+    out = capsys.readouterr().out
+    assert len(rows) == 3, rows
+    assert pool.catalog_queries == [], "the whole point: no 23s read in front of chunk 1"
+    assert "table listing taken from disk" in out and "3 tables" in out, out
+    assert os.path.getmtime(path) == stale_mtime, "a listing read from disk is not re-written"
+
+    # a listing too old for even that is re-read — and the fresh one is persisted
+    old = _time.time() - 3600.0
+    os.utime(path, (old, old))
+    dapp._SCAN_INVENTORY.clear()
+    pool2 = _FakeScanPool(schema)
+
+    async def fake_create_pool2(**kw):
+        return pool2
+
+    monkeypatch.setattr(dapp.asyncpg, "create_pool", fake_create_pool2)
+    rows2 = asyncio.run(dapp._scan_database("db_disk", "LOW", "h", 1, "u", "p",
+                                            pool_size=1, chunk_size=120, budget_sec=10.0,
+                                            sweep={}))
+    assert len(rows2) == 3
+    assert pool2.catalog_queries, "3600s old is 6x the inventory TTL: re-read it"
+    assert os.path.getmtime(path) > old, "the real read refreshes the disk listing"
+    capsys.readouterr()

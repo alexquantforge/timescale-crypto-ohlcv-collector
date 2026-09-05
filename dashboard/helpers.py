@@ -7,6 +7,8 @@ and a synthetic demo-data generator used when no TimescaleDB is reachable.
 """
 import json
 import os
+import pickle
+import re as _re
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 
@@ -431,6 +433,71 @@ def load_summary_snapshot(path: str, max_age_sec: float):
         if age > float(max_age_sec):
             return None, None
         return coerce_summary_types(pd.read_pickle(path)), age
+    except Exception:
+        return None, None
+
+
+# ---------------------------------------------------------------------------
+# Table/column inventory on disk — the same idea one level down
+# ---------------------------------------------------------------------------
+
+def _safe_component(text: str) -> str:
+    return _re.sub(r"[^A-Za-z0-9_.-]", "_", str(text or ""))[:64]
+
+
+def inventory_path(directory: str, db_host: str, db_port, db_name: str) -> str:
+    """File the last catalog listing of one database is cached in."""
+    base = directory or os.path.join(
+        os.path.expanduser("~"), ".cache", "timescale-ohlcv-dashboard"
+    )
+    return os.path.join(
+        base, f"inventory_{_safe_component(db_host)}_{db_port}_{_safe_component(db_name)}.pkl"
+    )
+
+
+def save_inventory_snapshot(path: str, tables: dict) -> bool:
+    """Persist `{table: {column: data_type}}` after a REAL pg_catalog read.
+
+    The listing is the most expensive thing a sweep does on a big database — the
+    operator's own restarts each began with `+catalog 23.6s` / `27.3s` in front of
+    the first chunk — and it changes on the order of listings and migrations, not
+    seconds. Written once per read (TTL `DASH_SCAN_INVENTORY_TTL_SEC`, and never
+    in the middle of a sweep), through a temp file, because a cache poisoned by an
+    interrupted write is worse than no cache.
+    """
+    if not tables:
+        return False
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as fh:
+            pickle.dump({"at": _time.time(), "tables": dict(tables)}, fh,
+                        protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def load_inventory_snapshot(path: str, max_age_sec: float):
+    """Returns (tables, age_sec) or (None, None).
+
+    `max_age_sec` is deliberately SHORTER than the summary snapshot's: a stale
+    pair list self-heals (a table the database no longer has is dropped by
+    `forget_missing_relations`, a new listing appears at the next real read), but
+    a table that was MOVED out of `public` by the zombie prune must not stay
+    selectable for a day.
+    """
+    try:
+        age = _time.time() - os.path.getmtime(path)
+        if age > float(max_age_sec):
+            return None, None
+        with open(path, "rb") as fh:
+            blob = pickle.load(fh)
+        tables = blob.get("tables") if isinstance(blob, dict) else None
+        if not isinstance(tables, dict) or not tables:
+            return None, None
+        return tables, age
     except Exception:
         return None, None
 

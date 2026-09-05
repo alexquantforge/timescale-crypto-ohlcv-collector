@@ -75,6 +75,9 @@ from dashboard.helpers import (
     scan_pause_sec,
     chunked,
     snapshot_path,
+    inventory_path,
+    save_inventory_snapshot,
+    load_inventory_snapshot,
     save_summary_snapshot,
     load_summary_snapshot,
 )
@@ -308,6 +311,27 @@ async def _table_inventory(pool, db_name: str, db_host: str = "", db_port: int =
     ttl = float(settings.dash_scan_inventory_ttl_sec)
     cache_key = (db_host, db_port, db_name)
     ent = _SCAN_INVENTORY.get(cache_key)
+    if ent is None and settings.dash_snapshot_enabled:
+        # Nothing in memory is the moment a cold process pays the MOST for the
+        # catalog: every one of their restarts began with `+catalog 23.6s` /
+        # `27.3s` BEFORE the first chunk, so the bounded first paint answered 0 of
+        # 70 chunks and the tier looked gone ("15минутка пропала") while the
+        # sweep spent minutes proving otherwise. The last listing this database
+        # had is on disk next to the summary snapshot, and reading it costs
+        # milliseconds. It is accepted as fresh for ONE inventory TTL — the same
+        # freshness a real read buys — so a newly listed pair appears at the next
+        # read (TTL plus, while a sweep is unfinished, the reuse below), a table
+        # that no longer exists is still dropped by `forget_missing_relations` on
+        # the chunk that names it, and the age is printed, never hidden.
+        _inv_path = inventory_path(
+            settings.dash_snapshot_dir, db_host, db_port, db_name)
+        disk, disk_age = load_inventory_snapshot(_inv_path, 3.0 * ttl)
+        if disk:
+            ent = {"at": time.time(), "tables": disk, "disk_age": disk_age}
+            _SCAN_INVENTORY[cache_key] = ent
+            print(f"[scan] {db_name}: table listing taken from disk ({disk_age:.0f}s "
+                  f"old, {len(disk)} tables) — no pg_catalog read before the first "
+                  f"chunk; fresh within {ttl:.0f}s", flush=True)
     if ent and time.time() - ent["at"] < ttl:
         return ent["tables"]
     if ent and mid_sweep:
@@ -369,6 +393,11 @@ async def _table_inventory(pool, db_name: str, db_host: str = "", db_port: int =
     for r in col_rows:
         tables.setdefault(r["table_name"], {})[r["column_name"]] = r["data_type"]
     _SCAN_INVENTORY[cache_key] = {"at": time.time(), "tables": tables}
+    if tables and settings.dash_snapshot_enabled:
+        # only a REAL read is persisted — never something that came from disk
+        save_inventory_snapshot(
+            inventory_path(settings.dash_snapshot_dir, db_host, db_port, db_name),
+            tables)
     return tables
 
 
@@ -652,6 +681,12 @@ async def _scan_database(
         # Total time this sweep may spend yielding to clicks. A cap, so
         # interactivity never turns into "the pair list never completes".
         yield_left = [min(3.0, 0.2 * max(1.0, float(budget_sec)))]
+        # Slowest plain UNION query seen so far in the CURRENT wave — the number
+        # the next wave is admitted against. Deliberately NOT the wave's wall
+        # time: a chunk that failed on a type problem spends its wave in the
+        # all-TEXT retry and the per-table recovery, and letting that set the
+        # estimate would stop a sweep whose normal chunk costs 4s because one
+        # broken chunk cost 30s (my own tests caught exactly that).
 
         async def _fetch_union(sql: str) -> list:
             # Bounded by the SCAN budget, not only by the pool's
@@ -677,7 +712,9 @@ async def _scan_database(
                     left = deadline - time.time()
                     if left < 0.5:
                         raise asyncio.TimeoutError("scan budget exhausted (acquire)")
+                    t_query = time.time()
                     rows = await asyncio.wait_for(conn.fetch(sql), timeout=left)
+                    _wave_q[0] = max(_wave_q[0], time.time() - t_query)
             return [dict(r) for r in rows]
 
         async def run_chunk(ci: int, chunk: dict):
@@ -780,18 +817,21 @@ async def _scan_database(
         # the sweep, only queries that were guaranteed to be wasted.
         wave_n = max(1, int(pool_size))
         wave_secs = 0.0
+        _wave_q = [0.0]
         ci = 0
         while ci < n_chunks:
             left = deadline - time.time()
             if ci and wave_secs > 0.0 and left < wave_secs + 1.0:
                 break
+            _wave_q[0] = 0.0
             t_wave = time.time()
             got = await asyncio.gather(
                 *[run_chunk(i, c) for i, c in enumerate(chunks[ci:ci + wave_n], start=ci)]
             )
             for r in got:
                 out.extend(r)
-            d = time.time() - t_wave
+            # the queries of THIS wave if there were any, else its wall time
+            d = _wave_q[0] if _wave_q[0] > 0.0 else (time.time() - t_wave)
             wave_secs = d if wave_secs <= 0.0 else 0.4 * wave_secs + 0.6 * d
             ci += wave_n
         if ci < n_chunks:
