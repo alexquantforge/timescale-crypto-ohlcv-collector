@@ -168,6 +168,18 @@ Market loading, the two facts that took four rounds:
   probe must leave the instance with NO markets and the original `fetchMarkets`
   dict, or every later `market()` lookup reports a delisting.
 
+Read a market-load failure by SIZE before reading it by latency. `DASH_MARKET_-
+LOAD_DEBUG=true` on 2026-09-05 produced: 94 KB and 1.3 MB lists hung for the
+whole 90s per request, a 30-market list answered in 2.8s — same host, same
+instance, seconds apart. That rules out the host, the budget and the throttle
+queue in one line, and the only remaining difference from a `curl` that finishes
+in 3s is `Accept-Encoding`. So the loader re-asks a hanging leg once bare and, if
+that answers, retries the load that way in the same cycle
+(`DASH_MARKET_LOAD_ACCEPT_ENCODING=identity` to keep it): one header, zero extra
+requests, feeds untouched. A load that returns an EMPTY market list is a failure,
+not a success — an empty dict reads as "loaded" and comes back as BadSymbol for
+every pair on that exchange.
+
 A timeout longer than the operator's own measurement of the same endpoint is not
 a timeout problem. `curl` answered gate's `/spot/currency_pairs` in 2.7-5.8s while
 ccxt hit the 60s per-request wall: the suspect is state inside the process (a
