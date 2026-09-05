@@ -52,6 +52,20 @@ direct 11–50 KB/s link to the same host), so it is no longer inferred from sou
 `exchange client gate: route=socks5://127.0.0.1:10808` / `route=direct (…)`, every `[markets]` line carries
 its own route, `DASH_LIVE_SNAPSHOT_VIA_PROXY=false` moves the card off the tunnel, and
 `DASH_SYNC_PROXY=http://127.0.0.1:10809` moves the sync clients onto it — with the HTTP port, or an explicit
+
+**A stale proxy library looks exactly like a dead exchange.** `poetry add pysocks` re-synced one venv to
+`poetry.lock`, and `poetry.lock` carried `aiohttp-socks 0.8.4` — a version whose connector overrides
+`_wrap_create_connection(protocol_factory, host, port, …)`, a hook aiohttp 3.10 replaced with
+`_wrap_create_connection(*, addr_infos, req, timeout, …)`. Result: both engines came up with
+`Total symbols to process: 0`, and 18 warnings of
+`TypeError: ProxyConnector._wrap_create_connection() missing 2 required positional arguments: 'host' and 'port'`
+— one exchange "failing" 3 times after another, while the tunnel, the API and the timeouts were all fine.
+Reproduced by installing 0.8.4 into a working environment (and fixed by 0.12.0), which is why
+`aiohttp-socks>=0.12` is now a floor in `pyproject.toml`/`requirements.txt` instead of `^0.8.4`, and why the
+loaders recognise that signature: they say *once*, with the version pair and the command to run, and refuse to
+ask the remaining exchanges — a signature cannot be out-waited, and a retry policy that only multiplies log
+lines is a regression.
+
 warning that a SOCKS URL is being ignored.
 
 **The engines had the same bug with a different symptom.** `load_markets` was given a 30 s total wait around a

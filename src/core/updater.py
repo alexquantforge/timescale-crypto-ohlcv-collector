@@ -143,6 +143,39 @@ def format_await_chain(task: asyncio.Task, max_depth: int = 12) -> str:
     return " <- ".join(parts) if parts else "<no suspension point>"
 
 
+_PROXY_CLASH = {"told": False}
+
+
+def _proxy_clash_note(exc: BaseException) -> str:
+    """Return the sentence that explains a proxy-library clash, or "" if this is
+    not one.
+
+    A connector whose signature does not match aiohttp's is not flakiness, a rate
+    limit, or a slow market list: it fails before the socket opens, identically for
+    every exchange in the process, and no amount of retrying changes a function's
+    parameters. The engines used to spend 3 attempts x 6 exchanges on it every cycle
+    (18 lines, 0 information), and the operator had no way to see that the tunnel was
+    fine and the LIBRARY was stale. Naming the version pair and the install command is
+    the difference between a log and a fix.
+    """
+    text = repr(exc)
+    if "_wrap_create_connection" not in text or "ProxyConnector" not in text:
+        return ""
+    try:
+        import aiohttp
+        import aiohttp_socks
+        libs = (f"aiohttp {aiohttp.__version__} + "
+                f"aiohttp-socks {getattr(aiohttp_socks, '__version__', '?')}")
+    except Exception:
+        libs = "aiohttp + aiohttp-socks (versions unreadable)"
+    return (f"the SOCKS connector library is incompatible with this aiohttp "
+            f"({libs}): `_wrap_create_connection` became keyword-only `addr_infos` "
+            f"in aiohttp 3.10+, so the connector raises TypeError before any request "
+            f"is sent and NO exchange can load. Fix the environment, not the timeout: "
+            f"`poetry add \"aiohttp-socks>=0.12\"` (or pip install -U it), then "
+            f"restart — the proxy itself answered fine.")
+
+
 def _markets_load_budget() -> float:
     """Total seconds a `load_markets` may take, from EXCHANGE_MARKETS_LOAD_SEC.
     Read per call, never cached in a constant, so a restart with a different
@@ -196,6 +229,11 @@ async def load_markets_with_retry(
     """
     if timeout is None:
         timeout = _markets_load_budget()
+    if _PROXY_CLASH["told"]:
+        # every exchange in this process fails the same way — do not ask six times
+        logger.warning("load_markets for %s skipped: the proxy-library clash "
+                       "reported above still applies (restart after fixing it)", name)
+        return False
     last_err: Optional[BaseException] = None
     for attempt in range(1, attempts + 1):
         try:
@@ -206,6 +244,11 @@ async def load_markets_with_retry(
             return True
         except Exception as e:
             last_err = e
+            clash = _proxy_clash_note(e)
+            if clash:
+                _PROXY_CLASH["told"] = True
+                logger.error("market load is structurally impossible: %s", clash)
+                return False
             if attempt < attempts:
                 logger.warning(
                     f"load_markets for {name} failed (attempt {attempt}/{attempts}): {e!r} — retrying..."

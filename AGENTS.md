@@ -189,6 +189,23 @@ they were measured on different paths — so any network number the dashboard pr
 must name its route (`_route_note`, `create_exchange`'s `route=` log), and any proxy
 setting that cannot be honoured is reported as ignored, never obeyed silently.
 
+Never tell the operator to `poetry add` a package on a working machine. `poetry add` re-syncs the WHOLE venv
+to `poetry.lock`, so anything that had drifted ahead of the lock is silently downgraded — that is exactly how
+a healthy environment got `aiohttp-socks 0.12.0 -> 0.8.4` and lost every exchange connection on the next start.
+Ask them to `poetry run pip install <pkg>` for the immediate unblock, declare the dependency in
+`pyproject.toml`, and let them reconcile with `poetry lock --no-update && poetry install` on their own
+schedule, when a re-resolve is safe. If a re-sync is unavoidable, say out loud that versions of *other*
+packages will move and give the one command that proves the important ones still import.
+
+`aiohttp-socks` is a floor, not a preference: `^0.8.4` in `pyproject.toml` was installable, and 0.8.4's
+`_wrap_create_connection(protocol_factory, host, port, …)` no longer matches what aiohttp 3.10+ calls, so a
+fresh `poetry install` produced an engine that could not reach ANY exchange — 18 identical
+`TypeError: ProxyConnector._wrap_create_connection() … missing 2 required positional arguments: 'host' and
+'port'` and `Total symbols to process: 0`. Dependency bounds that gate a protocol hook must be pinned to the
+first version that matches the hook's current shape, and a failure whose cause is a signature must be
+diagnosed once (`_proxy_clash_note`: versions + the command that fixes it) and then NOT retried on the other
+exchanges, because a per-process environment error asked six times is noise, not evidence.
+
 A timeout that is shorter than payload_bytes ÷ measured_throughput is not a timeout
 setting, it is a permanent failure with a log line — and the number has to be applied
 to every ceiling in front of the request, not just the outer one: gate's ~1.4 MB of

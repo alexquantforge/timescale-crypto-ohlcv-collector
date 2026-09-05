@@ -10,7 +10,18 @@ packages = [{include = "src"}]
 python = "^3.11"
 asyncpg = "^0.31.0"
 ccxt = "^4.5.74"
-aiohttp-socks = "^0.8.4"
+# The floor is load-bearing, not hygiene. `^0.8.4` lets poetry install 0.8.4, whose
+# `ProxyConnector._wrap_create_connection(self, protocol_factory, host, port, *, ssl, …)`
+# overrides the OLD aiohttp hook, while aiohttp 3.10+ calls it as
+# `_wrap_create_connection(*, addr_infos, req, timeout, …)`. Reproduced 2026-09-05 on
+# aiohttp 3.14.3 + aiohttp-socks 0.8.4: EVERY async request of EVERY exchange dies with
+# `TypeError: ProxyConnector._wrap_create_connection() missing 2 required positional
+# arguments: 'host' and 'port'` before a socket is opened, and both engines start with
+# `Total symbols to process: 0`. 0.12.0 mirrors the new signature and fixes it.
+aiohttp-socks = ">=0.12"
+# The sync half of the app (dashboard `DASH_SYNC_PROXY` → `requests`) needs the other
+# SOCKS library; without it a socks5h:// URL is refused with a log line, not obeyed.
+pysocks = "^1.7.1"
 pandas = "^2.2.0"
 numpy = "^2.0.0"
 pydantic = "^2.10.0"

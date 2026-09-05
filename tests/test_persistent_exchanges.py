@@ -296,3 +296,103 @@ def test_the_market_list_refresh_interval_is_a_setting_both_engines_read(monkeyp
         assert mod._markets_ttl_sec() == 0.0
         monkeypatch.setattr(mod.settings, "exchange_markets_ttl_sec", -1.0)
         assert mod._markets_ttl_sec() == 1800.0
+
+
+# --- a stale proxy LIBRARY is not a network problem, and must not be dialled ---
+
+_CLASH = ("ProxyConnector._wrap_create_connection() missing 2 required positional "
+          "arguments: 'host' and 'port'")
+
+
+class _ClashingConnector:
+    """What `aiohttp-socks 0.8.4` does against `aiohttp 3.14`: the connector
+    overrides a hook whose signature changed in aiohttp 3.10, so EVERY request of
+    EVERY exchange raises this TypeError before a socket opens. Reproduced on
+    2026-09-05 by installing 0.8.4 into a working environment — the error is not
+    the exchange, not the tunnel, and not something a retry can affect.
+    """
+
+    def __init__(self):
+        self.timeout = 20_000
+        self.asked = 0
+
+    async def load_markets(self, reload: bool = False):
+        self.asked += 1
+        raise TypeError(_CLASH)
+
+
+@pytest.mark.parametrize("mod,loader_name", _ENGINES)
+def test_a_connector_signature_clash_is_named_once_instead_of_dialed_by_everyone(
+        mod, loader_name, monkeypatch, caplog):
+    """`Total symbols to process: 0` in both engines with 18 identical warnings is
+    the sound of an environment problem wearing a network costume. One line, with
+    the version pair and the command that fixes it, and the remaining exchanges are
+    not asked at all — the clash is per-process, so retrying it multiplies noise and
+    nothing else."""
+    import logging
+    loader = getattr(mod, loader_name)
+    monkeypatch.setattr(mod, "_PROXY_CLASH", {"told": False})
+    ex = _ClashingConnector()
+    with caplog.at_level(logging.INFO):
+        assert asyncio.run(loader(ex, "gateio", attempts=3)) is False
+        other = _ClashingConnector()
+        assert asyncio.run(loader(other, "bybit", attempts=3)) is False
+    assert ex.asked == 1, "one attempt to find out, then stop — a signature is not flaky"
+    assert other.asked == 0, "the second exchange is the same environment; do not ask"
+    assert "aiohttp-socks>=0.12" in caplog.text, caplog.text[-500:]
+
+
+@pytest.mark.parametrize("mod,loader_name", _ENGINES)
+def test_an_ordinary_timeout_still_gets_its_whole_retry_budget(
+        mod, loader_name, monkeypatch):
+    """The short-circuit must stay specific to the structural error: a slow or
+    hanging exchange is exactly what the 3 attempts exist for, and narrowing the
+    fix would silently turn `aiohttp-socks>=0.12` into "give up early on
+    everything"."""
+    class _Hangs:
+        def __init__(self):
+            self.timeout = 20_000
+            self.asked = 0
+
+        async def load_markets(self, reload: bool = False):
+            self.asked += 1
+            await asyncio.sleep(0.2)
+
+    loader = getattr(mod, loader_name)
+    monkeypatch.setattr(mod, "_PROXY_CLASH", {"told": False})
+    monkeypatch.setattr(mod.settings, "exchange_markets_load_sec", 0.02)
+    ex = _Hangs()
+    assert asyncio.run(loader(ex, "mexc", attempts=3)) is False
+    assert ex.asked == 3, "a timeout is still worth retrying; only a clash skips"
+
+
+@pytest.mark.parametrize("mod", [updater, updater_15m], ids=["1d", "15m"])
+def test_the_clash_note_says_what_it_measured_and_what_to_run(mod):
+    note = mod._proxy_clash_note(TypeError(_CLASH))
+    assert "aiohttp-socks>=0.12" in note
+    assert "aiohttp 3" in note, "the version pair is the evidence, not a guess"
+    # and it stays out of the way of everything it cannot explain
+    for other in (RuntimeError("gate GET https://api.gateio.ws/… timed out"),
+                  TypeError("market is not defined: 'symbol'"),
+                  OSError("_wrap_create_connection failed for other reasons")):
+        assert mod._proxy_clash_note(other) == "", other
+
+
+def test_the_15m_engine_names_the_route_of_the_clients_it_builds(monkeypatch, caplog):
+    """The 1d engine got its `route=` line from `create_exchange`; the 15m engine
+    builds its clients in `_make_exchange` and stayed mute, which is how "the
+    engines are on the tunnel, the dashboard is not" survived four rounds of
+    guesses. Two log files must answer the same question independently."""
+    import logging
+    monkeypatch.setattr(updater_15m.settings, "socks5_proxy",
+                        "socks5://127.0.0.1:10808", raising=False)
+    with caplog.at_level(logging.INFO, logger="updater_15m"):
+        ex = updater_15m._make_exchange("gate")
+    assert ex.socks_proxy == "socks5://127.0.0.1:10808"
+    assert "exchange client gate: route=socks5://127.0.0.1:10808" in caplog.text
+    monkeypatch.setattr(updater_15m.settings, "socks5_proxy", "", raising=False)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="updater_15m"):
+        ex2 = updater_15m._make_exchange("gate")
+    assert getattr(ex2, "socks_proxy", None) in (None, "")
+    assert "route=direct" in caplog.text, caplog.text

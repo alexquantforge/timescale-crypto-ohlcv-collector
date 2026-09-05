@@ -1,7 +1,11 @@
 # Crypto Market Data Engine Dependencies
 asyncpg>=0.28.0
 ccxt>=4.2.0
-aiohttp-socks>=0.8.4
+# >=0.12, not "latest hygiene": 0.8.x overrides an aiohttp hook whose signature changed
+# in aiohttp 3.10, so every async request dies with `ProxyConnector._wrap_create_connection()
+# missing 2 required positional arguments: 'host' and 'port'` and BOTH engines report
+# `Total symbols to process: 0`. See pyproject.toml for the reproduction.
+aiohttp-socks>=0.12
 # …and the OTHER proxy library, for the other half of the app: `aiohttp-socks`
 # serves the async clients (engines/collector), while the dashboard's sync clients
 # go through `requests`, which needs PySocks to accept a socks5:// URL at all.

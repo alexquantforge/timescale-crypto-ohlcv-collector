@@ -1610,6 +1610,11 @@ def _make_exchange(ccxt_id: str):
     }
     if settings.socks5_proxy:
         config["socks_proxy"] = settings.socks5_proxy
+    # same line the 1d engine gets from `create_exchange`: two engines, two log
+    # files, and "which route" has to be answerable from either one alone
+    log(f"exchange client {ccxt_id}: route="
+        + (settings.socks5_proxy if settings.socks5_proxy
+           else "direct (no proxy: SOCKS5_PROXY is empty)"))
     return getattr(ccxt_async, ccxt_id)(config)
 
 
@@ -1680,6 +1685,39 @@ def release_memory() -> None:
         pass
 
 
+_PROXY_CLASH = {"told": False}
+
+
+def _proxy_clash_note(exc: BaseException) -> str:
+    """Return the sentence that explains a proxy-library clash, or "" if this is
+    not one.
+
+    A connector whose signature does not match aiohttp's is not flakiness, a rate
+    limit, or a slow market list: it fails before the socket opens, identically for
+    every exchange in the process, and no amount of retrying changes a function's
+    parameters. The engines used to spend 3 attempts x 6 exchanges on it every cycle
+    (18 lines, 0 information), and the operator had no way to see that the tunnel was
+    fine and the LIBRARY was stale. Naming the version pair and the install command is
+    the difference between a log and a fix.
+    """
+    text = repr(exc)
+    if "_wrap_create_connection" not in text or "ProxyConnector" not in text:
+        return ""
+    try:
+        import aiohttp
+        import aiohttp_socks
+        libs = (f"aiohttp {aiohttp.__version__} + "
+                f"aiohttp-socks {getattr(aiohttp_socks, '__version__', '?')}")
+    except Exception:
+        libs = "aiohttp + aiohttp-socks (versions unreadable)"
+    return (f"the SOCKS connector library is incompatible with this aiohttp "
+            f"({libs}): `_wrap_create_connection` became keyword-only `addr_infos` "
+            f"in aiohttp 3.10+, so the connector raises TypeError before any request "
+            f"is sent and NO exchange can load. Fix the environment, not the timeout: "
+            f"`poetry add \"aiohttp-socks>=0.12\"` (or pip install -U it), then "
+            f"restart — the proxy itself answered fine.")
+
+
 def _markets_load_budget() -> float:
     """Total seconds a `load_markets` may take (EXCHANGE_MARKETS_LOAD_SEC).
     Mirror of `src/core/updater.py` — BOTH engines collect from gateio, so a
@@ -1723,6 +1761,11 @@ async def load_markets_retries(exchange, ccxt_name, attempts: int = 3,
     market lists at all. `timeout=None` = EXCHANGE_MARKETS_LOAD_SEC."""
     if timeout is None:
         timeout = _markets_load_budget()
+    if _PROXY_CLASH["told"]:
+        # every exchange in this process fails the same way — do not ask six times
+        log(f"  [MARKETS] {ccxt_name} skipped: the proxy-library clash reported "
+            f"above still applies (restart after fixing it)")
+        return False
     last_err = None
     for attempt in range(1, attempts + 1):
         try:
@@ -1732,6 +1775,11 @@ async def load_markets_retries(exchange, ccxt_name, attempts: int = 3,
             return True
         except Exception as e:
             last_err = e
+            clash = _proxy_clash_note(e)
+            if clash:
+                _PROXY_CLASH["told"] = True
+                log(f"  ⛔ {ccxt_name}: market load is structurally impossible — {clash}")
+                return False
             if attempt < attempts:
                 log(f"  [MARKETS] {ccxt_name} attempt {attempt}/{attempts} failed: {e!r} — retrying...")
                 await asyncio.sleep(2.0)
