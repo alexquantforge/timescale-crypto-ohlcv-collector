@@ -273,9 +273,13 @@ class Settings(BaseSettings):
     dash_markets_disk_ttl_sec: float = Field(default=86400.0,
                                              alias="DASH_MARKETS_DISK_TTL_SEC")
     # …and a disk-seeded catalog older than this also triggers a real reload in
-    # the background (never on the click path). Set it to 0 to reload on every
-    # start, or above the TTL to never reload while the process lives.
-    dash_markets_refresh_sec: float = Field(default=3600.0,
+    # the background (never on the click path). SIX HOURS, not an hour: a reload
+    # of gate's spot+swap lists is ~200 KB of compressed JSON, and the operator's
+    # measured throughput to that endpoint is 11-50 KB/s while the collector is
+    # using the same pipe — an hourly refresh would spend the link to re-learn
+    # something that changes on the scale of listings. Set it to 0 to reload on
+    # every start, or above the TTL to never reload while the process lives.
+    dash_markets_refresh_sec: float = Field(default=21600.0,
                                             alias="DASH_MARKETS_REFRESH_SEC")
     # Wall-clock budget for the whole-database summary scan. Whatever came
     # back in time is rendered — the dashboard must stay usable while the

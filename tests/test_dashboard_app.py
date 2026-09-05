@@ -3080,11 +3080,11 @@ def test_the_market_probe_names_the_slow_category_and_leaves_no_partial_catalog(
     assert "spot ok, 1 markets" in out, out
     assert "swap FAILED after" in out and "RequestTimeout" in out, out
     assert "[markets] gate: probe, 4 categories, 60s per request" in out, out
-    # one request per category, and only ever for the categories ccxt declares —
-    # plus ONE bare retry for the leg that hung (the encoding is the variable the
-    # operator's curl differs in, so the probe tests it instead of theorising)
-    assert [c for c in calls] == [["spot"], ["swap"], ["swap"], ["future"],
-                                  ["option"]], calls
+    # one request per category, and only ever for the categories ccxt declares.
+    # `swap` died on a timeout, and a timeout is NOT re-asked uncompressed (the
+    # bare body would be ~12x the bytes) — see
+    # `test_a_timeout_is_never_answered_with_a_bigger_response`.
+    assert [c for c in calls] == [["spot"], ["swap"], ["future"], ["option"]], calls
     # the instance ends EMPTY and its own config is restored, siblings included
     assert not ex.markets, ex.markets
     assert ex.options["fetchMarkets"] == {"types": ["spot", "swap", "future", "option"],
@@ -3100,30 +3100,50 @@ def _isolate_market_gate(monkeypatch, dapp):
 
 
 class _ShapeExchange:
-    """A ccxt-shaped fake whose endpoint only answers uncompressed responses.
+    """A ccxt-shaped fake for the two ways a market list fails, which must NOT get
+    the same answer:
+
+    * `corrupt` — the gzip body is damaged, so asking bare fixes it (worth one
+      request, and the load is retried that way in the same cycle);
+    * `slow` — the body never arrives before the clock, so asking bare would ask
+      for ~12x the bytes of the thing that just timed out (the operator measured
+      gate's spot list at 92,784 B gzipped / 1,137,626 B plain);
+    * `dead` — nothing answers either way.
 
     `session` starts as None on purpose: ccxt creates the requests session
-    lazily, and the `noproxy` variant has to cope with both states.
+    lazily, and the header machinery has to cope with both states.
     """
 
-    def __init__(self, fail_identity=False):
+    def __init__(self, mode="corrupt", bare_error=None):
         self.timeout = 8_000
         self.headers = {"Accept-Encoding": "gzip, deflate", "User-Agent": "ccxt/4.5.77"}
         self.options = {"fetchMarkets": {"types": ["spot", "swap"]}}
         self.markets = None
         self.session = None
         self.calls = []
-        self._fail_identity = fail_identity
+        self.mode = mode
+        # …and a bare request that breaks too (a different decoder error), which
+        # must leave NO conclusion behind. Recorded through the same `calls` list
+        # as everything else, so a test can count what the endpoint actually saw.
+        self.bare_error = bare_error
 
     def load_markets(self):
         enc = self.headers.get("Accept-Encoding")
         self.calls.append({"types": list(self.options["fetchMarkets"]["types"]),
                            "enc": enc, "ua": self.headers.get("User-Agent"),
                            "trust_env": getattr(self.session, "trust_env", None)})
-        if self._fail_identity or enc != "identity":
+        if self.mode == "dead":
             raise RuntimeError("RequestTimeout: gate GET https://api.gateio.ws/"
                                "api/v4/spot/currency_pairs")
-        self.markets = {"BTC/USDT": {"id": "BTC_USDT", "symbol": "BTC/USDT"}}
+        if enc == "identity":
+            if self.bare_error:
+                raise RuntimeError(self.bare_error)
+            self.markets = {"BTC/USDT": {"id": "BTC_USDT", "symbol": "BTC/USDT"}}
+            return
+        if self.mode == "corrupt":
+            raise RuntimeError("Failed to decode the gzip'ed response body")
+        raise RuntimeError("RequestTimeout: gate GET https://api.gateio.ws/"
+                           "api/v4/spot/currency_pairs")
 
     def set_markets(self, m):
         vals = list(m.values()) if isinstance(m, dict) else list(m)
@@ -3146,11 +3166,12 @@ def test_a_failed_market_load_probes_the_encoding_and_keeps_the_answer(monkeypat
 
     _isolate_market_gate(monkeypatch, dapp)
     monkeypatch.setattr(dapp.settings, "dash_market_load_debug", True)
-    ex = _ShapeExchange()
+    ex = _ShapeExchange(mode="corrupt")
 
     assert dapp._load_markets_locked("gate", ex, "stitch") == ""
     out = capsys.readouterr().out
     assert "spot FAILED after" in out and "spot ok UNCOMPRESSED" in out, out
+    assert "died on the per-request timeout" not in out
     assert "every list that hung arrived once asked uncompressed (spot, swap)" in out
     assert "(by bare-retry)" in out, out
     # the real load, then one request per category, then a bare retry per HANGING
@@ -3171,16 +3192,48 @@ def test_a_failed_market_load_probes_the_encoding_and_keeps_the_answer(monkeypat
     assert set(ex.markets) == {"BTC/USDT"}
 
 
-def test_the_bare_probe_finding_nothing_costs_no_retry_and_says_so(monkeypatch, capsys):
-    """A measurement that indicts nothing must still clear the encoding theory —
-    that is what the next message can be built on."""
+def test_a_timeout_is_never_answered_with_a_bigger_response(monkeypatch, capsys):
+    """The wrong conclusion this code was about to reach, now refused in a test.
+
+    The measurement that reversed it is theirs: the same URL, gzip 92,784 B in
+    8.2s vs identity 1,137,626 B in 22.2s. A leg that hit the wall on 93 KB must
+    not be re-asked for 1.1 MB; it has to be told what it is (throughput) and
+    where the real levers are (fewer bytes, a wider FIRST window, the catalog on
+    disk) — because the tempting setting, `DASH_MARKET_LOAD_ACCEPT_ENCODING=
+    identity`, would make the endpoint 12x harder to reach.
+    """
     from dashboard import app as dapp
 
     _isolate_market_gate(monkeypatch, dapp)
     monkeypatch.setattr(dapp.settings, "dash_market_load_debug", True)
-    ex = _ShapeExchange(fail_identity=True)
+    ex = _ShapeExchange(mode="slow")
 
     assert "RequestTimeout" in dapp._load_markets_locked("gate", ex, "stitch")
+    out = capsys.readouterr().out
+    assert "died on the per-request timeout, not on a bad response" in out, out
+    assert "92,784 B gzipped vs 1,137,626 B plain" in out, out
+    assert "DASH_MARKET_LOAD_TIMEOUT_SEC=180" in out and "markets_gate.pkl" in out
+    assert len(ex.calls) == 1 + 2, ex.calls      # the load + one probe per category
+    assert [c["enc"] for c in ex.calls] == ["gzip, deflate", "gzip, deflate",
+                                           "gzip, deflate"], ex.calls
+    assert dapp._market_gate("gate")["variant"] == ""
+    assert "ok UNCOMPRESSED" not in out
+
+
+def test_a_bare_retry_that_also_fails_leaves_no_conclusion(monkeypatch, capsys):
+    """The decode-error path is allowed exactly one extra request per hanging leg;
+    when even that fails, no setting is suggested and no retry is started — the
+    only thing this may conclude is that the encoding theory is not supported."""
+    from dashboard import app as dapp
+
+    _isolate_market_gate(monkeypatch, dapp)
+    monkeypatch.setattr(dapp.settings, "dash_market_load_debug", True)
+    # the bare request breaks too (a different decoder) -> no conclusion, no
+    # retry of the load
+    ex = _ShapeExchange(mode="corrupt",
+                        bare_error="Failed to decode the deflate'ed response body")
+
+    assert "Failed to decode" in dapp._load_markets_locked("gate", ex, "stitch")
     out = capsys.readouterr().out
     assert "also failed UNCOMPRESSED" in out, out
     assert "the response ENCODING is the variable" not in out
@@ -3190,7 +3243,7 @@ def test_the_bare_probe_finding_nothing_costs_no_retry_and_says_so(monkeypatch, 
 
     # the SECOND failure does not probe again: one burst per process, however
     # long the operator leaves the knob on
-    assert "RequestTimeout" in dapp._load_markets_locked("gate", ex, "stitch")
+    assert "Failed to decode" in dapp._load_markets_locked("gate", ex, "stitch")
     assert len(ex.calls) == 1 + 2 + 2 + 1, ex.calls
     assert dapp._market_gate("gate")["fails"] == 2
 

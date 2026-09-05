@@ -181,7 +181,15 @@ not a success — an empty dict reads as "loaded" and comes back as BadSymbol fo
 every pair on that exchange.
 
 A timeout longer than the operator's own measurement of the same endpoint is not
-a timeout problem. `curl` answered gate's `/spot/currency_pairs` in 2.7-5.8s while
+a timeout problem — but check which measurement they actually made. The
+falsified version of this round's theory, recorded so it is not re-derived:
+"the gzip stream is broken, because curl (no `Accept-Encoding`) was fast" — the
+operator then timed BOTH shapes of the same URL and identity was *slower in wall
+time and 12x bigger in bytes* (92,784 B / 8.2s gz vs 1,137,626 B / 22.2s bare,
+i.e. a 11-50 KB/s pipe). A narrow link and a corrupted stream both look like
+`RequestTimeout`, so the rule in code is: never answer a timeout with more bytes
+(`_is_timeout_like`), only with fewer; a decode/framing error is the one case
+worth one bare retry (`DASH_MARKET_LOAD_ACCEPT_ENCODING`). `curl` answered gate's `/spot/currency_pairs` in 2.7-5.8s while
 ccxt hit the 60s per-request wall: the suspect is state inside the process (a
 reused session left half-read by an abandoned request), and the fix is to measure
 and to make the page survivable without the endpoint — not to add retries.

@@ -1665,19 +1665,25 @@ def _market_load_probe(ccxt_id: str, ex, timeout_ms) -> None:
     probe that loaded `spot` alone would otherwise leave a catalog without perps,
     which every later `market()` lookup would report as a delisting.
 
-    A leg that hangs is asked ONCE more with `Accept-Encoding: identity`, because
-    that is the only difference between our request and the operator's `curl` of
-    the same URL (which answers 94 KB in 3.0s): if the bare response arrives, the
-    endpoint is not slow, the *compressed stream* is — and the caller can then
-    retry the load that way instead of waiting out the backoff. Returns "identity"
-    when every hanging leg answered bare, "" otherwise.
+    The first theory this printed was "the gzip stream is broken" — because the
+    only thing a 3s `curl` did differently was to send no `Accept-Encoding`. The
+    operator then measured BOTH shapes of that URL and the theory is dead: gzip
+    92,784 B in 8.2s, identity 1,137,626 B in 22.2s — ~11 and ~50 KB/s of
+    throughput, with a 3 KB list arriving in 2.8s. Nothing is corrupted: the pipe
+    is narrow and the response SIZE is the whole story. So
+
+    * a leg that died on the clock is NOT re-asked uncompressed (that would add
+      ~12x to the bytes of the thing that just failed) — it gets a verdict;
+    * a leg that died on a decode/framing error IS re-asked bare, once, and if the
+      bare body arrives the caller retries the load that way instead of waiting
+      out the 20-900s backoff. Returns "identity" in that case, "" otherwise.
     """
     fm = (getattr(ex, "options", None) or {}).get("fetchMarkets") or {}
     types = fm.get("types")
     if not isinstance(types, list):
         types = ["spot", "swap", "future", "option"]
     parts = []
-    bare_ok, bare_failed = [], []
+    bare_ok, bare_failed, timed_out = [], [], []
     # The timeout the probe runs under is the LOAD one, not the tightened fetch
     # one that the caller restores afterwards — the printed number has to be the
     # one that was in force while the legs were being timed.
@@ -1691,8 +1697,12 @@ def _market_load_probe(ccxt_id: str, ex, timeout_ms) -> None:
             parts.append(f"{one} ok, {len(ex.markets or {})} markets, "
                          f"{time.time() - started:.1f}s")
         except BaseException as e:
+            _etxt = f"{type(e).__name__}: {e}"
             parts.append(f"{one} FAILED after {time.time() - started:.1f}s: "
-                         f"{type(e).__name__}: {str(e)[:120]}")
+                         f"{_etxt[:120]}")
+            if _is_timeout_like(e, _etxt):
+                timed_out.append(one)
+                continue          # bigger bytes are not the cure, see the docstring
             bare_failed.append(one)
             undo_bare = _apply_header(ex, "Accept-Encoding", "identity")
             t_bare = time.time()
@@ -1724,6 +1734,15 @@ def _market_load_probe(ccxt_id: str, ex, timeout_ms) -> None:
             pass
     print(f"[markets] {ccxt_id}: probe, {len(types)} categories, "
           f"{_probe_to / 1000:.0f}s per request — " + "; ".join(parts), flush=True)
+    if timed_out:
+        print(f"[markets] {ccxt_id}: {', '.join(timed_out)} died on the per-request "
+              f"timeout, not on a bad response — the encoding is NOT the lever "
+              f"(uncompressed is ~12x the bytes: gate's spot list measured "
+              f"92,784 B gzipped vs 1,137,626 B plain). This is throughput: ask "
+              f"for gzip (the default), widen the FIRST load until it fits "
+              f"(DASH_MARKET_LOAD_TIMEOUT_SEC=180 once, then back to 60), and let "
+              f"the catalog on disk carry every later restart — that is what "
+              f"markets_{ccxt_id}.pkl exists for.", flush=True)
     if bare_failed and len(bare_ok) == len(bare_failed):
         print(f"[markets] {ccxt_id}: every list that hung arrived once asked "
               f"uncompressed ({', '.join(bare_ok)}) — the response ENCODING is the "
@@ -1796,6 +1815,22 @@ def _seed_markets_from_disk(ccxt_id: str, ex, g: dict) -> bool:
           f"accepted up to {ttl:.0f}s) — no exchange request needed on the click "
           f"path; {_what}", flush=True)
     return True
+
+
+def _is_timeout_like(exc, text: str) -> bool:
+    """Did this request die on the CLOCK rather than on the bytes?
+
+    The distinction decides whether asking for an uncompressed body can help at
+    all. It cannot for a timeout: `DASH_MARKET_LOAD_ACCEPT_ENCODING=identity`
+    makes gate's spot list ~12x BIGGER (the operator measured 1,137,626 B in
+    22.2s against 92,784 B in 8.2s for the same URL on 2026-09-05), so a client
+    that timed out at 90s on 93 KB would need minutes for 1.1 MB. A decode or
+    framing error is the opposite case: there the compressed stream itself is the
+    broken thing, and going bare is worth one request.
+    """
+    if "Timeout" in type(exc).__name__ or "timed out" in text.lower():
+        return True
+    return "RequestTimeout" in text or "TimeoutError" in text
 
 
 def _apply_header(ex, key: str, value):
