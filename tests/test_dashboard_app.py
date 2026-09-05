@@ -3153,6 +3153,62 @@ class _ShapeExchange:
         pass
 
 
+def test_the_markets_lines_say_which_route_they_took(monkeypatch, capsys):
+    """One machine, two routes, one question: the engines reach gate through the
+    default `SOCKS5_PROXY` tunnel while the dashboard's sync clients go direct and
+    cannot do otherwise — so every number in a `[markets]` line has to carry the
+    route it was measured on, or it is not evidence about the exchange at all."""
+
+    class _Sync:                      # what `_new_sync_exchange` builds
+        socks_proxy = None
+        proxy = None
+        session = None
+        headers = {}
+        options = {}
+        timeout = 8_000
+        markets = {"BTC/USDT": {"symbol": "BTC/USDT"}}
+
+        def load_markets(self):
+            pass
+
+    class _Async:                     # what `create_exchange` builds
+        socks_proxy = "socks5://127.0.0.1:10808"
+
+    from dashboard import app as dapp
+
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy",
+              "all_proxy"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(dapp.settings, "socks5_proxy", "socks5://127.0.0.1:10808")
+
+    assert dapp._route_note(_Sync()).startswith("direct")
+    assert "socks5://127.0.0.1:10808" in dapp._route_note(_Sync())
+    assert dapp._route_note(_Async()) == "via socks5://127.0.0.1:10808"
+
+    # the line the operator pastes carries it, not just the helper
+    import threading
+    g = {"lock": threading.Lock(), "at": 0.0, "fails": 0, "err": "", "loading": True,
+         "markets_from": "", "variant": ""}
+    dapp._apply_loaded_catalog("gate", _Sync(), g, "stitch", time.time() - 2.0)
+    out = capsys.readouterr().out
+    assert "(by stitch, direct" in out, out
+
+    # …and an exported env proxy is reported as what it is, because that IS a
+    # different route and `requests` picks it up while ccxt's sync socks does not
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:8118")
+    assert dapp._route_note(_Sync()) == "via env https_proxy=http://127.0.0.1:8118"
+
+    # the knob that puts the dashboard's OWN clients on a proxy (an HTTP one works
+    # without PySocks; a socks5:// one does not) is reported, not swallowed
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.setattr(dapp.settings, "dash_sync_proxy", "http://127.0.0.1:10809")
+    ex = dapp._new_sync_exchange("gate")
+    assert ex.proxies == {"http": "http://127.0.0.1:10809",
+                          "https": "http://127.0.0.1:10809"}, ex.proxies
+    assert dapp._route_note(ex) == "via http://127.0.0.1:10809"
+
+
+
 def test_a_failed_market_load_probes_the_encoding_and_keeps_the_answer(monkeypatch,
                                                                         capsys):
     """`spot FAILED after 91.8s`, `swap FAILED after 92.3s`, `future ok, 30
@@ -3173,7 +3229,7 @@ def test_a_failed_market_load_probes_the_encoding_and_keeps_the_answer(monkeypat
     assert "spot FAILED after" in out and "spot ok UNCOMPRESSED" in out, out
     assert "died on the per-request timeout" not in out
     assert "every list that hung arrived once asked uncompressed (spot, swap)" in out
-    assert "(by bare-retry)" in out, out
+    assert "(by bare-retry," in out, out      # the route follows the `who`
     # the real load, then one request per category, then a bare retry per HANGING
     # category, then the load again — 1 + 2 + 2 + 1, and never a burst per pair
     assert [c["enc"] for c in ex.calls] == [

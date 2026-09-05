@@ -1524,7 +1524,11 @@ def _demo_candles_cached(timeframe: str, ticker: str, exchange: str, limit: int)
 async def _fetch_live_snapshot(ticker: str, exchange_name: str, ccxt_id: str, atr_val: float):
     exchange = None
     try:
-        exchange = create_exchange(ccxt_id)
+        # …and the ONE dashboard path that can use the tunnel says so, because a
+        # card fed through the VPN next to feeds fed directly is two measurements
+        # of two different networks pretending to be one of the exchange.
+        exchange = create_exchange(
+            ccxt_id, use_proxy=bool(settings.dash_live_snapshot_via_proxy))
         return await fetch_orderbook_snapshot(
             exchange=exchange,
             symbol=ticker,
@@ -1535,7 +1539,12 @@ async def _fetch_live_snapshot(ticker: str, exchange_name: str, ccxt_id: str, at
             depth_pct=settings.ob_depth_pct,
         )
     except Exception as e:
-        st.warning(f"Could not fetch live API data from {exchange_name}: {e}. Displaying DB snapshot.")
+        st.warning(f"Could not fetch live API data from {exchange_name}: {e}. "
+                   f"Displaying DB snapshot. This card used "
+                   f"{'the SOCKS5 tunnel' if settings.dash_live_snapshot_via_proxy else 'a direct connection'}"
+                   f" ({_route_note()}), while the chips/tape/stitch on this page "
+                   f"always go direct — a timeout here is not necessarily a "
+                   f"timeout there.")
         return None
     finally:
         if exchange:
@@ -1580,7 +1589,26 @@ def _new_sync_exchange(ccxt_id: str, timeout_ms: int = 8000):
     need markets, not currency metadata.
     """
     import ccxt as _ccxt
-    ex = getattr(_ccxt, ccxt_id)({"enableRateLimit": True, "timeout": int(timeout_ms)})
+    _conf = {"enableRateLimit": True, "timeout": int(timeout_ms)}
+    # A proxy for the sync clients is normally impossible here: `requests` needs
+    # PySocks for a `socks5://` URL and that is not a dependency of this project,
+    # which is why the engine (async, aiohttp_socks) and the dashboard could end
+    # up on two different routes to the same exchange. An HTTP proxy needs
+    # nothing, so `DASH_SYNC_PROXY` accepts one and says so if it cannot take the
+    # other — never a silently ignored setting.
+    _px = (getattr(settings, "dash_sync_proxy", "") or "").strip()
+    if _px:
+        if _px.startswith("socks") and not _pysocks_available():
+            _market_log_once(
+                ("pysocks",),
+                f"[markets] ⚠️ DASH_SYNC_PROXY={_px} is ignored: the dashboard's "
+                f"synchronous client uses `requests`, which needs the `pysocks` "
+                f"package for a SOCKS URL (the engines do not — they are async). "
+                f"Install it, or point DASH_SYNC_PROXY at the HTTP port of the "
+                f"same client (commonly 10809 next to 10808).")
+        else:
+            _conf["proxies"] = {"http": _px, "https": _px}
+    ex = getattr(_ccxt, ccxt_id)(_conf)
     try:
         ex.has = dict(ex.has or {})
         ex.has["fetchCurrencies"] = False
@@ -1833,6 +1861,46 @@ def _is_timeout_like(exc, text: str) -> bool:
     return "RequestTimeout" in text or "TimeoutError" in text
 
 
+def _pysocks_available() -> bool:
+    try:
+        import socks                      # noqa: F401  (requests' SOCKS support)
+        return True
+    except Exception:
+        return False
+
+
+def _route_note(ex=None) -> str:
+    """Which network path this instance's HTTP takes, in one string.
+
+    Asked out loud because the answer is not the same everywhere in this
+    project: the engines (and the dashboard's async snapshot client) use
+    `SOCKS5_PROXY`, whose default is a local SOCKS5 tunnel, while the dashboard's
+    sync clients — markets, tape, order book, gap stitching — cannot: `requests`
+    needs PySocks for a `socks5://` proxy and it is not installed. So the same
+    exchange can be slow in one panel and fine in another, on one machine, and
+    `curl` disagrees with both. A latency number that does not say which route it
+    came from is not evidence, so every `[markets]` line now says.
+    """
+    for attr in ("socks_proxy", "proxy"):
+        v = getattr(ex, attr, None)
+        if v:
+            return f"via {v}"
+    px = getattr(ex, "proxies", None) or getattr(getattr(ex, "session", None),
+                                                  "proxies", None)
+    if isinstance(px, dict) and px:
+        vals = set(px.values())
+        if len(vals) == 1:
+            return f"via {vals.pop()}"
+        return "via " + ", ".join(f"{k}={v}" for k, v in sorted(px.items()))
+    env = [f"{k.lower()}={v}" for k, v in sorted(os.environ.items())
+           if k.lower() in ("http_proxy", "https_proxy", "all_proxy")]
+    if env and getattr(getattr(ex, "session", None), "trust_env", True) is not False:
+        return "via env " + ", ".join(env)
+    eng = (settings.socks5_proxy or "").strip()
+    return (f"direct (this client has no proxy; the async ones — engines, and the "
+            f"snapshot card — use {eng})" if eng else "direct (no proxy anywhere)")
+
+
 def _apply_header(ex, key: str, value):
     """Set one header on a ccxt instance, returning an undo that never raises."""
     hdrs = getattr(ex, "headers", None)
@@ -1863,7 +1931,7 @@ def _apply_loaded_catalog(ccxt_id: str, ex, g: dict, who: str, started: float,
         save_markets_snapshot(
             markets_path(settings.dash_snapshot_dir, ccxt_id), ex.markets)
     print(f"[markets] {ccxt_id}: {n_loaded} markets loaded "
-          f"in {time.time() - started:.1f}s (by {who})"
+          f"in {time.time() - started:.1f}s (by {who}, {_route_note(ex)})"
           + (f" — {note}" if note else ""), flush=True)
 
 
@@ -1904,8 +1972,8 @@ def _load_markets_locked(ccxt_id: str, ex, who: str) -> str:
                  err=f"{type(e).__name__}: {e}")
         _market_log_once(("load", ccxt_id),
                          f"[markets] ⚠️ {ccxt_id}: load_markets failed "
-                         f"({g['err']}) — retrying after a backoff, feeds and "
-                         f"stitching stay empty until it works")
+                         f"({g['err']}, {_route_note(ex)}) — retrying after a "
+                         f"backoff, feeds and stitching stay empty until it works")
         if int(g["fails"]) >= 2:
             # One abandoned request (an orderbook or tape fetch cut by its own
             # 8s budget) can poison a reused HTTP session: the next request then

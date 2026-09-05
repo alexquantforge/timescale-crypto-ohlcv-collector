@@ -417,6 +417,21 @@ class Settings(BaseSettings):
     # opposite answers (more timeout vs. fewer requests / another route). Costs
     # one load per category, only after a failure, so it stays off in production.
     dash_market_load_debug: bool = Field(default=False, alias="DASH_MARKET_LOAD_DEBUG")
+    # The order-book/Funding "live snapshot" card is the one dashboard path that
+    # builds an ASYNC client, and async clients follow `SOCKS5_PROXY` (default
+    # `socks5://127.0.0.1:10808`) while every other dashboard path is direct —
+    # because the sync path could not use it even if it tried (no PySocks). Set
+    # this to false to put the whole dashboard on one route so that a latency
+    # difference is never a route difference; the client logs which one it took.
+    dash_live_snapshot_via_proxy: bool = Field(default=True,
+                                               alias="DASH_LIVE_SNAPSHOT_VIA_PROXY")
+    # …and the opposite direction: put the dashboard's SYNCHRONOUS clients (markets
+    # load, tape, order book, gap stitching) on a proxy so that they share the
+    # engine's route instead of measuring a different network. An `http://` proxy
+    # URL works here out of the box; a `socks5://` one needs the `pysocks` package
+    # for `requests`, which this project does not depend on (it is checked and
+    # reported, not silently ignored).
+    dash_sync_proxy: str = Field(default="", alias="DASH_SYNC_PROXY")
     # "" = leave ccxt's own headers alone. `identity` asks for the market lists
     # uncompressed, which is what `curl` does — see the size-shaped failure the
     # timing probe measures (`spot FAILED after 91.8s … future ok, 2.8s`). Costs no

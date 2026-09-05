@@ -42,6 +42,18 @@ same cycle instead of after a 20–900 s backoff. What actually moves a narrow p
 (`DASH_MARKET_LOAD_TIMEOUT_SEC=180`, then back to 60), trim what is fetched at all
 (`CCXT_MARKET_TYPES_SKIP`, `CCXT_FETCH_CURRENCIES=false`) and let `markets_<exchange>.pkl` carry every
 later restart — with `DASH_MARKETS_REFRESH_SEC=21600` so a reload is not re-burning the link hourly.
+
+**Proxy: which half of the app uses it.** `SOCKS5_PROXY` (default `socks5://127.0.0.1:10808`) is honoured by
+the *async* ccxt clients — the engines, the collector, and the dashboard's order-book metrics card — and by
+nothing else: the dashboard's sync clients (markets load, chips, tape, gap stitching) go direct, because
+`requests` needs `pysocks` for a `socks5://` URL and this project does not depend on it. That asymmetry was
+the last unexplained number in the gate saga (one panel timing out on the tunnel while another crawled on a
+direct 11–50 KB/s link to the same host), so it is no longer inferred from source: `create_exchange` logs
+`exchange client gate: route=socks5://127.0.0.1:10808` / `route=direct (…)`, every `[markets]` line carries
+its own route, `DASH_LIVE_SNAPSHOT_VIA_PROXY=false` moves the card off the tunnel, and
+`DASH_SYNC_PROXY=http://127.0.0.1:10809` moves the sync clients onto it — with the HTTP port, or an explicit
+warning that a SOCKS URL is being ignored.
+
 A restart gets the same treatment from the other side: a `load_markets()` is the
 slowest thing the dashboard does before it can draw a price (gate: a ~94 KB spot list and a
 ~1.3 MB swap list, in sequence, each under `DASH_MARKET_LOAD_TIMEOUT_SEC`), and one endpoint

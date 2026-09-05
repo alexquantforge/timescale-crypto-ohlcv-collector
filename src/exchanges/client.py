@@ -10,9 +10,22 @@ from config.settings import settings
 logger = logging.getLogger("exchange_client")
 
 
-def create_exchange(ccxt_id: str, proxy: Optional[str] = None) -> ccxt_async.Exchange:
+def create_exchange(ccxt_id: str, proxy: Optional[str] = None,
+                    use_proxy: bool = True) -> ccxt_async.Exchange:
     """
     Instantiates an asynchronous CCXT exchange client with rate-limiting and proxy settings.
+
+    `use_proxy=False` builds the client that goes straight to the endpoint. It
+    exists because `SOCKS5_PROXY` has a NON-EMPTY default (`socks5://127.0.0.1:10808`),
+    so "is gate loaded through the VPN?" was not answerable without reading this
+    function — and because the dashboard's synchronous clients (markets load,
+    tape, order book, gap stitching) cannot use that proxy at all: ccxt's sync path
+    hands a `socks5://` URL to `requests`, which needs PySocks, which is not a
+    dependency here (only `aiohttp_socks`/`python-socks` are). So until this round
+    the SAME dashboard could reach gate over two different routes — the metrics
+    card through the tunnel, everything else direct — and a difference in latency
+    between them looked like a difference in the exchange.
+    The route is therefore logged, not assumed.
     """
     exchange_class = getattr(ccxt_async, ccxt_id)
     config = {
@@ -20,9 +33,11 @@ def create_exchange(ccxt_id: str, proxy: Optional[str] = None) -> ccxt_async.Exc
         "timeout": 40000,
         "options": {},
     }
-    proxy_url = proxy or settings.socks5_proxy
+    proxy_url = proxy if proxy is not None else (settings.socks5_proxy if use_proxy else "")
     if proxy_url:
         config["socks_proxy"] = proxy_url
+    logger.info("exchange client %s: route=%s", ccxt_id,
+                proxy_url or "direct (no proxy: SOCKS5_PROXY is not used here)")
 
     exchange = exchange_class(config)
     # The collector reads public market data only: OHLCV, tickers, order books,

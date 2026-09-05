@@ -148,3 +148,34 @@ def test_option_markets_are_never_asked_for():
     okx = ccxt.okx()
     assert apply_market_type_trim(okx, skip="") == [], "the knob off = ccxt default"
     assert okx.options["fetchMarkets"]["types"] == ["spot", "future", "swap", "option"]
+
+
+def test_the_async_client_says_which_route_it_took(monkeypatch, caplog):
+    """`SOCKS5_PROXY` has a non-empty default, so "is gate loaded through the VPN?"
+    was a question about a line of code nobody had read. It is now a line in the
+    log — and the dashboard can ask for the other route explicitly, because the
+    sync half of the dashboard CANNOT use the tunnel (ccxt hands a `socks5://` URL
+    to requests, which needs PySocks; only aiohttp_socks is installed)."""
+    import logging
+
+    from config.settings import settings
+    from src.exchanges.client import create_exchange
+
+    monkeypatch.setattr(settings, "socks5_proxy", "socks5://127.0.0.1:10808",
+                        raising=False)
+    with caplog.at_level(logging.INFO, logger="exchange_client"):
+        via = create_exchange("gate")
+        direct = create_exchange("gate", use_proxy=False)
+    assert getattr(via, "socks_proxy", None) == "socks5://127.0.0.1:10808"
+    assert getattr(direct, "socks_proxy", None) in (None, ""), "use_proxy=False is real"
+    text = caplog.text
+    assert "gate: route=socks5://127.0.0.1:10808" in text, text
+    assert "gate: route=direct" in text, text
+
+
+def test_an_empty_socks5_proxy_means_direct_everywhere(monkeypatch):
+    from config.settings import settings
+    from src.exchanges.client import create_exchange
+
+    monkeypatch.setattr(settings, "socks5_proxy", "", raising=False)
+    assert getattr(create_exchange("gate"), "socks_proxy", None) in (None, "")

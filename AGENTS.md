@@ -180,6 +180,15 @@ requests, feeds untouched. A load that returns an EMPTY market list is a failure
 not a success — an empty dict reads as "loaded" and comes back as BadSymbol for
 every pair on that exchange.
 
+Two routes, one host: `SOCKS5_PROXY` (default `socks5://127.0.0.1:10808`) is used by
+the ASYNC clients only (engines, collector, and the dashboard's order-book card via
+`create_exchange`); the dashboard's SYNC clients cannot use a `socks5://` URL at all
+(`requests` needs `pysocks`, which is not a dependency), so they are direct whatever
+`.env` says. "gate is slow" and "gate works" were both true on one machine because
+they were measured on different paths — so any network number the dashboard prints
+must name its route (`_route_note`, `create_exchange`'s `route=` log), and any proxy
+setting that cannot be honoured is reported as ignored, never obeyed silently.
+
 A timeout longer than the operator's own measurement of the same endpoint is not
 a timeout problem — but check which measurement they actually made. The
 falsified version of this round's theory, recorded so it is not re-derived:
