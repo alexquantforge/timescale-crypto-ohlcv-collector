@@ -141,3 +141,35 @@ Patch discipline that has burned this repo:
 * A change to state persistence must be re-validated against *list convergence*,
   not only against unit tests: an optimisation that makes a degraded path
   reachable can blank the UI for a day.
+* Any pipeline hides its own exit code: `pytest -q | tail && git push` green-lights
+  a red suite, because `tail` succeeds. Read `${PIPESTATUS[0]}`, or the tail text.
+* A cached artifact may only be written by the real thing it stands in for. A
+  disk-seeded catalog that re-saves itself, or a listing persisted from a
+  previous file, silently converts "the exchange is broken" into "the cache is
+  the truth" — see `save_markets_snapshot` / `save_inventory_snapshot`, which are
+  called from the success path of a *network* read and a *pg_catalog* read only.
+* A disk cache read must be paired with a test that no request happened
+  (`test_a_cold_process_applies_the_disk_catalog_without_a_request`,
+  `test_a_cold_process_does_not_read_the_catalog_before_the_first_chunk`) and
+  with the age printed in the log line, never hidden.
+
+Market loading, the two facts that took four rounds:
+
+* `CCXT_MARKET_TYPES_SKIP=option` (default) removes whole market lists — trimming
+  is legitimate because it *removes requests*; gate loads spot+swap+future, bybit
+  dropped from 3429 to 1423 markets. It only touches `options['fetchMarkets']`
+  when that value's `types` is a LIST (bybit names perps `linear`; mexc's `types`
+  is a dict — leaving it alone is the point of the shape check).
+* `DASH_MARKET_LOAD_DEBUG=true` times each category after a failed load and prints
+  `[markets] gate: probe, 3 categories, 60s per request — spot ok …`. It is the
+  only tool that separates "the big list is slow" from "this connection is being
+  blackholed"; a `RequestTimeout` on one URL names the leg in flight, not the
+  costly one, because the legs are sequential under one per-request timeout. The
+  probe must leave the instance with NO markets and the original `fetchMarkets`
+  dict, or every later `market()` lookup reports a delisting.
+
+A timeout longer than the operator's own measurement of the same endpoint is not
+a timeout problem. `curl` answered gate's `/spot/currency_pairs` in 2.7-5.8s while
+ccxt hit the 60s per-request wall: the suspect is state inside the process (a
+reused session left half-read by an abandoned request), and the fix is to measure
+and to make the page survivable without the endpoint — not to add retries.
