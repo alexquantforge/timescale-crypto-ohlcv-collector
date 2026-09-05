@@ -193,9 +193,13 @@ Never tell the operator to `poetry add` a package on a working machine. `poetry 
 to `poetry.lock`, so anything that had drifted ahead of the lock is silently downgraded — that is exactly how
 a healthy environment got `aiohttp-socks 0.12.0 -> 0.8.4` and lost every exchange connection on the next start.
 Ask them to `poetry run pip install <pkg>` for the immediate unblock, declare the dependency in
-`pyproject.toml`, and let them reconcile with `poetry lock --no-update && poetry install` on their own
-schedule, when a re-resolve is safe. If a re-sync is unavoidable, say out loud that versions of *other*
-packages will move and give the one command that proves the important ones still import.
+`pyproject.toml`, and let them re-resolve the lock on their own schedule, when that is safe — and name the
+command by what it touches, because the flags move between Poetry versions (`poetry lock --no-update` does not
+exist in the operator's 2.x): `poetry update <pkg>` re-resolves ONE package into the lock (prefer it), plain
+`poetry lock` rebuilds the whole lock and never touches the venv, and `poetry install` is the only one that
+rewrites the venv — which is why it stays out of a "just fix this one thing" instruction. If a re-sync is
+unavoidable, say out loud that versions of *other* packages will move and give the one command that proves the
+important ones still import.
 
 `aiohttp-socks` is a floor, not a preference: `^0.8.4` in `pyproject.toml` was installable, and 0.8.4's
 `_wrap_create_connection(protocol_factory, host, port, …)` no longer matches what aiohttp 3.10+ calls, so a
