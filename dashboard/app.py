@@ -4305,6 +4305,172 @@ def _unique_sorted(values):
     return sorted(set(v for v in values if v))
 
 
+# ---------------------------------------------------------------------------
+# Growth filter (off by default). "Show only pairs whose price is up more than
+# X% from the lowest LOW of the last N days to the current CLOSE" — i.e. the
+# distance from the bottom to now. Computing it needs the candles of every
+# candidate table, so it is done in a background thread and cached process-wide;
+# the render path only READS the cache. When the toggle is off, nothing is
+# computed at all (the default).
+#
+# A pair can have both a 15m and a 1D table; we measure each table independently
+# on its own timeframe (the window `N days` is timestamped, so both agree on the
+# calendar window). `Timestamp` can be seconds or milliseconds (legacy tables),
+# so the cutoff is matched in both units.
+# ---------------------------------------------------------------------------
+_GROWTH_STATE: dict = _state("growth_state", dict)    # metrics/busy/total/done/days
+_GROWTH_LOCK = _state("growth_lock", threading.Lock)
+_GROWTH_LAST_DONE = _state("growth_last_done", dict)
+_GROWTH_TBL_RE = re.compile(r"[A-Za-z0-9_:]{1,96}")
+
+
+def _growth_sql(table_name: str, cutoff: int) -> str:
+    """One row per table: current close, and the lowest low over the window."""
+    tbl = table_name
+    if not _GROWTH_TBL_RE.fullmatch(tbl or ""):
+        return ""
+    return (
+        f'SELECT (SELECT "close" FROM "{tbl}" ORDER BY "Timestamp" DESC LIMIT 1) AS cur_close, '
+        f'(SELECT MIN("low") FROM "{tbl}" '
+        f'WHERE "Timestamp" >= {cutoff} OR ("Timestamp" >= 100000000000 '
+        f'AND "Timestamp" >= {cutoff * 1000})) AS min_low'
+    )
+
+
+def _growth_from_row(row) -> Optional[float]:
+    """growth % = (current close - lowest low) / lowest low * 100, else None."""
+    if not row:
+        return None
+    try:
+        cur = float(row.get("cur_close"))
+        mn = float(row.get("min_low"))
+    except (TypeError, ValueError):
+        return None
+    if cur <= 0 or mn <= 0:
+        return None
+    return (cur - mn) / mn * 100.0
+
+
+async def _growth_worker(tables, days, db_host, db_port, db_user, db_pass):
+    """Compute growth for every (db, table) and store it in `_GROWTH_STATE`."""
+    cutoff = int(time.time()) - int(days) * 86400
+    state = _GROWTH_STATE
+    metrics = state.setdefault("metrics", {})
+    state["total"] = len(tables)
+    state["done"] = 0
+    by_db: dict = {}
+    for db, tbl in tables:
+        by_db.setdefault(db, []).append(tbl)
+    for db, tbls in by_db.items():
+        try:
+            pool = await asyncpg.create_pool(
+                host=db_host, port=db_port, user=db_user, password=db_pass,
+                database=db, min_size=1, max_size=4, command_timeout=20, timeout=10,
+            )
+        except Exception as e:
+            _market_log_once(("growth-pool", db),
+                             f"[growth] {db}: cannot connect ({type(e).__name__}: {e})")
+            continue
+        sem = asyncio.Semaphore(4)
+
+        async def _one(tbl):
+            sql = _growth_sql(tbl, cutoff)
+            if not sql:
+                return
+            async with sem:
+                try:
+                    async with pool.acquire() as conn:
+                        row = await conn.fetchrow(sql)
+                    g = _growth_from_row(row)
+                except Exception as e:
+                    _market_log_once(("growth", db, tbl),
+                                     f"[growth] {db}.{tbl}: {type(e).__name__}: {e}")
+                    g = None
+            metrics[(db, tbl)] = (g, time.time())
+            with _GROWTH_LOCK:
+                state["done"] = int(state.get("done") or 0) + 1
+
+        await asyncio.gather(*[_one(t) for t in tbls])
+        await pool.close()
+    with _GROWTH_LOCK:
+        state["busy"] = False
+
+
+def _ensure_growth_started(tables, days, db_host, db_port, db_user, db_pass):
+    """Kick off the background growth computation once; never block the render."""
+    if not tables:
+        return
+    state = _GROWTH_STATE
+    with _GROWTH_LOCK:
+        if state.get("busy"):
+            return
+        state["busy"] = True
+        state["days"] = int(days)
+        state.setdefault("metrics", {})
+
+    def _run():
+        try:
+            asyncio.run(_growth_worker(tables, days, db_host, db_port, db_user, db_pass))
+        except BaseException as e:
+            print(f"[growth] background compute failed: {type(e).__name__}: {e}", flush=True)
+            with _GROWTH_LOCK:
+                _GROWTH_STATE["busy"] = False
+
+    threading.Thread(target=_run, daemon=True, name="growth").start()
+
+
+def _growth_metric(db_name, table_name):
+    e = (_GROWTH_STATE.get("metrics") or {}).get((db_name, table_name))
+    return e[0] if e else None
+
+
+def _filter_frames_by_growth(df_15m, df_1d, pct):
+    """Restrict the two summary frames to pairs whose growth >= pct (known so far)."""
+    metrics = _GROWTH_STATE.get("metrics") or {}
+
+    def _m(row):
+        g = metrics.get((row.get("db_name"), row.get("table_name")))
+        return bool(g and g[0] is not None and g[0] >= pct)
+
+    if not df_15m.empty:
+        df_15m = df_15m[df_15m.apply(_m, axis=1)]
+    if not df_1d.empty:
+        df_1d = df_1d[df_1d.apply(_m, axis=1)]
+    return df_15m, df_1d
+
+
+def _growth_progress():
+    state = _GROWTH_STATE
+    return int(state.get("done") or 0), int(state.get("total") or 0), bool(state.get("busy"))
+
+
+# Optional GROWTH filter from the Chart options (off by default): keep only the
+# pairs whose price is up more than X% from the lowest low of the last N days to
+# the current close. Off = no extra work at all. When on, the per-table growth is
+# computed in the BACKGROUND (see _ensure_growth_started) and cached; the render
+# path only reads the cache, and while the computation is still filling the pair
+# list is left half-filtered rather than blanked.
+_growth_on = bool(st.session_state.get("growth_filter", False))
+_growth_days = int(st.session_state.get("growth_days", 7) or 7)
+_growth_pct = float(st.session_state.get("growth_pct", 50.0) or 50.0)
+if _growth_on and not demo_mode:
+    _cand = []
+    for _df_ in (df_15m, df_1d):
+        if _df_.empty:
+            continue
+        for _, _r in _df_.iterrows():
+            if _r.get("db_name") and _r.get("table_name"):
+                _cand.append((_r["db_name"], _r["table_name"]))
+    if _cand:
+        _ensure_growth_started(_cand, _growth_days, db_host, db_port, db_user, db_pass)
+    _df15_g, _df1d_g = _filter_frames_by_growth(df_15m, df_1d, _growth_pct)
+    _g_done, _g_total, _g_busy = _growth_progress()
+    # While it is still computing and NOTHING is known yet, show the unfiltered
+    # list instead of an empty selector that reads as "no pairs matched".
+    if _g_busy and _g_done == 0 and (_df15_g.empty and _df1d_g.empty):
+        _df15_g, _df1d_g = df_15m, df_1d
+    df_15m, df_1d = _df15_g, _df1d_g
+
 # Optional pair filter from the Chart options: only tickers that have a 15m
 # table. Many pairs have a 1D table but no 15m data — with this enabled the
 # pair list and Prev/Next skip them. The flag itself lives in a checkbox
@@ -4392,6 +4558,14 @@ with tab_charts:
             help="OFF: compact — 15m left, 1D right. ON: large — 15m top, 1D bottom.",
         )
 
+    # --- Growth filter status (only when the toggle is on) -------------------
+    if _growth_on and not demo_mode:
+        _g_done, _g_total, _g_busy = _growth_progress()
+        _g_note = f"📈 Growth filter ON: {len(TICKER_OPTIONS)} pair(s) rose ≥ {_growth_pct:g}% over {_growth_days}d"
+        if _g_busy and _g_total:
+            _g_note += f" — computing {_g_done}/{_g_total}, list fills automatically"
+        st.caption(_g_note)
+
     # --- Chart options (collapsed by default to save vertical space) ---------
     with st.expander("⚙️ Chart options", expanded=False):
         opt1, opt2, opt3, opt4 = st.columns([2, 2, 2, 1])
@@ -4430,6 +4604,25 @@ with tab_charts:
             help="Pair list and Prev/Next skip tickers that only have a 1D table "
                  "(no 15m candles). Default OFF.",
         )
+        st.markdown("###### 📈 Growth filter (off by default)")
+        g1, g2, g3 = st.columns([3, 1, 1])
+        g1.checkbox(
+            "Enable — keep only pairs up > X% from the last N-day low",
+            value=False, key="growth_filter",
+            help="Show only the pairs whose distance from the LOWEST low of the "
+                 "last N days to the CURRENT close is more than X% (bottom→now "
+                 "rise). The percentages are computed from the stored candles in "
+                 "a background thread and cached; while it is still building, the "
+                 "pair list fills in automatically. Off by default.",
+        )
+        g2.number_input("N days", min_value=1, max_value=365, value=7, step=1,
+                        key="growth_days",
+                        help="Trailing days of the lowest-low window (both 15m and "
+                             "1D tables, by timestamp).")
+        g3.number_input("X %", min_value=0.0, max_value=100000.0, value=50.0, step=5.0,
+                        key="growth_pct",
+                        help="Minimum rise (percent) from the last N-day low to the "
+                             "current close.")
 
     # Resolve table rows per timeframe (same exchange preferred)
     row_15m = find_table_row(df_15m, sym_ticker, sym_ex)
@@ -4990,6 +5183,22 @@ with tab_charts:
             _auto_reload.armed = True
 
         st.fragment(run_every=60.0)(_auto_reload)()
+
+    # --- Growth filter: keep re-painting the pair list while it fills --------
+    # The per-table growth is computed in the background (see _ensure_growth_started).
+    # A rerun reads the freshest cache; without a kick the list would only refresh
+    # on a manual interaction or the 60 s auto-reload. This fragment reruns the
+    # app scope once per progress advance so the pair list converges on its own.
+    if _growth_on and not demo_mode and hasattr(st, "fragment"):
+        @st.fragment(run_every=4.0)
+        def _growth_progress_fragment():
+            _g_done, _g_total, _g_busy = _growth_progress()
+            _last = _GROWTH_LAST_DONE.get("done", -1)
+            if _g_busy and _g_done != _last:
+                _GROWTH_LAST_DONE["done"] = _g_done
+                st.rerun(scope="app")
+
+        _growth_progress_fragment()
 
 with tab_liquidity:
     col1, col2, col3, col4, col5 = st.columns(5)
