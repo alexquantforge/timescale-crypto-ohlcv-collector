@@ -2378,13 +2378,24 @@ def _live_wait_text(ccxt_id: str) -> str:
 
 
 def _render_live_panel(ticker: str, exchange: str, demo: bool, db_name: str = None,
-                       atr_label: str = ""):
+                       atr_label: str = "", db_row: Optional[dict] = None):
     """One-line LIVE chips: price, bid/ask, spread, 24h change.
 
     Reads the live row the background daemon keeps writing to TimescaleDB
-    every second; falls back to a direct exchange ticker fetch only when the
-    DB row is missing/stale.
+    every second; falls back to the background feed thread's last ticker, and
+    — only when BOTH are silent (the exchange has not answered once yet, so no
+    live price can exist on this paint) — to the pair's own last STORED price,
+    labelled as "last saved" rather than live.
+
+    The label is the whole point. A stored CLOSE is not a live tick, and
+    showing it under a LIVE badge would be exactly the lie this app keeps
+    removing: the LIVE line is the *last trade*, never a mid, and a stored
+    value is a different fact. So it is painted in amber with "(not live)"
+    and swapped for the real tick the moment the writer/feed answers. The old
+    "waiting for the first tick" caption is still what appears when there is
+    nobody to answer AND no stored price either (a genuinely new table).
     """
+    is_live = True
     if demo:
         import random as _random
         key = f"demo_px_{ticker}_{exchange}"
@@ -2412,8 +2423,30 @@ def _render_live_panel(ticker: str, exchange: str, demo: bool, db_name: str = No
             # instead of fetching here, so a pair switch never pays a ticker
             # round trip before the first paint.
             data = _feed_value("ticker", ccxt_id, ticker)
+        if not data:
+            # Neither the live row nor the feed has produced a tick yet. Paint
+            # the pair's last stored CLOSE and SAY it is not live, instead of a
+            # bare "waiting for the first tick" that reads as a dead pair (the
+            # case the operator hit on 1000000BABYDOGE @bybit, ~20s of waiting
+            # while the first exchange round trip ran behind a busy DB scan and
+            # a stale market-list reload). The live value replaces it within a
+            # second of the writer/feed answering; until then this is honest.
+            _last = _finite((db_row or {}).get("close")) if db_row else None
+            if _last is not None:
+                data = {
+                    "last": _last,
+                    "bid": _finite((db_row or {}).get("ob_best_bid")) if db_row else None,
+                    "ask": _finite((db_row or {}).get("ob_best_ask")) if db_row else None,
+                    "pct": None,
+                }
+                is_live = False
+                _market_log_once(
+                    ("live-stored", ccxt_id, ticker),
+                    f"[live] {ticker}: no live tick yet (writer/feed still fetching) — "
+                    f"painting the last stored CLOSE labelled 'last saved (not live)'",
+                )
 
-    html = _live_line_html(data, atr_label)
+    html = _live_line_html(data, atr_label, is_live=is_live)
     if not html:
         st.caption(_live_wait_text(ccxt_id if not demo else ""))
         return
@@ -2429,7 +2462,7 @@ def _finite(v):
     return f if f == f and abs(f) != float("inf") else None
 
 
-def _live_line_html(data: dict, atr_label: str = "") -> str:
+def _live_line_html(data: dict, atr_label: str = "", is_live: bool = True) -> str:
     """Compose the one-line LIVE chips (price · bid/ask · spread · 24h change).
 
     Every part is optional and non-finite counts as missing, because that is what
@@ -2440,13 +2473,26 @@ def _live_line_html(data: dict, atr_label: str = "") -> str:
     different set of metrics (depth from the orderbook, spread against the daily
     ATR), so the two are allowed to disagree ONLY when they are different metrics,
     never when one of them could have been computed from the same numbers.
+
+    `is_live=False` paints the pair's last STORED value, in amber, with an
+    explicit "(not live)" note and an explanatory tooltip — so a stale stored
+    CLOSE can never pass itself off as a live tick.
     """
     last = _finite((data or {}).get("last"))
     if last is None:
         return ""
     bid = _finite(data.get("bid"))
     ask = _finite(data.get("ask"))
-    parts = [f"<b style='color:#42a5f5;'>🔴 LIVE ${last:.6g}</b>"]
+    if is_live:
+        head = f"<b style='color:#42a5f5;'>🔴 LIVE ${last:.6g}</b>"
+    else:
+        head = (
+            f"<b style='color:#ffb74d;'>🟠 last saved ${last:.6g}"
+            f"<span title=\"the last CLOSE stored in TimescaleDB for this pair, "
+            f"not a live tick — it is replaced by the live price as soon as the "
+            f"background feed answers\"> (not live)</span></b>"
+        )
+    parts = [head]
     if bid and ask:
         parts.append(f" &nbsp;·&nbsp; bid {bid:.6g} / ask {ask:.6g}")
         abs_sp = ask - bid
@@ -4448,12 +4494,13 @@ with tab_charts:
         @st.fragment(run_every=live_interval)
         def _live_fragment():
             _render_live_panel(sym_ticker, sym_ex, demo_mode, db_name=live_db,
-                               atr_label=_live_lbl)
+                               atr_label=_live_lbl, db_row=row_1d or row_15m)
 
         _live_fragment()
     else:
         _render_live_panel(sym_ticker, sym_ex, demo_mode, db_name=live_db,
-                           atr_label=format_atr_label("1D", atr_days))
+                           atr_label=format_atr_label("1D", atr_days),
+                           db_row=row_1d or row_15m)
 
     def _render_stitch_caption(stitch_txt: str) -> None:
         # Always render the stitch caption line at a fixed height (empty when
