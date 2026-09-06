@@ -4444,6 +4444,33 @@ def _growth_progress():
     return int(state.get("done") or 0), int(state.get("total") or 0), bool(state.get("busy"))
 
 
+def _growth_pct_done() -> float:
+    """0..1 fraction of the candidate pairs whose growth has been computed."""
+    done, total, _ = _growth_progress()
+    if not total:
+        return 0.0
+    return min(1.0, float(done) / float(total))
+
+
+def _render_growth_status(n_shown: int, already_done: bool = False) -> None:
+    """Caption + progress bar for the growth filter (only when the toggle is on).
+
+    `already_done` lets the fragment reprint the same status without a full app
+    rerun; the fragment below actually reruns the app scope whenever `done`
+    advances, so the bar is redrawn with the freshest counters on each step.
+    """
+    _g_done, _g_total, _g_busy = _growth_progress()
+    _frac = _growth_pct_done()
+    _head = f"📈 Growth filter ON: {n_shown} pair(s) rose ≥ {_growth_pct:g}% over {_growth_days}d"
+    if _g_busy and _g_total:
+        _rem = max(0.0, 100.0 - _frac * 100.0)
+        _head += f" — computing {_g_done}/{_g_total} pairs ({_frac * 100.0:.0f}% done, {_rem:.0f}% left); list fills automatically"
+    st.caption(_head)
+    if _g_total:
+        st.progress(_frac, text=f"{_frac * 100.0:.0f}% — growth computed for {_g_done} of {_g_total} pairs",)
+
+
+
 # Optional GROWTH filter from the Chart options (off by default): keep only the
 # pairs whose price is up more than X% from the lowest low of the last N days to
 # the current close. Off = no extra work at all. When on, the per-table growth is
@@ -4560,11 +4587,7 @@ with tab_charts:
 
     # --- Growth filter status (only when the toggle is on) -------------------
     if _growth_on and not demo_mode:
-        _g_done, _g_total, _g_busy = _growth_progress()
-        _g_note = f"📈 Growth filter ON: {len(TICKER_OPTIONS)} pair(s) rose ≥ {_growth_pct:g}% over {_growth_days}d"
-        if _g_busy and _g_total:
-            _g_note += f" — computing {_g_done}/{_g_total}, list fills automatically"
-        st.caption(_g_note)
+        _render_growth_status(len(TICKER_OPTIONS))
 
     # --- Chart options (collapsed by default to save vertical space) ---------
     with st.expander("⚙️ Chart options", expanded=False):

@@ -84,3 +84,18 @@ def test_filter_frames_by_growth_empty_when_off():
             dapp._GROWTH_STATE.pop("metrics", None)
         else:
             dapp._GROWTH_STATE["metrics"] = original
+
+
+def test_growth_pct_done(monkeypatch):
+    """The fraction the progress bar is filled to: done / total, capped at 1.0."""
+    monkeypatch.setattr(dapp, "_GROWTH_STATE", {"done": 0, "total": 0})
+    assert dapp._growth_pct_done() == 0.0        # unknown -> 0, never a division error
+
+    monkeypatch.setattr(dapp, "_GROWTH_STATE", {"done": 5, "total": 20})
+    assert abs(dapp._growth_pct_done() - 0.25) < 1e-9
+
+    monkeypatch.setattr(dapp, "_GROWTH_STATE", {"done": 20, "total": 20})
+    assert dapp._growth_pct_done() == 1.0        # complete -> full bar
+
+    monkeypatch.setattr(dapp, "_GROWTH_STATE", {"done": 30, "total": 20})
+    assert dapp._growth_pct_done() == 1.0        # never overflow past 100%
