@@ -19,6 +19,9 @@ venv*/
 .cache/
 .pytest_cache/
 
+# swap_watch diagnostic output
+swap_watch.csv
+
 # IDE
 .idea/
 .vscode/
