@@ -49,6 +49,11 @@ from src.core.priority_pairs import (
     mark_lane_service,
     read_priority_pairs,
 )
+from src.utils.memory import (
+    release_memory,
+    setup_malloc_trim,
+    memory_release_loop,
+)
 from pytz import timezone as pytz_timezone
 
 from config.settings import Settings, settings
@@ -1666,23 +1671,10 @@ async def get_persistent_exchange(ccxt_name: str):
     return ex
 
 
-def release_memory() -> None:
-    """Return freed heap arenas to the OS after a cycle. Python's allocator
-    ratchets RSS to the cycle peak and NEVER hands it back on its own — that
-    ratchet is what filled RAM + swap over hours. gc + malloc_trim(0) gives
-    it back on Linux; a harmless no-op elsewhere."""
-    try:
-        import gc
-
-        gc.collect()
-    except Exception:
-        pass
-    try:
-        import ctypes
-
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception:
-        pass
+# `release_memory` is imported from src.utils.memory (the shared helper) — the
+# local definition that used to live here was the one-shot end-of-cycle trim.
+# The background `memory_release_loop` (started in main_15m_loop) now runs it
+# periodically DURING the sweep and the idle sleep, not only after a full cycle.
 
 
 _PROXY_CLASH = {"told": False}
@@ -2066,6 +2058,11 @@ async def main_15m_loop():
     # sweep gives every pair a slow full refresh (~40 min at 7.5k pairs), the
     # lane keeps the ≤12 pairs the dashboard is showing second-fresh.
     lane_task = asyncio.create_task(priority_lane_loop(), name="priority-lane")
+    # Periodic heap trimming beside the lane: frees pages during the cycle and
+    # during the idle sleep so RSS+swap never ratchet up over hours (the
+    # one-shot release_memory() at end-of-cycle was too late).
+    setup_malloc_trim()
+    mem_task = asyncio.create_task(memory_release_loop(), name="memory-release")
 
     global GLOBAL_PROGRESS
     while True:
@@ -2074,6 +2071,11 @@ async def main_15m_loop():
             if exc is not None:
                 log(f"  [LANE] ⚠️ lane task died ({type(exc).__name__}: {exc}) — restarting")
             lane_task = asyncio.create_task(priority_lane_loop(), name="priority-lane")
+        if mem_task.done() and not mem_task.cancelled():
+            exc = mem_task.exception()
+            if exc is not None:
+                log(f"  [MEM] ⚠️ memory-release task died ({type(exc).__name__}: {exc}) — restarting")
+            mem_task = asyncio.create_task(memory_release_loop(), name="memory-release")
 
         if not active_exchanges:
             log(

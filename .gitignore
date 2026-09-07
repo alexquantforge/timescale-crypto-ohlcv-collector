@@ -8,6 +8,8 @@ env/
 venv/
 ENV/
 .venv/
+tools-env/
+venv*/
 
 # Environment variables
 .env

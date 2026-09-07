@@ -33,6 +33,11 @@ from src.core.oi_funding import (
     write_oi_funding_snapshot,
 )
 from src.utils.timeouts import hard_wait_for
+from src.utils.memory import (
+    release_memory,
+    setup_malloc_trim,
+    memory_release_loop,
+)
 from src.db.connection import get_db_pools, close_all_db_pools
 from src.core.history_prefill import (
     extract_older_rows,
@@ -309,22 +314,12 @@ async def get_persistent_exchange(ccxt_id: str, ccxt_name: str):
     return ex
 
 
-def release_memory() -> None:
-    """Return freed heap arenas to the OS after a cycle: gc + malloc_trim(0).
-    Python's allocator ratchets RSS to the cycle peak and never returns it on
-    its own — that ratchet is what filled RAM + swap over hours."""
-    try:
-        import gc
-
-        gc.collect()
-    except Exception:
-        pass
-    try:
-        import ctypes
-
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception:
-        pass
+# `release_memory` is imported from src.utils.memory (the shared helper) — the
+# local definition that used to live here was the one-shot end-of-cycle trim;
+# the background `memory_release_loop` below now runs it periodically so freed
+# pages are handed back DURING a long cycle and the idle sleep, not only after a
+# full cycle. `setup_malloc_trim` is idempotent and lowers glibc's trim
+# threshold once per process.
 
 
 class MarketDataEngine:
@@ -1127,10 +1122,17 @@ class MarketDataEngine:
     async def start_loop(self) -> None:
         """Starts continuous execution loop."""
         await self.initialize()
+        setup_malloc_trim()
         # Lane runs forever beside the sweep; a crash in it is logged and the
         # task restarted, it must never stop the collector.
         lane_task = asyncio.create_task(
             self.priority_lane_loop(), name=f"priority-lane-{self.timeframe}"
+        )
+        # Periodic heap trimming beside the lane: frees pages during the cycle
+        # and during the idle sleep so RSS+swap never ratchet up over hours
+        # (the one-shot release_memory() at end-of-cycle was too late).
+        mem_task = asyncio.create_task(
+            memory_release_loop(), name=f"memory-release-{self.timeframe}"
         )
         interval = (
             settings.update_interval_seconds_15m
@@ -1147,6 +1149,16 @@ class MarketDataEngine:
                     )
                 lane_task = asyncio.create_task(
                     self.priority_lane_loop(), name=f"priority-lane-{self.timeframe}"
+                )
+            if mem_task.done() and not mem_task.cancelled():
+                exc = mem_task.exception()
+                if exc is not None:
+                    logger.warning(
+                        f"[{self.timeframe.upper()}] [MEM] task died "
+                        f"({type(exc).__name__}: {exc}) — restarting"
+                    )
+                mem_task = asyncio.create_task(
+                    memory_release_loop(), name=f"memory-release-{self.timeframe}"
                 )
             try:
                 await self.run_cycle()
