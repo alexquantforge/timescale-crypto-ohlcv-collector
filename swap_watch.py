@@ -20,9 +20,15 @@ USAGE
     python swap_watch.py --interval 5               # sample every 5 s
     python swap_watch.py --interval 60 --max 120    # 120 samples (~2 h) then stop
     python swap_watch.py --out ./swap_watch.csv     # write CSV here (default)
-    python swap_watch.py --top 25                   # log only top-N processes by swap
-    python swap_watch.py --group                    # 1 row per family instead of 1 per pid
+    python swap_watch.py --detail 0                 # print EVERY process to the terminal
+    python swap_watch.py --detail 30                # print top 30 by swap to the terminal
+    python swap_watch.py --top 25                   # log only top-N processes by swap (CSV)
+    python swap_watch.py --group                    # 1 row per family instead of 1 per pid (CSV)
     python swap_watch.py --summary 5                # print a delta summary every 5 samples
+
+The terminal gets BOTH a detailed per-process table (pid, comm, RSS, swap, % of
+system swap, command) and the family totals, refreshed every tick; the CSV holds
+the full long-run history for trend analysis.
 
 EXIT AND WATCH
 --------------
@@ -174,6 +180,86 @@ def _fmt_kb(kb: int) -> str:
     return f"{kb} KB"
 
 
+def _pct(part: int, whole: int) -> str:
+    """Percent of `whole` that `part` is; '0%' for negligible but non-zero."""
+    if whole <= 0:
+        return "--"
+    p = part / whole * 100.0
+    if p >= 99.9:
+        return "100%"
+    if p < 0.05:
+        return "<0.1%"
+    return f"{p:.1f}%"
+
+
+def _short_cmd(cmd: str, width: int = 60) -> str:
+    cmd = (cmd or "").strip()
+    if len(cmd) <= width:
+        return cmd
+    return cmd[: width - 3] + "..."
+
+
+def _print_detail(rows: list[dict], limit: int) -> None:
+    """Print the top-by-swap processes as an aligned, readable table.
+
+    `limit=0` prints everything; otherwise only the `limit` rows that use the
+    most swap (ties broken by RSS). Zero-rss kernel threads are dropped — they
+    are noise on a memory hunt.
+    """
+    shown = [r for r in rows if r["swap_kb"] > 0 or r["rss_kb"] > 0]
+    if not shown:
+        print("    (no process has a non-zero footprint)")
+        return
+    shown.sort(key=lambda r: (r["swap_kb"], r["rss_kb"]), reverse=True)
+    if limit and len(shown) > limit:
+        shown = shown[:limit]
+
+    total_swap = sum(r["swap_kb"] for r in rows)
+    total_rss = sum(r["rss_kb"] for r in rows)
+
+    fams = [r["family"] for r in shown]
+    pids = [str(r["pid"]) for r in shown]
+    comms = [r["comm"] for r in shown]
+    rss = [_fmt_kb(r["rss_kb"] * 1024) for r in shown]
+    swap = [_fmt_kb(r["swap_kb"] * 1024) for r in shown]
+    pcts = [_pct(r["swap_kb"], total_swap) for r in shown]
+    cmds = [_short_cmd(r["cmd"]) for r in shown]
+
+    w_fam = max(10, max(len(x) for x in fams))
+    w_pid = max(5, max(len(x) for x in pids))
+    w_com = max(8, max(len(x) for x in comms))
+    w_rss = max(9, max(len(x) for x in rss))
+    w_sw = max(9, max(len(x) for x in swap))
+    w_pct = max(5, max(len(x) for x in pcts))
+
+    hdr = (f"  {'FAMILY':<{w_fam}}  {'PID':>{w_pid}}  {'COMM':>{w_com}}  "
+           f"{'RSS':>{w_rss}}  {'SWAP':>{w_sw}}  {'%SWAP':>{w_pct}}  CMD")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for i in range(len(shown)):
+        print(f"  {fams[i]:<{w_fam}}  {pids[i]:>{w_pid}}  {comms[i]:>{w_com}}  "
+              f"{rss[i]:>{w_rss}}  {swap[i]:>{w_sw}}  {pcts[i]:>{w_pct}}  {cmds[i]}")
+    if limit and len(shown) >= limit:
+        more = sum(1 for r in rows if r["swap_kb"] > 0 or r["rss_kb"] > 0) - len(shown)
+        if more > 0:
+            print(f"  ... and {more} more process(es) (use --detail 0 to show all)")
+
+
+def _print_groups(rows: list[dict]) -> None:
+    """Family totals, largest swap first."""
+    groups = _group(rows)
+    if not groups:
+        print("    (no groups)")
+        return
+    print("  ---- family totals ----")
+    for fam, g in sorted(groups.items(), key=lambda kv: -kv[1]["swap_kb"]):
+        if g["swap_kb"] <= 0 and g["rss_kb"] <= 0:
+            continue
+        print(f"    {fam:<24} {g['pids']:>3} proc   "
+              f"rss={_fmt_kb(g['rss_kb'] * 1024):>10}   "
+              f"swap={_fmt_kb(g['swap_kb'] * 1024):>10}")
+
+
 def _human_time(sec: float) -> str:
     h, rem = divmod(int(sec), 3600)
     m, s = divmod(rem, 60)
@@ -192,9 +278,11 @@ def _parse_args(argv=None):
     p.add_argument("--out", default="swap_watch.csv",
                    help="CSV output path (append mode)")
     p.add_argument("--top", type=int, default=0,
-                   help="log only the top-N processes by swap (0 = all)")
+                   help="log only the top-N processes by swap in the CSV (0 = all)")
+    p.add_argument("--detail", type=int, default=15,
+                   help="print this many top-by-swap processes to the terminal (0 = all)")
     p.add_argument("--group", action="store_true",
-                   help="log one row per family, not one per pid")
+                   help="write one row per family to the CSV, not one per pid")
     p.add_argument("--summary", type=int, default=0,
                    help="print a delta summary every N samples")
     return p.parse_args(argv)
@@ -214,7 +302,8 @@ def main(argv=None) -> int:
 
     print(f"swap_watch: writing to {args.out}  (interval={args.interval:g}s, "
           f"{'forever' if not args.max else args.max} sample(s), "
-          f"{'grouped' if args.group else 'per-pid'})", file=sys.stderr)
+          f"{'grouped' if args.group else 'per-pid'} CSV; "
+          f"terminal detail=top{args.detail})", file=sys.stderr)
     print("Swap will be reported per process (VmSwap). Watch for a family whose "
           "swap_kb trends UP.", file=sys.stderr)
 
@@ -267,19 +356,17 @@ def main(argv=None) -> int:
                     })
             out_fh.flush()
 
-            # Console line every tick
+            # --- Terminal output (detailed) ---------------------------------
             used = used_kb * 1024
-            line = (f"[{sample_no}] swap used={_fmt_kb(used)} "
-                    f"| sampled RSS={_fmt_kb(total_rss * 1024)} "
-                    f"sampled swap={_fmt_kb(total_swap * 1024)}")
-            print(line)
-            for fam, g in sorted(_group(rows).items(),
-                                 key=lambda kv: -kv[1]["swap_kb"]):
-                if g["swap_kb"] <= 0 and g["rss_kb"] <= 0:
-                    continue
-                print(f"    {fam:<12} ({g['pids']:>3} proc) "
-                      f"rss={_fmt_kb(g['rss_kb']*1024):>10} "
-                      f"swap={_fmt_kb(g['swap_kb']*1024):>10}")
+            ts_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(
+                f"\n[#{sample_no}] {ts_local}  "
+                f"swap used={_fmt_kb(used)}  "
+                f"(sampled of {len(rows)} proc: RSS={_fmt_kb(total_rss * 1024)}, "
+                f"swap={_fmt_kb(total_swap * 1024)})"
+            )
+            _print_detail(rows, args.detail)
+            _print_groups(rows)
 
             # Delta summary every N samples
             if args.summary and sample_no % args.summary == 0 and sample_no > 1:
