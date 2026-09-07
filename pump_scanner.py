@@ -27,11 +27,16 @@ PUMP SCANNER — поиск быстрых пампов (кросс-биржев
 
   4. КРОСС-БИРЖЕВОЕ ПОДТВЕРЖДЕНИЕ (REQUIRE_ALL_EXCHANGES=True):
      монета попадает в отчёт, только если памп + условие «до пампа»
-     выполняются на ВСЕХ биржах, где она есть в базе (монета может быть
-     свежей на одной бирже и с историей на других — на каждой проверка
-     идёт по её доступной истории). Пики на разных биржах должны лежать
-     в пределах PEAK_ALIGN_DAYS друг от друга (это один и тот же памп).
-     MIN_EXCHANGES задаёт минимум бирж, чтобы монету вообще рассматривать.
+     выполняются на ВСЕХ биржах, где она есть в базе. По умолчанию
+     REQUIRE_ALL_EXCHANGES=False — достаточно, чтобы памп был на тех
+     биржах, где монета РЕАЛЬНО торгуется (минимум MIN_EXCHANGES).
+     Пики на разных биржах должны лежать в пределах PEAK_ALIGN_DAYS
+     друг от друга (это один и тот же памп). MIN_EXCHANGES задаёт
+     минимум бирж, чтобы монету вообще рассматривать.
+
+  4b. Фильтр «мёртвых» стаканов (MIN_OB_VITALITY="C"): в отчёт идут только
+     монеты с живостью стакана A/B/C. D/F и отсутствие OB отсеиваются
+     (памп по неликвиду нереализуем). ""/None — фильтр выключен.
 
   5. Отчёт: одна строка на МОНЕТУ (группа бирж) печатается в консоль, а все
      результаты сохраняются в TimescaleDB (база RESULTS_DB):
@@ -54,6 +59,9 @@ PUMP SCANNER — поиск быстрых пампов (кросс-биржев
     python3 pump_scanner.py --exchanges bybit,okx    # только эти биржи
     python3 pump_scanner.py --price-source high_low  # по фитилям
     python3 pump_scanner.py --no-save-to-db          # только консоль
+    python3 pump_scanner.py --min-vitality C         # отсев «мёртвых» стаканов (A/B/C)
+    python3 pump_scanner.py --min-history-days 0.1   # ловить и вчерашние запуски
+    python3 pump_scanner.py --no-require-all-exchanges --min-exchanges 2
     python3 pump_scanner.py --help
 
 Креды БД берутся из config/settings (тот же .env, что у апдейтеров), поэтому
@@ -99,8 +107,8 @@ PRE_PUMP_BELOW_PEAK_FACTOR: float = 1.0
 #     1.1  -> допустить, что до пампа цена была чуть выше «нынешнего пика».
 
 # --- Кросс-биржевое подтверждение ---
-REQUIRE_ALL_EXCHANGES: bool = True   # условие (памп + «до пампа») должно выполняться
-                                     # на ВСЕХ биржах, где монета есть в базе.
+REQUIRE_ALL_EXCHANGES: bool = False  # False (по умолчанию): памп должен быть на тех биржах,
+                                     # где монета РЕАЛЬНО торгуется; НЕ обязательно на всех.
 MIN_EXCHANGES: int = 1               # минимум бирж с данными по монете, чтобы её рассматривать
                                      # (2 = только монеты, торгующиеся минимум на 2 биржах).
 PEAK_ALIGN_DAYS: Optional[float] = 2.0
@@ -160,7 +168,8 @@ MIN_HISTORY_BARS: Optional[int] = None   # порог «новой» монет�
 # --- Новые монеты (короткая история) ---
 SCAN_SHORT_HISTORY: bool = True          # True: монеты с историей короче MIN_HISTORY_BARS тоже
                                          # сканируются (окна ужимаются до доступной истории).
-SHORT_MIN_HISTORY_DAYS: float = 0.5      # минимальная история, при которой монету вообще смотрим.
+SHORT_MIN_HISTORY_DAYS: float = 0.1      # минимальная история, при которой монету вообще смотрим
+                                         # (0.1 — ловим и вчерашние запуски: 1-2 бара).
 
 # --- Склейка соседних детекций ---
 MERGE_GAP_DAYS: float = 5.0      # детекции одного пампа ближе этого зазора = одно событие.
@@ -196,6 +205,10 @@ COLORIZE_OB_LINES: bool = True
 OB_SPREAD_ATR_BAD_PCT: float = 5.0   # спред хуже этой доли дневного ATR → красный
 OB_LIQ_BAD_USD: float = 500.0        # глубина стакана ниже — красная зона
 OB_LIQ_GOOD_USD: float = 50_000.0    # глубина выше — зелёная зона
+# --- Фильтр «мёртвых» стаканов ---
+# A/B/C проходят; D/F и отсутствие OB отсеиваются («мёртвый» стакан = неликвид,
+# памп по нему нереализуем). "" или None = фильтр выключен.
+MIN_OB_VITALITY: Optional[str] = "C"
 RESULTS_DB: str = "pump_scanner_results"   # база для результатов (создаётся автоматически).
 SAVE_TO_DB: bool = True          # False — только консоль, без записи в БД.
 WIPE_PREVIOUS_RUNS: bool = True  # True — перед записью нового прогона очистить таблицы результатов
@@ -457,6 +470,19 @@ def cfmt(text: str, goodness: Optional[float]) -> str:
         return text
     i = int(round(_clamp01(float(goodness)) * (len(_ANSI_GOODNESS) - 1)))
     return f"{_ANSI_GOODNESS[i]}{text}{_ANSI_RESET}"
+
+
+def min_ob_vitality_ok(grade: Optional[str]) -> bool:
+    """True, если грейд живости стакана проходит фильтр MIN_OB_VITALITY.
+
+    A/B/C — «живой» стакан (A лучший). D/F и отсутствие/пустой грейд — «мёртвый».
+    При выключенном фильтре (MIN_OB_VITALITY пустой/None) пропускаем всех.
+    """
+    if not MIN_OB_VITALITY:
+        return True
+    if not grade:
+        return False
+    return grade.strip().upper() <= MIN_OB_VITALITY.upper()
 
 
 def _score_lerp(v: float, bad: float, good: float) -> float:
@@ -1254,6 +1280,7 @@ def config_snapshot() -> Dict[str, Any]:
         "INCLUDE_SPOT": INCLUDE_SPOT,
         "INCLUDE_SWAP": INCLUDE_SWAP,
         "EXCHANGES_INCLUDE": sorted(EXCHANGES_INCLUDE) if EXCHANGES_INCLUDE else None,
+        "MIN_OB_VITALITY": MIN_OB_VITALITY,
         "DB_NAMES": list(DB_NAMES),
     }
 
@@ -1456,12 +1483,28 @@ async def scan_one_table(db_name: str, pool: asyncpg.Pool, tbl: str,
         out.append(ev)
 
     # Один снимок стакана на таблицу — прикрепляем ко всем отквалифицированным
-    # событиям (для консольного отчёта: ссылки + OB-характеристики).
-    if out and PRINT_EVENT_DETAILS:
+    # событиям (для консольного отчёта: ссылки + OB-характеристики) и/или
+    # используем для фильтра «мёртвых» стаканов (MIN_OB_VITALITY).
+    ob = None
+    if out and (PRINT_EVENT_DETAILS or MIN_OB_VITALITY):
         ob = await fetch_ob_snapshot(pool, tbl)
-        if ob is not None:
+
+    if MIN_OB_VITALITY:
+        ob_grade = (ob or {}).get("ob_vitality_grade")
+        if not min_ob_vitality_ok(ob_grade):
+            # Мёртвый стакан (D/F) или OB не записан/нет колонок — события
+            # такого пампа нереализуемы, в отчёт не идут.
+            stats["filtered_ob_dead"] += len(out)
+            out = []
+        elif ob is not None:
             for ev in out:
-                ev["ob"] = ob
+                ev["ob_vitality_grade"] = ob_grade
+                ev["ob_vitality_score"] = ob.get("ob_vitality_score")
+                ev["ob_is_barcode"] = ob.get("ob_is_barcode")
+
+    if out and PRINT_EVENT_DETAILS and ob is not None:
+        for ev in out:
+            ev["ob"] = ob
 
     # --- Сравнение порогов пампа: сканируем эту же таблицу на доп. порогах ---
     # (те же фильтры: санити/до-пампа/возраст). Сохраняем только лёгкие поля.
@@ -1543,6 +1586,8 @@ async def main() -> None:
         f"MIN_EXCHANGES={MIN_EXCHANGES}, PEAK_ALIGN_DAYS={PEAK_ALIGN_DAYS}")
     log(f"  Новые монеты: SCAN_SHORT_HISTORY={SCAN_SHORT_HISTORY} "
         f"(мин. история {SHORT_MIN_HISTORY_DAYS} дн)")
+    ob_filter = f"живость стакана >= {MIN_OB_VITALITY}" if MIN_OB_VITALITY else "без фильтра стакана"
+    log(f"  Стакан: {ob_filter}")
     log(f"  Базы: {', '.join(DB_NAMES)} | таймфрейм: {BAR_MINUTES}m")
     log("=" * 78)
 
@@ -1559,6 +1604,7 @@ async def main() -> None:
         "tables_total": 0, "scanned": 0, "too_short": 0, "errors": 0,
         "skipped_filter": 0, "raw_events": 0, "filtered_prepump": 0,
         "filtered_age": 0, "filtered_data_sanity": 0, "done": 0, "cpu_ms": 0, "short_history": 0,
+        "filtered_ob_dead": 0,
     }
 
     sem = asyncio.Semaphore(DB_CONCURRENCY)
@@ -1620,7 +1666,8 @@ async def main() -> None:
         f"мало истории: {stats['too_short']}, ошибок чтения: {stats['errors']}, "
         f"пропущено фильтрами: {stats['skipped_filter']}).")
     log(f"Сырых детекций: {stats['raw_events']} | отсеяно: до-пампа={stats['filtered_prepump']}, "
-        f"возраст={stats['filtered_age']}, мусор данных={stats['filtered_data_sanity']}; "
+        f"возраст={stats['filtered_age']}, мусор данных={stats['filtered_data_sanity']}, "
+        f"мёртвый стакан={stats['filtered_ob_dead']}; "
         f"кросс-биржа: мин.бирж={rej['min_exch']}, "
         f"не на всех биржах={rej['not_all']}, рассинхрон пиков={rej['align']}.")
     log(f"ИТОГО монет в отчёте: {len(coins)}")
@@ -1776,10 +1823,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Минимум бирж с данными по монете")
     p.add_argument("--require-all-exchanges", dest="require_all", action="store_true",
                    default=REQUIRE_ALL_EXCHANGES,
-                   help="Памп+«до пампа» должны быть на ВСЕХ биржах (дефолт)")
+                   help="Памп+«до пампа» на КАЖДОЙ бирже, где есть таблица")
     p.add_argument("--no-require-all-exchanges", dest="require_all",
                    action="store_false",
-                   help="Достаточно пампa на MIN_EXCHANGES биржах")
+                   help="Памп достаточно на MIN_EXCHANGES биржах (дефолт)")
+    p.add_argument("--min-vitality", default=MIN_OB_VITALITY,
+                   help="Мин. живость стакана (A/B/C; D/F и без OB отсев; ''=выкл)")
+    p.add_argument("--min-history-days", type=float, default=SHORT_MIN_HISTORY_DAYS,
+                   help="Мин. история для новых монет, дней (ловить вчерашние запуски)")
     p.add_argument("--peak-align-days", type=float, default=PEAK_ALIGN_DAYS,
                    help="Разброс времени пика между биржами, дн (0 = отключить)")
     p.add_argument("--pre-pump-days", type=float, default=PRE_PUMP_DAYS,
@@ -1809,6 +1860,7 @@ def apply_args(args) -> None:
     global EXCHANGES_INCLUDE, MIN_EXCHANGES, REQUIRE_ALL_EXCHANGES, PEAK_ALIGN_DAYS
     global PRE_PUMP_DAYS, PRE_PUMP_BELOW_PEAK_FACTOR, RECENT_PUMPS_DAYS, REPORT_TOP_N
     global SAVE_TO_DB, PRINT_RUN_STATISTICS, INCLUDE_SPOT, INCLUDE_SWAP
+    global MIN_OB_VITALITY, SHORT_MIN_HISTORY_DAYS
 
     PUMP_MIN_PCT = float(args.pct)
     PUMP_WINDOW_DAYS = float(args.days)
@@ -1826,6 +1878,8 @@ def apply_args(args) -> None:
     PRINT_RUN_STATISTICS = bool(args.statistics)
     INCLUDE_SPOT = bool(args.include_spot)
     INCLUDE_SWAP = bool(args.include_swap)
+    MIN_OB_VITALITY = (str(args.min_vitality).strip().upper() if args.min_vitality else "")
+    SHORT_MIN_HISTORY_DAYS = float(args.min_history_days)
 
     _recompute_derived()
 

@@ -31,6 +31,7 @@ _CONFIG_GLOBALS = [
     "EXCHANGES_INCLUDE", "MIN_EXCHANGES", "REQUIRE_ALL_EXCHANGES", "PEAK_ALIGN_DAYS",
     "PRE_PUMP_DAYS", "PRE_PUMP_BELOW_PEAK_FACTOR", "RECENT_PUMPS_DAYS",
     "REPORT_TOP_N", "SAVE_TO_DB", "PRINT_RUN_STATISTICS", "INCLUDE_SPOT", "INCLUDE_SWAP",
+    "MIN_OB_VITALITY", "SHORT_MIN_HISTORY_DAYS",
 ]
 
 _DERIVED_GLOBALS = [
@@ -196,11 +197,21 @@ def _ev(base, exchange, pump_pct, peak_ts):
 
 def test_build_coin_results_requires_all_exchanges():
     catalog = {"BTC": {"bybit", "okx"}}
-    # Only bybit has a qualifying event -> not all exchanges -> rejected.
+    # Only bybit has a qualifying event -> with REQUIRE_ALL_EXCHANGES=True, none.
+    ps.REQUIRE_ALL_EXCHANGES = True
     events = [dict(_ev("BTC", "bybit", 350.0, 1750000000))]
     coins, rej = ps.build_coin_results(catalog, events, 1750000000)
     assert coins == []
     assert rej["not_all"] == 1
+
+
+def test_build_coin_results_relaxed_single_exchange():
+    """По умолчанию (REQUIRE_ALL_EXCHANGES=False) хватает пампa на 1 бирже."""
+    catalog = {"BTC": {"bybit", "okx"}}
+    events = [dict(_ev("BTC", "bybit", 350.0, 1750000000))]
+    coins, rej = ps.build_coin_results(catalog, events, 1750000000)
+    assert len(coins) == 1
+    assert coins[0]["base"] == "BTC"
 
 
 def test_build_coin_results_min_exchanges():
@@ -209,6 +220,7 @@ def test_build_coin_results_min_exchanges():
         dict(_ev("BTC", "bybit", 350.0, 1750000000)),
         dict(_ev("BTC", "okx", 320.0, 1750001000)),
     ]
+    ps.REQUIRE_ALL_EXCHANGES = False
     coins, rej = ps.build_coin_results(catalog, events, 1750000000)
     assert len(coins) == 1
     assert coins[0]["base"] == "BTC"
@@ -224,7 +236,9 @@ def test_apply_args_overrides_and_recomputes():
     from pump_scanner import build_arg_parser, apply_args
     args = build_arg_parser().parse_args(
         ["--pct", "200", "--days", "7", "--timeframe", "15m",
-         "--exchanges", "bybit,okx", "--no-save-to-db", "--min-exchanges", "2"])
+         "--exchanges", "bybit,okx", "--no-save-to-db", "--min-exchanges", "2",
+         "--min-vitality", "C", "--min-history-days", "0.1",
+         "--no-require-all-exchanges"])
     apply_args(args)
     assert ps.PUMP_MIN_PCT == 200.0
     assert ps.PUMP_WINDOW_DAYS == 7.0
@@ -235,7 +249,39 @@ def test_apply_args_overrides_and_recomputes():
     assert ps.EXCHANGES_INCLUDE == {"bybit", "okx"}
     assert ps.SAVE_TO_DB is False
     assert ps.MIN_EXCHANGES == 2
+    assert ps.REQUIRE_ALL_EXCHANGES is False
+    assert ps.MIN_OB_VITALITY == "C"
+    assert ps.SHORT_MIN_HISTORY_DAYS == 0.1
     assert ps.DB_NAMES == [ps.settings.db_high_15m, ps.settings.db_low_15m]
+
+
+def test_default_require_all_is_false():
+    """Новая семантика: по умолчанию памп не обязан быть на ВСЕХ биржах."""
+    assert ps.REQUIRE_ALL_EXCHANGES is False
+
+
+def test_min_ob_vitality_ok_grades():
+    ps.MIN_OB_VITALITY = "C"
+    assert ps.min_ob_vitality_ok("A") is True
+    assert ps.min_ob_vitality_ok("B") is True
+    assert ps.min_ob_vitality_ok("C") is True
+    assert ps.min_ob_vitality_ok("D") is False
+    assert ps.min_ob_vitality_ok("F") is False
+    # Отсутствие OB (мёртвый стакан) при включённом фильтре — не проходит.
+    assert ps.min_ob_vitality_ok(None) is False
+    assert ps.min_ob_vitality_ok("") is False
+
+
+def test_min_ob_vitality_ok_disabled():
+    ps.MIN_OB_VITALITY = ""
+    assert ps.min_ob_vitality_ok(None) is True
+    assert ps.min_ob_vitality_ok("F") is True
+
+
+def test_min_ob_vitality_ok_stricter():
+    ps.MIN_OB_VITALITY = "A"
+    assert ps.min_ob_vitality_ok("A") is True
+    assert ps.min_ob_vitality_ok("B") is False  # B хуже A -> отсев
 
 
 def test_parse_exchange_list_empty_is_none():
