@@ -1489,11 +1489,13 @@ async def scan_one_table(db_name: str, pool: asyncpg.Pool, tbl: str,
     if out and (PRINT_EVENT_DETAILS or MIN_OB_VITALITY):
         ob = await fetch_ob_snapshot(pool, tbl)
 
+    table_dead_ob = False
     if MIN_OB_VITALITY:
         ob_grade = (ob or {}).get("ob_vitality_grade")
         if not min_ob_vitality_ok(ob_grade):
             # Мёртвый стакан (D/F) или OB не записан/нет колонок — события
             # такого пампа нереализуемы, в отчёт не идут.
+            table_dead_ob = True
             stats["filtered_ob_dead"] += len(out)
             out = []
         elif ob is not None:
@@ -1507,8 +1509,10 @@ async def scan_one_table(db_name: str, pool: asyncpg.Pool, tbl: str,
             ev["ob"] = ob
 
     # --- Сравнение порогов пампа: сканируем эту же таблицу на доп. порогах ---
-    # (те же фильтры: санити/до-пампа/возраст). Сохраняем только лёгкие поля.
-    if cmp_store is not None and COMPARE_PUMP_THRESHOLDS_PCT:
+    # (те же фильтры: санити/до-пампа/возраст + тот же отсев «мёртвого» стакана,
+    # чтобы все строки сравнения были в одной вселенной с основным порогом).
+    # Сохраняем только лёгкие поля.
+    if cmp_store is not None and COMPARE_PUMP_THRESHOLDS_PCT and not table_dead_ob:
         for pct in COMPARE_PUMP_THRESHOLDS_PCT:
             thr = 1.0 + pct / 100.0
             if abs(thr - THRESH_RATIO) < 1e-12:
@@ -1529,9 +1533,10 @@ async def scan_one_table(db_name: str, pool: asyncpg.Pool, tbl: str,
 
     # --- Сравнение методов (close vs high_low): сканируем эту же таблицу ---
     # каждым методом из PUMP_PRICE_SOURCES_COMPARE, кроме основного, с теми же
-    # фильтрами (санити/до-пампа/возраст). Основной метод уже посчитан выше —
-    # его события добавляем в хранилище из all_events при агрегации.
-    if src_cmp_store is not None and COMPARE_PRICE_SOURCES:
+    # фильтрами (санити/до-пампа/возраст + тот же отсев «мёртвого» стакана).
+    # Основной метод уже посчитан выше — его события добавляем в хранилище
+    # из all_events при агрегации.
+    if src_cmp_store is not None and COMPARE_PRICE_SOURCES and not table_dead_ob:
         for src in PUMP_PRICE_SOURCES_COMPARE:
             if src == PUMP_PRICE_SOURCE:
                 continue  # основной метод — готовые события ниже
