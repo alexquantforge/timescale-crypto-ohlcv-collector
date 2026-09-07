@@ -34,9 +34,11 @@ PUMP SCANNER — поиск быстрых пампов (кросс-биржев
      друг от друга (это один и тот же памп). MIN_EXCHANGES задаёт
      минимум бирж, чтобы монету вообще рассматривать.
 
-  4b. Фильтр «мёртвых» стаканов (MIN_OB_VITALITY="C"): в отчёт идут только
-     монеты с живостью стакана A/B/C. D/F и отсутствие OB отсеиваются
-     (памп по неликвиду нереализуем). ""/None — фильтр выключен.
+  4b. Фильтр «мёртвых» стаканов (MIN_OB_VITALITY="C"): монеты с живостью
+     стакана D/F (есть снимок, но грейд мёртвый) отсеиваются — памп по
+     неликвиду нереализуем. Таблицы БЕЗ снимка OB (апдейтер не писал ob_*,
+     напр. bingx/htx) НЕ отсеиваются, а помечаются «OB: не подтверждено —
+     нет свежего снимка», чтобы не терять новые листинги. ""/None — фильтр выключен.
 
   5. Отчёт: одна строка на МОНЕТУ (группа бирж) печатается в консоль, а все
      результаты сохраняются в TimescaleDB (база RESULTS_DB):
@@ -475,8 +477,11 @@ def cfmt(text: str, goodness: Optional[float]) -> str:
 def min_ob_vitality_ok(grade: Optional[str]) -> bool:
     """True, если грейд живости стакана проходит фильтр MIN_OB_VITALITY.
 
-    A/B/C — «живой» стакан (A лучший). D/F и отсутствие/пустой грейд — «мёртвый».
+    A/B/C — «живой» стакан (A лучший). D/F и пустой грейд — False.
     При выключенном фильтре (MIN_OB_VITALITY пустой/None) пропускаем всех.
+    ВАЖНО: на уровне скана отсутствие снимка (ob=None) НЕ отсеивается — это
+    «не подтверждено» (ob_unverified), а не «мёртвый стакан»; сюда пустой
+    грейд попадает только если снимок ЕСТЬ, но грейд не задан/пуст.
     """
     if not MIN_OB_VITALITY:
         return True
@@ -517,7 +522,11 @@ def fmt_event_details_lines(ev: Dict[str, Any]) -> List[str]:
     lines.append(f"     {eid:<10} [{tag}] " + " | ".join(url_part))
     ob = ev.get("ob")
     if not ob:
-        lines.append("       OB: нет свежего снимка (апдейтер не писал ob_* или устарел)")
+        if ev.get("ob_unverified"):
+            lines.append("       OB: не подтверждено — нет свежего снимка (апдейтер не писал ob_* "
+                         "или устарел); книга не проверена на «мёртвость»")
+        else:
+            lines.append("       OB: нет свежего снимка (апдейтер не писал ob_* или устарел)")
         return lines
     vit_s = float(ob.get("ob_vitality_score") or 0)
     vit_g = ob.get("ob_vitality_grade") or "?"
@@ -1492,17 +1501,29 @@ async def scan_one_table(db_name: str, pool: asyncpg.Pool, tbl: str,
     table_dead_ob = False
     if MIN_OB_VITALITY:
         ob_grade = (ob or {}).get("ob_vitality_grade")
-        if not min_ob_vitality_ok(ob_grade):
-            # Мёртвый стакан (D/F) или OB не записан/нет колонок — события
-            # такого пампа нереализуемы, в отчёт не идут.
+        if ob is not None and not min_ob_vitality_ok(ob_grade):
+            # Реально «мёртвый» стакан: есть снимок OB, но грейд D/F (или штрихкод).
+            # События такого пампа нереализуемы, в отчёт не идут.
             table_dead_ob = True
             stats["filtered_ob_dead"] += len(out)
             out = []
         elif ob is not None:
+            # Снимок есть и живость A/B/C — подтверждено, проходим.
             for ev in out:
                 ev["ob_vitality_grade"] = ob_grade
                 ev["ob_vitality_score"] = ob.get("ob_vitality_score")
                 ev["ob_is_barcode"] = ob.get("ob_is_barcode")
+        else:
+            # Снимка OB вообще нет (апдейтер не писал ob_*, или таблица без них).
+            # Это НЕ подтверждённая «мёртвая» книга, а «неизвестно» — по решению
+            # пользователя такие монеты НЕ отсеиваем, а помечаем как неподтверждённые,
+            # чтобы не терять листинги (bingx и т.п.), где updater не пишет OB.
+            for ev in out:
+                ev["ob_vitality_grade"] = None
+                ev["ob_vitality_score"] = None
+                ev["ob_is_barcode"] = None
+                ev["ob_unverified"] = True
+            stats["ob_unverified"] += len(out)
 
     if out and PRINT_EVENT_DETAILS and ob is not None:
         for ev in out:
@@ -1610,6 +1631,7 @@ async def main() -> None:
         "skipped_filter": 0, "raw_events": 0, "filtered_prepump": 0,
         "filtered_age": 0, "filtered_data_sanity": 0, "done": 0, "cpu_ms": 0, "short_history": 0,
         "filtered_ob_dead": 0,
+        "ob_unverified": 0,
     }
 
     sem = asyncio.Semaphore(DB_CONCURRENCY)
@@ -1672,7 +1694,8 @@ async def main() -> None:
         f"пропущено фильтрами: {stats['skipped_filter']}).")
     log(f"Сырых детекций: {stats['raw_events']} | отсеяно: до-пампа={stats['filtered_prepump']}, "
         f"возраст={stats['filtered_age']}, мусор данных={stats['filtered_data_sanity']}, "
-        f"мёртвый стакан={stats['filtered_ob_dead']}; "
+        f"мёртвый стакан={stats['filtered_ob_dead']}, "
+        f"OB неподтверждён(без снимка)={stats['ob_unverified']}; "
         f"кросс-биржа: мин.бирж={rej['min_exch']}, "
         f"не на всех биржах={rej['not_all']}, рассинхрон пиков={rej['align']}.")
     log(f"ИТОГО монет в отчёте: {len(coins)}")
@@ -1833,7 +1856,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    action="store_false",
                    help="Памп достаточно на MIN_EXCHANGES биржах (дефолт)")
     p.add_argument("--min-vitality", default=MIN_OB_VITALITY,
-                   help="Мин. живость стакана (A/B/C; D/F и без OB отсев; ''=выкл)")
+                   help="Мин. живость стакана (A/B/C проходят; D/F отсев; без OB — не подтверждено, "
+                        "не отсев; ''=выкл)")
     p.add_argument("--min-history-days", type=float, default=SHORT_MIN_HISTORY_DAYS,
                    help="Мин. история для новых монет, дней (ловить вчерашние запуски)")
     p.add_argument("--peak-align-days", type=float, default=PEAK_ALIGN_DAYS,

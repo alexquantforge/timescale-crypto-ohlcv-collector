@@ -267,7 +267,9 @@ def test_min_ob_vitality_ok_grades():
     assert ps.min_ob_vitality_ok("C") is True
     assert ps.min_ob_vitality_ok("D") is False
     assert ps.min_ob_vitality_ok("F") is False
-    # Отсутствие OB (мёртвый стакан) при включённом фильтре — не проходит.
+    # Пустой грейд (нет данных) при включённом фильтре — НЕ проходит через
+    # min_ob_vitality_ok; но на уровне скана отсутствие снимка = «не подтверждено»
+    # и НЕ отсеивается (монета помечается ob_unverified).
     assert ps.min_ob_vitality_ok(None) is False
     assert ps.min_ob_vitality_ok("") is False
 
@@ -288,4 +290,23 @@ def test_parse_exchange_list_empty_is_none():
     assert ps._parse_exchange_list(None) is None
     assert ps._parse_exchange_list("") is None
     assert ps._parse_exchange_list("  ") is None
+
+
+def test_fmt_event_details_unverified_flag():
+    """Событие без снимка OB (ob_unverified) помечается, а не молча пропадает."""
+    ev = dict(exchange="bingx", ticker="PROLOGUE/USDT", kind="swap",
+              ob_unverified=True)
+    lines = ps.fmt_event_details_lines(ev)
+    ob_line = [l for l in lines if l.strip().startswith("OB:")][0]
+    assert "не подтверждено" in ob_line
+    assert "нет свежего снимка" in ob_line
+
+
+def test_fmt_event_details_no_flag_no_ob():
+    """Историческое сообщение для случая без ob_unverified сохраняется."""
+    ev = dict(exchange="bingx", ticker="PROLOGUE/USDT", kind="swap")
+    lines = ps.fmt_event_details_lines(ev)
+    ob_line = [l for l in lines if l.strip().startswith("OB:")][0]
+    assert "не подтверждено" not in ob_line
+    assert "нет свежего снимка" in ob_line
     assert ps._parse_exchange_list("bybit,OKX") == {"bybit", "okx"}
