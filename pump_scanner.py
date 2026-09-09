@@ -378,7 +378,7 @@ def get_exchange_url(eid: str, base: str, quote: str) -> str:
         "mexc": f"https://www.mexc.com/exchange/{b}_{q}",
         "kucoin": f"https://trade.kucoin.com/{b}-{q}",
         "gateio": f"https://www.gate.io/trade/{b}_{q}",
-        "bingx": f"https://bingx.com/en-us/spot/{b}{q}/",
+        "bingx": f"https://bingx.com/en/spot/{b}{q}",  # /en/, склеено, без '/'; en-us/висячий '/' не открываются
         "htx": f"https://www.htx.com/trade/{bl}_{ql}?type=spot",
         "huobipro": f"https://www.htx.com/trade/{bl}_{ql}?type=spot",
         "huobi": f"https://www.htx.com/trade/{bl}_{ql}?type=spot",
@@ -399,7 +399,7 @@ def get_swap_url(eid: str, base: str, quote: str) -> str:
         "mexc": f"https://futures.mexc.com/exchange/{b}_{q}",
         "kucoin": f"https://www.kucoin.com/futures/trade/{b}{q}M",
         "gateio": f"https://www.gate.io/futures_trade/USDT/{b}_{q}",
-        "bingx": f"https://bingx.com/en-us/perpetual/{b}{q}/",
+        "bingx": f"https://bingx.com/en/perpetual/{b}-{q}",  # /en/, через дефис, без '-SWAP' и без '/'; en-us/-SWAP не открываются
         "htx": f"https://www.htx.com/futures/linear_swap/exchange#contract_code={b}-{q}&contract_type=swap&type=isolated",
         "huobipro": f"https://www.htx.com/futures/linear_swap/exchange#contract_code={b}-{q}&contract_type=swap&type=isolated",
         "huobi": f"https://www.htx.com/futures/linear_swap/exchange#contract_code={b}-{q}&contract_type=swap&type=isolated",

@@ -310,3 +310,40 @@ def test_fmt_event_details_no_flag_no_ob():
     assert "не подтверждено" not in ob_line
     assert "нет свежего снимка" in ob_line
     assert ps._parse_exchange_list("bybit,OKX") == {"bybit", "okx"}
+
+
+# ---------------------------------------------------------------------------
+# BingX pair URLs (must match src/exchanges/symbol_selector grammar)
+# ---------------------------------------------------------------------------
+
+
+def test_bingx_spot_url_is_glued_under_en():
+    # /en/spot/BASEQUOTE (glued) — no en-us, no trailing slash, no separator.
+    assert ps.get_exchange_url("bingx", "PROLOGUE", "USDT") == \
+        "https://bingx.com/en/spot/PROLOGUEUSDT"
+    assert ps.get_exchange_url("bingx", "BTC", "USDT") == \
+        "https://bingx.com/en/spot/BTCUSDT"
+
+
+def test_bingx_perp_url_is_dashed_under_en():
+    # /en/perpetual/BASE-QUOTE (dashed) — no -SWAP, no trailing slash.
+    assert ps.get_swap_url("bingx", "PROLOGUE", "USDT") == \
+        "https://bingx.com/en/perpetual/PROLOGUE-USDT"
+    assert ps.get_swap_url("bingx", "BTC", "USDT") == \
+        "https://bingx.com/en/perpetual/BTC-USDT"
+
+
+def test_bingx_urls_carry_no_broken_shapes():
+    """en-us, a trailing '/', and the ccxt -SWAP suffix all 404 on BingX.
+
+    Pinned on every pair kind so a future edit cannot reintroduce one of them
+    into just one of the two builders.
+    """
+    for base, quote in (("PROLOGUE", "USDT"), ("BTC", "USDT"),
+                        ("RAINPROTOCOL", "USDT")):
+        for url in (ps.get_exchange_url("bingx", base, quote),
+                    ps.get_swap_url("bingx", base, quote)):
+            assert url.startswith("https://bingx.com/en/"), url
+            assert "en-us" not in url, url
+            assert not url.endswith("/"), url
+            assert "SWAP" not in url.upper(), url
