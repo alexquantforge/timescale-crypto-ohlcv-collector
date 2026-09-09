@@ -351,7 +351,7 @@ def test_a_failed_stitch_is_not_remembered_as_an_answer(monkeypatch):
         markets = {"X/USDT": {}}
         calls = 0
 
-        def load_markets(self):
+        def load_markets(self, reload=False):
             return self.markets
 
         def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None):
@@ -393,7 +393,7 @@ def test_markets_are_loaded_once_per_exchange_and_then_reused(monkeypatch):
         markets = {}
         timeout = 8000
 
-        def load_markets(self):
+        def load_markets(self, reload=False):
             calls.append(1)
             self.markets = {"A/B": {}}
 
@@ -430,7 +430,7 @@ def test_the_render_path_never_waits_for_a_market_load(monkeypatch):
         markets = {}
         timeout = 8000
 
-        def load_markets(self):           # would block for 20 s in reality
+        def load_markets(self, reload=False):           # would block for 20 s in reality
             raise AssertionError("must not run inline on the render path")
 
     ex = _Ex()
@@ -461,7 +461,7 @@ def test_a_failing_market_load_backs_off_instead_of_beating_the_exchange(monkeyp
         timeout = 8000
         loads = 0
 
-        def load_markets(self):
+        def load_markets(self, reload=False):
             type(self).loads += 1
             raise RuntimeError("RequestTimeout: gate GET /spot/currencies")
 
@@ -501,7 +501,7 @@ def test_a_stitch_without_markets_says_so_instead_of_claiming_no_candles(monkeyp
         timeout = 8000
         fetched = 0
 
-        def load_markets(self):
+        def load_markets(self, reload=False):
             raise RuntimeError("markets unavailable")
 
         def fetch_ohlcv(self, *a, **k):
@@ -565,7 +565,7 @@ def test_an_empty_answer_stays_an_empty_answer(monkeypatch):
         markets = {"X/USDT": {}}
         calls = 0
 
-        def load_markets(self):
+        def load_markets(self, reload=False):
             return self.markets
 
         def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None):
@@ -620,7 +620,7 @@ def test_stitch_fetch_honours_its_time_budget(monkeypatch):
         markets = {"X/USDT": {}}
         calls = 0
 
-        def load_markets(self):
+        def load_markets(self, reload=False):
             return self.markets
 
         def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None):
@@ -3061,7 +3061,7 @@ def test_the_market_probe_names_the_slow_category_and_leaves_no_partial_catalog(
             self.options = {"fetchMarkets": {"types": ["spot", "swap", "future", "option"],
                                              "keepme": 1}}
 
-        def load_markets(self):
+        def load_markets(self, reload=False):
             fm = self.options["fetchMarkets"]
             calls.append(list(fm["types"]))
             t = fm["types"][0]
@@ -3127,7 +3127,7 @@ class _ShapeExchange:
         # as everything else, so a test can count what the endpoint actually saw.
         self.bare_error = bare_error
 
-    def load_markets(self):
+    def load_markets(self, reload=False):
         enc = self.headers.get("Accept-Encoding")
         self.calls.append({"types": list(self.options["fetchMarkets"]["types"]),
                            "enc": enc, "ua": self.headers.get("User-Agent"),
@@ -3153,6 +3153,111 @@ class _ShapeExchange:
         pass
 
 
+
+def test_a_background_refresh_must_ask_the_exchange_and_not_its_own_disk_copy(
+        tmp_path, monkeypatch, capsys):
+    """A refresh aimed at an instance the disk seed had just populated was ccxt's
+    cheapest no-op — `load_markets()` returns at once when `markets` is set — and the
+    consequences showed in exactly one number:
+
+        [markets] gate: 3233 markets taken from disk (38710s old …); a real reload is running now
+        [markets] gate: 3233 markets loaded in 0.0s (by disk-refresh, …)
+        [markets] gate: 3233 markets taken from disk (1s old …)   ← the age it just reset
+
+    The no-op fell through to `_apply_loaded_catalog`, which SAVED what it had
+    "loaded": the file's age reset to 0, so the next restart found the catalog fresh
+    and scheduled no refresh, ever. `DASH_MARKETS_REFRESH_SEC` was decorative and a
+    pair listed after the file was written stayed a permanent BadSymbol.
+
+    The fake below implements ccxt's contract — it answers from memory unless
+    `reload=True` — because a fake that always fetched would let the bug pass.
+    """
+    import os
+    import threading
+    from dashboard import app as dapp
+
+    monkeypatch.setattr(dapp, "_MARKET_GATE", {}, raising=False)
+    monkeypatch.setattr(dapp, "_MARKET_LOG_AT", {}, raising=False)
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_enabled", True, raising=False)
+    monkeypatch.setattr(dapp.settings, "dash_snapshot_dir", str(tmp_path), raising=False)
+    monkeypatch.setattr(dapp.settings, "dash_markets_disk_ttl_sec", 86400.0, raising=False)
+    monkeypatch.setattr(dapp.settings, "dash_markets_refresh_sec", 21600.0, raising=False)
+
+    old = [{"id": "OLD/USDT", "symbol": "OLD/USDT", "base": "OLD", "quote": "USDT",
+            "spot": True}]
+    new = {"NEW/USDT": {"id": "NEW/USDT", "symbol": "NEW/USDT", "base": "NEW",
+                        "quote": "USDT", "spot": True}}
+    path = dapp.markets_path(str(tmp_path), "gate")
+    assert dapp.save_markets_snapshot(path, old)
+    stale = time.time() - 40000.0                  # older than the refresh interval
+    os.utime(path, (stale, stale))
+    mtime_before = os.stat(path).st_mtime
+
+    asked = []
+
+    class _Ex:
+        timeout = 60_000
+        headers = {}
+        markets = {}
+
+        def set_markets(self, m):
+            self.markets = {x["symbol"]: x for x in m}
+
+        def load_markets(self, reload=False):
+            asked.append(bool(reload))
+            if reload or not self.markets:
+                self.markets = dict(new)
+            return self.markets
+
+        def close(self):
+            pass
+
+    ex = _Ex()
+    g = dapp._market_gate("gate")
+    g.update(at=0.0, fails=0, err="", loading=False, markets_from="", variant="")
+
+    spawned = []
+    real_thread = threading.Thread
+    monkeypatch.setattr(
+        dapp.threading, "Thread",
+        lambda target=None, **kw: spawned.append(target) or real_thread(target=lambda: None))
+    try:
+        assert dapp._seed_markets_from_disk("gate", ex, g) is True
+        assert asked == [], "the seed itself must not touch the exchange"
+        assert os.stat(path).st_mtime == mtime_before, "…nor re-save what it read"
+        assert spawned, "a catalog older than DASH_MARKETS_REFRESH_SEC schedules a refresh"
+        spawned[0]()                               # run the scheduled refresh inline
+        assert asked == [True], "the refresh has to pass reload=True; ccxt would not"
+        assert dapp._load_markets_locked("gate", _Ex(), "first load") == ""
+        assert asked[-1] is False, "an EMPTY instance needs no reload — the flag is " \
+                                   "for a refresh, not a habit"
+    finally:
+        monkeypatch.setattr(dapp.threading, "Thread", real_thread)
+
+    out = capsys.readouterr().out
+    assert "1 markets loaded" in out, out           # the NEW catalog, not the seeded count
+    markets_now, age_now = dapp.load_markets_snapshot(
+        path, float(dapp.settings.dash_markets_disk_ttl_sec))
+    assert "NEW/USDT" in (markets_now or [{}])[0].get("symbol", ""), markets_now
+    assert age_now < 60.0, "only a real load may reset the age"
+
+
+def test_the_displayed_pair_is_published_before_the_slow_tail_of_the_render():
+    """Ordering guard for the first tick. `_set_live_target` used to run only after
+    the charts, the stitch and the neighbour warming — on a cold process that is most
+    of the ~20 s an operator sees before a price appears, for a writer that then polls
+    at 1 s. The displayed pair must be handed over before that tail; the ±5 set may
+    refine it after. A print-order assertion in a script-style module is the cheapest
+    thing that can fail when someone moves the call back down."""
+    from pathlib import Path
+    from dashboard import app as dapp
+    src = Path(dapp.__file__).read_text()
+    early = src.index("Hand the DISPLAYED pair to the live writer now")
+    strip = src.index("def _strip_fragment")
+    full = src.index("_set_live_target([p for p in live_pairs")
+    assert -1 < early < strip < full, (early, strip, full)
+
+
 def test_the_markets_lines_say_which_route_they_took(monkeypatch, capsys):
     """One machine, two routes, one question: the engines reach gate through the
     default `SOCKS5_PROXY` tunnel while the dashboard's sync clients go direct and
@@ -3168,7 +3273,7 @@ def test_the_markets_lines_say_which_route_they_took(monkeypatch, capsys):
         timeout = 8_000
         markets = {"BTC/USDT": {"symbol": "BTC/USDT"}}
 
-        def load_markets(self):
+        def load_markets(self, reload=False):
             pass
 
     class _Async:                     # what `create_exchange` builds

@@ -1832,7 +1832,10 @@ def _seed_markets_from_disk(ccxt_id: str, ex, g: dict) -> bool:
         def _bg_refresh(ccxt_id=ccxt_id, ex=ex):
             g2 = _market_gate(ccxt_id)
             with g2["lock"]:
-                _load_markets_locked(ccxt_id, ex, "disk-refresh")
+                # reload=True: this instance ALREADY holds the seeded catalog, so a
+                # plain load_markets() would be a no-op that re-saves the file it was
+                # seeded from and calls that a refresh (see _load_markets_locked).
+                _load_markets_locked(ccxt_id, ex, "disk-refresh", reload=True)
 
         threading.Thread(target=_bg_refresh, daemon=True,
                          name=f"markets-refresh-{ccxt_id}").start()
@@ -1935,8 +1938,20 @@ def _apply_loaded_catalog(ccxt_id: str, ex, g: dict, who: str, started: float,
           + (f" — {note}" if note else ""), flush=True)
 
 
-def _load_markets_locked(ccxt_id: str, ex, who: str) -> str:
-    """Performs the load while holding the gate lock. Returns '' or a reason."""
+def _load_markets_locked(ccxt_id: str, ex, who: str, reload: bool = False) -> str:
+    """Performs the load while holding the gate lock. Returns '' or a reason.
+
+    `reload` is not a nicety: ccxt's `load_markets()` returns IMMEDIATELY when the
+    instance already has a catalog — so a refresh issued against an instance that
+    `_seed_markets_from_disk` had just populated was a 0.0 s no-op that still fell
+    through to `_apply_loaded_catalog`, printed `gate: 3233 markets loaded in 0.0s
+    (by disk-refresh)`, and RE-SAVED the file it had been seeded from. The age reset
+    made every later restart find the catalog "fresh", so no refresh was ever
+    scheduled again: the cache warmed itself from itself, `DASH_MARKETS_REFRESH_SEC`
+    was decorative, and a pair listed after the file was written answered BadSymbol
+    in every chart, chip and stitch on that exchange. A refresh therefore has to be
+    the one call shape that cannot be answered from memory.
+    """
     g = _market_gate(ccxt_id)
     g["loading"] = True
     started = time.time()
@@ -1960,7 +1975,7 @@ def _load_markets_locked(ccxt_id: str, ex, who: str) -> str:
         # A market load needs longer than a candle fetch; restoring it after
         # keeps the tight timeout where it belongs (on the fetches).
         ex.timeout = max(int(old_timeout or 0), int(_market_load_sec() * 1000))
-        ex.load_markets()
+        ex.load_markets(reload)
         if not (getattr(ex, "markets", None) or {}):
             # An empty dict here would look like "loaded" to every caller and
             # then come back as BadSymbol for every pair on this exchange.
@@ -2005,7 +2020,7 @@ def _load_markets_locked(ccxt_id: str, ex, who: str) -> str:
             undo_v = _apply_header(ex, "Accept-Encoding", "identity")
             try:
                 ex.timeout = max(int(old_timeout or 0), int(_market_load_sec() * 1000))
-                ex.load_markets()
+                ex.load_markets(reload)
             except BaseException:
                 g["variant"] = ""
             finally:
@@ -3201,6 +3216,7 @@ def _live_infra() -> dict:
         from concurrent.futures import ThreadPoolExecutor
 
         pool_exec = ThreadPoolExecutor(max_workers=6)
+        told_first = False
         while True:
             tgt_ts, pairs = _get_live_target()
             if not pairs or (time.time() - tgt_ts) > _LIVE_TARGET_TTL:
@@ -3217,6 +3233,24 @@ def _live_infra() -> dict:
                     # fire-and-forget: waiting per pair serialised the whole
                     # second-long round on database latency
                     infra["submit_upsert_nowait"](e["db"], e["ex"], e["sym"], payload)
+                    if not told_first:
+                        # "why did the live price take ~20s after a restart?" is not
+                        # answerable from the browser: the wait splits between the
+                        # page (the writer is only TOLD about a pair at the end of a
+                        # render) and this loop (round cadence, the displayed pair's
+                        # 3 serial requests, the DB queue behind the collector). Once
+                        # per process, no extra request, no line after the first
+                        # payload — every later round is a second.
+                        told_first = True
+                        now = time.time()
+                        print(f"[live] first tick of this process: {e['sym']} on "
+                              f"{e['ex']} — {now - tgt_ts:.1f}s after the page "
+                              f"published the target; this round: {len(pairs)} "
+                              f"pair(s) on 6 threads in {now - started:.1f}s "
+                              f"(the displayed pair costs 3 requests). The row now "
+                              f"waits for the DB write and the next fragment rerun. "
+                              f"If the first number is most of the wait, it was the "
+                              f"render, not the feed.", flush=True)
             time.sleep(max(0.2, 1.0 - (time.time() - started)))
 
     threading.Thread(target=writer_loop, daemon=True, name="live-writer").start()
@@ -4671,6 +4705,21 @@ with tab_charts:
             small_threshold=settings.atr_small_threshold,
             large_threshold=settings.atr_large_threshold,
         )
+
+    # --- Hand the DISPLAYED pair to the live writer now, not at the end --------
+    # The full ±5 set is assembled further down, after the charts, the stitch and
+    # the neighbour warming — and on a cold process that tail is seconds long (their
+    # own log: one catalog read of the 8296-table database took 12.3s inside the
+    # same render). The writer polls every second, so every second the pair is not in
+    # the target list is a second in which no first tick can exist. Publishing the
+    # current pair here costs one assignment under a lock and zero requests; the ±5
+    # set replaces it at the end of the render (the engine-side publish is keyed on
+    # the pair SET, so the fuller second call is not swallowed as a duplicate).
+    if not demo_mode and sym_ticker and sym_ex and TICKER_OPTIONS:
+        _set_live_target([{
+            "db": _live_db_for(row_1d, row_15m) or live_db,
+            "ex": sym_ex, "ccxt": ccxt_id, "sym": sym_ticker, "cur": True,
+        }])
 
     # --- Compact health strip — LIVE from the exchange every ~1s -------------
     # (Tape / Depth ±1% / Spread % ATR via orderbook & trade tape, Min 7d $Vol

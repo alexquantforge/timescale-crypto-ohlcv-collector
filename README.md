@@ -78,6 +78,25 @@ sizes the load, the client timeout is widened to it for the load and restored ri
 at all — raise it to 21600 to match `DASH_MARKETS_REFRESH_SEC` if the only thing you miss is a listing that
 appeared hours ago.
 
+**A cache that re-saves what it served is a lie about freshness.** `DASH_MARKETS_REFRESH_SEC` had been doing
+nothing for days. The background reload called `ex.load_markets()` on the very instance the disk seed had just
+populated, and ccxt answers that instantly — `[markets] gate: 3233 markets loaded in 0.0s (by disk-refresh)` —
+which then flowed into the step that saves the loaded catalog and reset the file's age to 0. Every later
+restart saw a fresh catalog and scheduled no refresh, so the listing stayed 10+ hours old indefinitely and a
+symbol listed in that window answered `BadSymbol` in every chart, chip and stitch on that exchange. A refresh
+now passes `reload=True` (the one call shape that cannot be answered from memory), only a real network answer
+resets the age, and the test that guards it uses a fake implementing ccxt's actual contract — a fake that
+always fetched would have passed the bug.
+
+**Why the first live tick takes ~20 s after a restart, and not 1 s after that.** The writer loop polls once a
+second and the chips fragment reruns once a second, so the wait is not in either of them: it is that the pair
+was handed to the writer only at the *end* of a page render (a cold one reads an 8296-table catalog in 12.3 s,
+stitches, warms ±5 neighbours), and the displayed pair's first payload needs three serial requests whose
+measured small-request latency on this link is ~2.3 s each — the rest queues behind the collector in the DB.
+The current pair is now published to the writer before that tail (a list assignment, zero extra requests), and
+the writer prints one line per process splitting the wait into page time and round time, because "20 seconds"
+observed from a browser cannot be located any other way.
+
 A restart gets the same treatment from the other side: a `load_markets()` is the
 slowest thing the dashboard does before it can draw a price (gate: a ~94 KB spot list and a
 ~1.3 MB swap list, in sequence, each under `DASH_MARKET_LOAD_TIMEOUT_SEC`), and one endpoint
