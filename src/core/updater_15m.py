@@ -39,6 +39,21 @@ from src.db.repository import (
     repair_text_typed_columns,
 )
 from src.exchanges.symbol_selector import get_exchange_url, get_swap_url
+from src.core.priority_pairs import (
+    MAX_PRIORITY_PAIRS,
+    resolve_exchange_alias,
+    PRIORITY_TABLE,
+    due_pairs,
+    lane_since_sec,
+    lane_warn_due,
+    mark_lane_service,
+    read_priority_pairs,
+)
+from src.utils.memory import (
+    release_memory,
+    setup_malloc_trim,
+    memory_release_loop,
+)
 from pytz import timezone as pytz_timezone
 
 from config.settings import Settings, settings
@@ -983,6 +998,111 @@ async def create_empty_symbol_table(db_name: str, tbl_name: str) -> None:
         pass
 
 
+async def save_candles_to_table(current_db, tbl: str, symbol: str, ccxt_id: str, cs: list) -> str:
+    """
+    Persists fetched 15m OHLCV rows into the pair table exactly the way the
+    main cycle does (same columns, same DELETE >= min_ts + COPY + dedup),
+    creating the table in DB_LOW when it does not exist yet.
+    Returns the database the rows landed in.
+
+    Extracted from process_pair so the 1-second PRIORITY LANE writes through
+    the identical code path — one writer implementation, no drift.
+    """
+
+    df = pd.DataFrame(cs, columns=["ts", "open", "high", "low", "close", "volume"])
+    df["Timestamp"] = df["ts"] // 1000
+    df["ticker"], df["exchange"] = symbol, ccxt_id
+    df["volume_x_low"] = df["volume"] * df["low"]
+    df["volume_x_close"] = df["volume"] * df["close"]
+    df["asset_type"] = "swap" if ":" in symbol else "spot"
+
+    dt_utc = pd.to_datetime(df["Timestamp"], unit="s", utc=True)
+    df["open_time_msk"] = dt_utc.dt.tz_convert(MSK_TZ).dt.strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    df["open_time_almaty"] = dt_utc.dt.tz_convert(ALMATY_TZ).dt.strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    if not current_db:
+        current_db = DB_LOW
+        async with db_pools[current_db].acquire() as conn:
+            cols = [f'"{c}" {t}' for c, t in ALL_COLUMNS_SQL.items()]
+            await conn.execute(f'CREATE TABLE "{tbl}" ({", ".join(cols)})')
+            try:
+                await conn.execute(
+                    f"SELECT create_hypertable('{tbl}', 'Timestamp', if_not_exists => TRUE)"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"  [TIMESCALEDB] Failed creating hypertable for {tbl}: {e}"
+                )
+
+    async with db_pools[current_db].acquire() as conn:
+        actual_cols = list(ALL_COLUMNS_SQL.keys())
+        existing_cols = {
+            r["column_name"]
+            for r in await conn.fetch(
+                "SELECT column_name FROM information_schema.columns WHERE table_name=$1",
+                tbl,
+            )
+        }
+        for col in actual_cols:
+            if col not in existing_cols:
+                await conn.execute(
+                    f'ALTER TABLE "{tbl}" ADD COLUMN "{col}" {ALL_COLUMNS_SQL[col]}'
+                )
+
+        tuples = [
+            tuple(None if pd.isna(x) else x for x in row)
+            for row in df[actual_cols].to_numpy()
+        ]
+
+        min_new_ts = int(df["Timestamp"].min())
+        # Replace ONLY the buckets this page actually carries.
+        #
+        # A blanket `DELETE >= min_new_ts` also wiped stored bars the exchange
+        # did NOT return this time — and illiquid pairs (JUSUNG/USDT:USDT
+        # @gateio) legitimately come back without the intervals that had no
+        # trades. The bar was deleted, nothing was inserted in its place, and
+        # the chart grew a one-candle hole that the exchange's own chart does
+        # not show. Bucket-scoped deletion keeps the rewrite (forming bar,
+        # corrected values) while never destroying data by omission.
+        new_buckets = sorted({int(t) // 900 for t in df["Timestamp"]})
+        async with conn.transaction():
+            await conn.execute(
+                f'DELETE FROM "{tbl}" WHERE ("Timestamp" / 900) = ANY($1::bigint[])',
+                new_buckets,
+            )
+            await conn.copy_records_to_table(
+                tbl, records=tuples, columns=actual_cols
+            )
+
+            # Dedup window is scoped to the freshly written range: the
+            # un-scoped variant scanned the whole 180-day table per pair
+            # per cycle.
+            await conn.execute(
+                f"""
+                WITH dups AS (
+                    SELECT "Timestamp",
+                           row_number() OVER (
+                               PARTITION BY ("Timestamp" / 900)
+                               ORDER BY COALESCE(volume, 0) DESC, "Timestamp" DESC
+                           ) AS rn
+                    FROM "{tbl}"
+                    WHERE "Timestamp" >= $1
+                )
+                DELETE FROM "{tbl}" 
+                WHERE "Timestamp" IN (
+                    SELECT "Timestamp" FROM dups WHERE rn > 1
+                )
+            """,
+                min_new_ts,
+            )
+
+    return current_db
+
+
 async def process_pair(exchange, symbol, ccxt_id):
     tbl = f"{symbol.replace('/', '_').replace('-', '_')}_on_{ccxt_id}".lower()
     current_db, last_ts, min_ts = await find_table_in_dbs(tbl)
@@ -1065,10 +1185,15 @@ async def process_pair(exchange, symbol, ccxt_id):
                 await asyncio.sleep(0.05)
 
         if last_ts > 0:
-            # Catch-up: from the last stored candle forward to now.
+            # Catch-up: from ONE BAR BEFORE the last stored candle forward to
+            # now. The newest stored bar was written while still forming, so
+            # it has to be re-downloaded and replaced (save_candles_to_table
+            # deletes everything >= the oldest fetched timestamp). Starting
+            # exactly AT last_ts leaves that bar untouched on exchanges whose
+            # `since` is exclusive — a permanently half-finished candle.
             if last_ts < download_min_ts:
                 last_ts = download_min_ts
-            cursor_ms = clamp_ohlcv_since_ms(ccxt_id, last_ts * 1000)
+            cursor_ms = clamp_ohlcv_since_ms(ccxt_id, max(0, last_ts - 900) * 1000)
             await _paged_forward_fill(cursor_ms, max_pages=40)
         else:
             # New symbol: full initial history FORWARD from the retention floor
@@ -1199,87 +1324,7 @@ async def process_pair(exchange, symbol, ccxt_id):
             return 0, 0, 0, 0
 
         cs = all_candles
-
-        df = pd.DataFrame(cs, columns=["ts", "open", "high", "low", "close", "volume"])
-        df["Timestamp"] = df["ts"] // 1000
-        df["ticker"], df["exchange"] = symbol, ccxt_id
-        df["volume_x_low"] = df["volume"] * df["low"]
-        df["volume_x_close"] = df["volume"] * df["close"]
-        df["asset_type"] = "swap" if ":" in symbol else "spot"
-
-        dt_utc = pd.to_datetime(df["Timestamp"], unit="s", utc=True)
-        df["open_time_msk"] = dt_utc.dt.tz_convert(MSK_TZ).dt.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-        df["open_time_almaty"] = dt_utc.dt.tz_convert(ALMATY_TZ).dt.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-
-        if not current_db:
-            current_db = DB_LOW
-            async with db_pools[current_db].acquire() as conn:
-                cols = [f'"{c}" {t}' for c, t in ALL_COLUMNS_SQL.items()]
-                await conn.execute(f'CREATE TABLE "{tbl}" ({", ".join(cols)})')
-                try:
-                    await conn.execute(
-                        f"SELECT create_hypertable('{tbl}', 'Timestamp', if_not_exists => TRUE)"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"  [TIMESCALEDB] Failed creating hypertable for {tbl}: {e}"
-                    )
-
-        async with db_pools[current_db].acquire() as conn:
-            actual_cols = list(ALL_COLUMNS_SQL.keys())
-            existing_cols = {
-                r["column_name"]
-                for r in await conn.fetch(
-                    "SELECT column_name FROM information_schema.columns WHERE table_name=$1",
-                    tbl,
-                )
-            }
-            for col in actual_cols:
-                if col not in existing_cols:
-                    await conn.execute(
-                        f'ALTER TABLE "{tbl}" ADD COLUMN "{col}" {ALL_COLUMNS_SQL[col]}'
-                    )
-
-            tuples = [
-                tuple(None if pd.isna(x) else x for x in row)
-                for row in df[actual_cols].to_numpy()
-            ]
-
-            min_new_ts = int(df["Timestamp"].min())
-            async with conn.transaction():
-                await conn.execute(
-                    f'DELETE FROM "{tbl}" WHERE "Timestamp" >= $1', min_new_ts
-                )
-                await conn.copy_records_to_table(
-                    tbl, records=tuples, columns=actual_cols
-                )
-
-                # Dedup window is scoped to the freshly written range: the
-                # un-scoped variant scanned the whole 180-day table per pair
-                # per cycle.
-                await conn.execute(
-                    f"""
-                    WITH dups AS (
-                        SELECT "Timestamp",
-                               row_number() OVER (
-                                   PARTITION BY ("Timestamp" / 900)
-                                   ORDER BY COALESCE(volume, 0) DESC, "Timestamp" DESC
-                               ) AS rn
-                        FROM "{tbl}"
-                        WHERE "Timestamp" >= $1
-                    )
-                    DELETE FROM "{tbl}" 
-                    WHERE "Timestamp" IN (
-                        SELECT "Timestamp" FROM dups WHERE rn > 1
-                    )
-                """,
-                    min_new_ts,
-                )
-
+        current_db = await save_candles_to_table(current_db, tbl, symbol, ccxt_id, cs)
         total_bars, gaps_found, gaps_filled = await check_and_fill_table_gaps(
             exchange, symbol, tbl, current_db, ccxt_name=ccxt_id
         )
@@ -1405,6 +1450,28 @@ PROGRESS_LOG_EVERY: int = settings.progress_log_every
 PRECOUNT_PAIRS: bool = settings.precount_pairs
 
 
+def format_pair_result(count: int, total_bars: int, gaps_found: int, gaps_filled: int) -> str:
+    """
+    Per-pair log tail: "+4 candles, 180.1d stored, no gaps. OK".
+
+    `total_bars` is 0 whenever check_and_fill_table_gaps() short-circuits on
+    its per-table cooldown (gap_recheck_sec, 6h) — printing "0.0d stored" then
+    read like an EMPTY table and sent people hunting a data-loss bug that was
+    not there. Say "gap scan on cooldown" instead; the depth line is printed
+    only when the scan really ran.
+    """
+    if total_bars > 0:
+        depth = f"{round(total_bars / 96, 1)}d stored"
+    else:
+        depth = "gap scan on cooldown"
+    gaps = (
+        f"⚠️ gaps: {gaps_found}, filled: {gaps_filled}"
+        if gaps_found > 0
+        else "no gaps. OK"
+    )
+    return f"+{count} candles, {depth}, {gaps}"
+
+
 def _fmt_eta(seconds: float) -> str:
     try:
         s = int(max(0, round(seconds)))
@@ -1412,9 +1479,12 @@ def _fmt_eta(seconds: float) -> str:
         return "?"
     h, rem = divmod(s, 3600)
     m, sec = divmod(rem, 60)
+    # Unit suffixes on purpose: the bare "22:13" was routinely misread as a
+    # wall-clock time ("last updated at 22:13") instead of "22 min 13 s left".
     if h > 0:
-        return f"{h}:{m:02d}:{sec:02d}"
-    return f"{m}:{sec:02d}"
+        return f"{h}h{m:02d}m"
+    return f"{m}m{sec:02d}s"
+
 
 
 class GlobalProgress:
@@ -1545,6 +1615,11 @@ def _make_exchange(ccxt_id: str):
     }
     if settings.socks5_proxy:
         config["socks_proxy"] = settings.socks5_proxy
+    # same line the 1d engine gets from `create_exchange`: two engines, two log
+    # files, and "which route" has to be answerable from either one alone
+    log(f"exchange client {ccxt_id}: route="
+        + (settings.socks5_proxy if settings.socks5_proxy
+           else "direct (no proxy: SOCKS5_PROXY is empty)"))
     return getattr(ccxt_async, ccxt_id)(config)
 
 
@@ -1556,7 +1631,17 @@ def _make_exchange(ccxt_id: str):
 # process RSS up until the machine hit swap. Now: one long-lived instance
 # per exchange; markets reloaded at most every MARKETS_TTL_SECONDS; instance
 # recreated at most every EXCHANGE_MAX_AGE_SECONDS.
-MARKETS_TTL_SECONDS = 1800.0           # reload market lists at most every 30 min
+MARKETS_TTL_SECONDS = 1800.0           # documented default; see _markets_ttl_sec()
+
+
+def _markets_ttl_sec() -> float:
+    """Mirror of `src/core/updater.py` — both engines hold their own exchange
+    instances, so the refresh policy of the 1d engine and this one has to come
+    from the same knob (see there for why it is read per decision)."""
+    ttl = getattr(settings, "exchange_markets_ttl_sec", None)
+    if ttl is None or float(ttl) < 0:
+        return MARKETS_TTL_SECONDS
+    return float(ttl)        # 0 is a legitimate answer: "reload every cycle"
 EXCHANGE_MAX_AGE_SECONDS = 6 * 3600.0  # recreate each ccxt instance every 6 h
 _EXCHANGES: Dict[str, dict] = {}       # ccxt_name -> {ex, born_at, markets_at}
 
@@ -1575,7 +1660,7 @@ async def get_persistent_exchange(ccxt_name: str):
                  "born_at": now, "markets_at": 0.0}
         _EXCHANGES[ccxt_name] = entry
     ex = entry["ex"]
-    if now - entry["markets_at"] > MARKETS_TTL_SECONDS or not getattr(ex, "markets", None):
+    if now - entry["markets_at"] > _markets_ttl_sec() or not getattr(ex, "markets", None):
         ok = await load_markets_retries(ex, ccxt_name, reload=True)
         if ok:
             entry["markets_at"] = time.time()
@@ -1586,34 +1671,107 @@ async def get_persistent_exchange(ccxt_name: str):
     return ex
 
 
-def release_memory() -> None:
-    """Return freed heap arenas to the OS after a cycle. Python's allocator
-    ratchets RSS to the cycle peak and NEVER hands it back on its own — that
-    ratchet is what filled RAM + swap over hours. gc + malloc_trim(0) gives
-    it back on Linux; a harmless no-op elsewhere."""
+# `release_memory` is imported from src.utils.memory (the shared helper) — the
+# local definition that used to live here was the one-shot end-of-cycle trim.
+# The background `memory_release_loop` (started in main_15m_loop) now runs it
+# periodically DURING the sweep and the idle sleep, not only after a full cycle.
+
+
+_PROXY_CLASH = {"told": False}
+
+
+def _proxy_clash_note(exc: BaseException) -> str:
+    """Return the sentence that explains a proxy-library clash, or "" if this is
+    not one.
+
+    A connector whose signature does not match aiohttp's is not flakiness, a rate
+    limit, or a slow market list: it fails before the socket opens, identically for
+    every exchange in the process, and no amount of retrying changes a function's
+    parameters. The engines used to spend 3 attempts x 6 exchanges on it every cycle
+    (18 lines, 0 information), and the operator had no way to see that the tunnel was
+    fine and the LIBRARY was stale. Naming the version pair and the install command is
+    the difference between a log and a fix.
+    """
+    text = repr(exc)
+    if "_wrap_create_connection" not in text or "ProxyConnector" not in text:
+        return ""
     try:
-        import gc
-
-        gc.collect()
+        import aiohttp
+        import aiohttp_socks
+        libs = (f"aiohttp {aiohttp.__version__} + "
+                f"aiohttp-socks {getattr(aiohttp_socks, '__version__', '?')}")
     except Exception:
-        pass
+        libs = "aiohttp + aiohttp-socks (versions unreadable)"
+    return (f"the SOCKS connector library is incompatible with this aiohttp "
+            f"({libs}): `_wrap_create_connection` became keyword-only `addr_infos` "
+            f"in aiohttp 3.10+, so the connector raises TypeError before any request "
+            f"is sent and NO exchange can load. Fix the environment, not the timeout: "
+            f"`poetry add \"aiohttp-socks>=0.12\"` (or pip install -U it), then "
+            f"restart — the proxy itself answered fine.")
+
+
+def _markets_load_budget() -> float:
+    """Total seconds a `load_markets` may take (EXCHANGE_MARKETS_LOAD_SEC).
+    Mirror of `src/core/updater.py` — BOTH engines collect from gateio, so a
+    fix to the shared behaviour has to land in both files; a one-sided change
+    leaves one engine permanently market-less, which is what `test_both_engines_
+    *` guard against."""
+    return float(getattr(settings, "exchange_markets_load_sec", 240.0) or 240.0)
+
+
+async def _load_markets_widened(exchange, wait_sec: float, awaitable_factory) -> None:
+    """One `load_markets` with both ceilings lifted for its duration only.
+
+    At the tunnel's measured 7.6 KB/s, gate's ~1.4 MB of market lists needs
+    minutes, and `_make_exchange` gives the client a 20 s per-request timeout on
+    top of the outer wait — either one alone kills the load. The client timeout is
+    raised to `wait_sec` and restored in the `finally`, because a 20 s candle
+    fetch timeout is what keeps a dead exchange from stalling a cycle.
+    """
+    saved = getattr(exchange, "timeout", None)
+    widened = False
+    if saved is not None:
+        try:
+            want = int(wait_sec * 1000)
+            if int(saved) < want:
+                exchange.timeout = want
+                widened = True
+        except (TypeError, ValueError):
+            saved = None            # not an int-ish attribute: outer wait only
     try:
-        import ctypes
+        await awaitable_factory()
+    finally:
+        if widened:
+            exchange.timeout = saved
 
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception:
-        pass
 
-
-async def load_markets_retries(exchange, ccxt_name, attempts: int = 3, timeout: float = 30.0, reload: bool = False) -> bool:
-    """Load markets with retries — gateio/htx occasionally time out on flaky networks."""
+async def load_markets_retries(exchange, ccxt_name, attempts: int = 3,
+                               timeout: Optional[float] = None,
+                               reload: bool = False) -> bool:
+    """Load markets with retries — gateio/htx occasionally time out on flaky
+    networks, and at the speed of this tunnel a 30 s budget never covered gate's
+    market lists at all. `timeout=None` = EXCHANGE_MARKETS_LOAD_SEC."""
+    if timeout is None:
+        timeout = _markets_load_budget()
+    if _PROXY_CLASH["told"]:
+        # every exchange in this process fails the same way — do not ask six times
+        log(f"  [MARKETS] {ccxt_name} skipped: the proxy-library clash reported "
+            f"above still applies (restart after fixing it)")
+        return False
     last_err = None
     for attempt in range(1, attempts + 1):
         try:
-            await asyncio.wait_for(exchange.load_markets(reload), timeout=timeout)
+            await _load_markets_widened(
+                exchange, timeout,
+                lambda: asyncio.wait_for(exchange.load_markets(reload), timeout=timeout))
             return True
         except Exception as e:
             last_err = e
+            clash = _proxy_clash_note(e)
+            if clash:
+                _PROXY_CLASH["told"] = True
+                log(f"  ⛔ {ccxt_name}: market load is structurally impossible — {clash}")
+                return False
             if attempt < attempts:
                 log(f"  [MARKETS] {ccxt_name} attempt {attempt}/{attempts} failed: {e!r} — retrying...")
                 await asyncio.sleep(2.0)
@@ -1672,31 +1830,212 @@ async def process_exchange(ccxt_name):
                     exchange, s, ccxt_name
                 )
                 processed += 1
-                total_days = round(total_bars / 96, 1)
-                if gaps_found > 0:
-                    gap_msg = f"⚠️ gaps: {gaps_found}, filled: {gaps_filled}"
-                else:
-                    gap_msg = "no gaps. OK"
+                result_msg = format_pair_result(count, total_bars, gaps_found, gaps_filled)
 
                 if GLOBAL_PROGRESS is not None:
                     g_done, g_total, eta_str, pct = GLOBAL_PROGRESS.tick()
                     if count > 0 or g_done % PROGRESS_LOG_EVERY == 0:
                         log(
                             f"  [15M] [ALL {g_done}/{g_total} · {pct:.1f}% · ETA {eta_str}] "
-                            f"[{ccxt_name} {processed}/{total}] {s}: +{count} candles, "
-                            f"{total_days}d stored, {gap_msg}"
+                            f"[{ccxt_name} {processed}/{total}] {s}: {result_msg}"
                         )
                 else:
                     if count > 0 or processed % 10 == 0:
                         log(
-                            f"  [15M] [{ccxt_name}] {processed}/{total} | {s}: +{count} candles, "
-                            f"{total_days}d stored, {gap_msg}"
+                            f"  [15M] [{ccxt_name}] {processed}/{total} | {s}: {result_msg}"
                         )
 
         await asyncio.gather(*[worker(s) for s in syms])
     finally:
         # instance stays alive across cycles — the registry rotates it by age
         pass
+
+
+# ---------------------------------------------------------------------------
+# PRIORITY LANE — 1-second refresh of the pairs the dashboard is displaying.
+#
+# The dashboard publishes the open pair plus its ±5 neighbours into
+# `dashboard_priority_pairs`; this task refreshes exactly those tables every
+# second, in parallel with the ~40-minute full sweep. The dashboard therefore
+# renders stored rows only: no chart-side downloading, no chart-side maths.
+# ---------------------------------------------------------------------------
+
+_LANE_LAST_RUN: Dict[Tuple[str, str], float] = {}
+_LANE_INFLIGHT: Set[Tuple[str, str]] = set()
+
+
+async def refresh_priority_pair(ccxt_name: str, symbol: str) -> int:
+    """
+    Tail refresh of ONE pair: fetch the candles that are MISSING at the end of
+    the table (the last few when it is current, the whole hole when the
+    collector was off) and persist them through the same writer the main cycle
+    uses. Deliberately light — no gap scan of the interior, no history prefill,
+    no tier moves; the full sweep still owns those. See `lane_since_sec` for how
+    far back "missing at the end" reaches.
+    Returns the number of candles written (0 on any failure).
+    """
+    # The dashboard may publish either spelling ("gateio" / "gate").
+    ccxt_name, ccxt_id = resolve_exchange_alias(ccxt_name, EXCHANGE_MAP)
+    if ccxt_name not in ALLOWED_EXCHANGES:
+        return 0
+    if (ccxt_name, symbol) in _DEAD_SYMBOLS or should_skip_pair(symbol, ccxt_name):
+        return 0
+
+    exchange = await get_persistent_exchange(ccxt_name)
+    if exchange is None:
+        return 0
+
+    tbl = f"{symbol.replace('/', '_').replace('-', '_')}_on_{ccxt_name}".lower()
+    current_db, last_ts, _min_ts = await find_table_in_dbs(tbl)
+    if not current_db:
+        # Creating tables is the full sweep's job: a mistyped/foreign pair
+        # published by a dashboard must never spawn an empty junk table.
+        return 0
+
+    # Where to start, and how many bars to ask for: `lane_since_sec` — the same
+    # rule the daily engine uses. The one-bar step back is what makes the forming
+    # bar get REPLACED (save_candles_to_table deletes everything >= the oldest
+    # fetched timestamp, and `since` is exclusive on some exchanges), and the
+    # hours-behind case is what makes the HOLE between that bar and `now` get
+    # written instead of refreshed around. With the old fixed `limit=10` a
+    # collector that had been off for a day left exactly that hole in the chart,
+    # because 10 bars near `now` are not 10 bars after the table's last row.
+    step = 900
+    now = int(time.time())
+    since_sec, want_bars = lane_since_sec(
+        last_ts, now, step, settings.priority_lane_catchup_max_bars
+    )
+    since_ms = clamp_ohlcv_since_ms(ccxt_name, since_sec * 1000)
+    limit = min(1000, max(10, int(want_bars)))
+
+    try:
+        cs = await asyncio.wait_for(
+            exchange.fetch_ohlcv(symbol, "15m", since=since_ms, limit=limit),
+            timeout=8.0,
+        )
+    except Exception as e:
+        # A failed fetch is WHY the chart is stale — say so instead of returning 0
+        # into the void (rate-limited: the lane ticks every few seconds per pair).
+        if lane_warn_due(("fetch", ccxt_name, symbol)):
+            log(f"  [LANE] ⚠️ {symbol} @{ccxt_name}: fetch failed ({type(e).__name__}: {e}) "
+                f"— the gap stays open until this works")
+        _mark_dead_symbol_if_gone(e, ccxt_name, symbol)
+        return 0
+
+    if not cs:
+        return 0
+
+    try:
+        await save_candles_to_table(current_db, tbl, symbol, ccxt_id, cs)
+    except Exception as e:
+        log(f"  [LANE] ⚠️ {symbol} @{ccxt_name}: write failed ({type(e).__name__}: {e})")
+        return 0
+    if len(cs) > 6 and last_ts > 1:
+        # A bridge this long is worth a line: it is the difference between "the
+        # lane is refreshing" and "the lane is repairing the pair you are looking
+        # at", and without it the write looks like the ordinary 1-bar rewrite.
+        log(f"  [LANE] ⚡ {symbol} @{ccxt_name}: wrote {len(cs)} bar(s) across a "
+            f"{max(0, now - int(last_ts)) / 3600.0:.1f}h hole in {tbl}")
+    return len(cs)
+
+
+# Cadence of the heartbeat stamp into `dashboard_priority_pairs` (see
+# `mark_lane_service`). 15 s is fresh enough for a UI badge and cheap enough to
+# never be a second database workload.
+LANE_STAMP_MIN_INTERVAL_SEC = 15.0
+_LANE_STAMP_AT = [0.0]
+
+
+# Pairs completed since the lane last stamped the heartbeat table, and the number
+# of candles those runs wrote. Stamping per refresh would be a write per pair per
+# second, so the loop reports in batches (see `LANE_STAMP_MIN_INTERVAL_SEC`).
+_LANE_SERVED: set = set()
+_LANE_SERVED_BARS = {"n": 0}
+
+
+async def _lane_worker(pair: Tuple[str, str], stats: Dict[str, int]) -> None:
+    exchange_name, symbol = pair
+    try:
+        written = await refresh_priority_pair(exchange_name, symbol)
+        stats["candles"] += written
+        stats["pairs"] += 1
+        if written >= 0:                       # a served attempt, even a 0-bar one
+            _LANE_SERVED.add(pair)
+            _LANE_SERVED_BARS["n"] += written
+    finally:
+        _LANE_LAST_RUN[pair] = time.time()
+        _LANE_INFLIGHT.discard(pair)
+
+
+async def priority_lane_loop() -> None:
+    """
+    Parallel task started next to the full sweep: every
+    PRIORITY_LANE_INTERVAL_SEC it reads the dashboard's published pair set and
+    refreshes each pair whose own interval has elapsed. Never raises — a lane
+    hiccup must not take the collector down.
+    """
+    if not settings.priority_lane_enabled:
+        log("[15M] priority lane disabled (PRIORITY_LANE_ENABLED=false)")
+        return
+
+    interval = max(0.2, float(settings.priority_lane_interval_sec))
+    ttl = float(settings.priority_lane_ttl_sec)
+    coord_db = settings.priority_lane_db or DB_HIGH
+    log(
+        f"[15M] ⚡ priority lane ON: refreshing dashboard pairs from "
+        f"'{coord_db}.{PRIORITY_TABLE}' every {interval:g}s "
+        f"(≤{MAX_PRIORITY_PAIRS} pairs, publication TTL {ttl:g}s)"
+    )
+
+    stats = {"pairs": 0, "candles": 0}
+    last_report = time.time()
+
+    while True:
+        started = time.time()
+        try:
+            pool = db_pools.get(coord_db)
+            if pool is None:
+                await asyncio.sleep(interval)
+                continue
+
+            async with pool.acquire() as conn:
+                pairs = await read_priority_pairs(conn, ttl_sec=ttl)
+
+            due = [
+                p for p in due_pairs(pairs, _LANE_LAST_RUN, interval)
+                if p not in _LANE_INFLIGHT
+            ]
+            for p in due:
+                _LANE_INFLIGHT.add(p)
+                asyncio.create_task(_lane_worker(p, stats))
+
+            # Heartbeat: "the pair you are looking at IS being serviced", so the
+            # dashboard can tell a slow collector from no collector at all.
+            if _LANE_SERVED and time.time() - _LANE_STAMP_AT[0] >= LANE_STAMP_MIN_INTERVAL_SEC:
+                _LANE_STAMP_AT[0] = time.time()
+                served, bars = list(_LANE_SERVED), _LANE_SERVED_BARS["n"]
+                _LANE_SERVED.clear()
+                _LANE_SERVED_BARS["n"] = 0
+                async with pool.acquire() as conn:
+                    await mark_lane_service(conn, served, bars, timeframe="15m")
+
+            if time.time() - last_report >= 60.0:
+                log(
+                    f"  [LANE] last 60s: {stats['pairs']} refreshes, "
+                    f"{stats['candles']} candles written, "
+                    f"{len(pairs)} pair(s) currently displayed"
+                )
+                stats = {"pairs": 0, "candles": 0}
+                last_report = time.time()
+        except Exception as e:
+            # Kept, but at most one line per (kind of) error per 10 minutes: this
+            # loop ticks once a second, and a lane that cannot read its table used
+            # to bury the log in identical warnings — while a *silently* dead lane
+            # was the other failure mode. Both are covered now.
+            if lane_warn_due(("cycle", type(e).__name__, str(e)[:80])):
+                log(f"  [LANE] ⚠️ cycle error ({type(e).__name__}: {e})")
+
+        await asyncio.sleep(max(0.05, interval - (time.time() - started)))
 
 
 async def main_15m_loop():
@@ -1715,8 +2054,29 @@ async def main_15m_loop():
     # (e.g. bitget) are skipped — the 1d engine still covers them.
     active_exchanges = [e for e in EXCHANGE_MAP.keys() if e in ALLOWED_EXCHANGES]
 
+    # The priority lane runs FOREVER in parallel with the sweep below: the
+    # sweep gives every pair a slow full refresh (~40 min at 7.5k pairs), the
+    # lane keeps the ≤12 pairs the dashboard is showing second-fresh.
+    lane_task = asyncio.create_task(priority_lane_loop(), name="priority-lane")
+    # Periodic heap trimming beside the lane: frees pages during the cycle and
+    # during the idle sleep so RSS+swap never ratchet up over hours (the
+    # one-shot release_memory() at end-of-cycle was too late).
+    setup_malloc_trim()
+    mem_task = asyncio.create_task(memory_release_loop(), name="memory-release")
+
     global GLOBAL_PROGRESS
     while True:
+        if settings.priority_lane_enabled and lane_task.done() and not lane_task.cancelled():
+            exc = lane_task.exception()
+            if exc is not None:
+                log(f"  [LANE] ⚠️ lane task died ({type(exc).__name__}: {exc}) — restarting")
+            lane_task = asyncio.create_task(priority_lane_loop(), name="priority-lane")
+        if mem_task.done() and not mem_task.cancelled():
+            exc = mem_task.exception()
+            if exc is not None:
+                log(f"  [MEM] ⚠️ memory-release task died ({type(exc).__name__}: {exc}) — restarting")
+            mem_task = asyncio.create_task(memory_release_loop(), name="memory-release")
+
         if not active_exchanges:
             log(
                 f"⚠️  [15M] no exchange to serve: ALLOWED_EXCHANGES="

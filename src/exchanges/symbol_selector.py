@@ -70,7 +70,13 @@ def get_exchange_url(exchange_id: str, symbol: str) -> str:
         "mexc": f"https://www.mexc.com/exchange/{b_up}_{q_up}",
         "kucoin": f"https://trade.kucoin.com/{b_up}-{q_up}",
         "gateio": f"https://www.gate.io/trade/{b_up}_{q_up}",
-        "bingx": f"https://bingx.com/en-us/spot/{b_up}{q_up}/",
+        # BingX links by pair NAME, not by ccxt id, and the two halves of the site
+        # spell that name differently: `/en/spot/RAINPROTOCOLUSDT` (glued) and
+        # `/en/perpetual/PROLOGUE-USDT` (dashed). `en-us`, a trailing slash, or the
+        # `-SWAP` suffix all produce a page that does not open — these two shapes are
+        # the operator's working examples (2026-09-06), and both engines and the
+        # dashboard build their links from this function, so it is fixed once here.
+        "bingx": f"https://bingx.com/en/spot/{b_up}{q_up}",
         "htx": f"https://www.htx.com/trade/{b_lo}_{q_lo}/",
         "coinex": f"https://www.coinex.com/exchange/{b_lo}-{q_lo}",
         "okx": f"https://www.okx.com/en/trade-spot/{b_lo}-{q_lo}",
@@ -89,7 +95,7 @@ def get_swap_url(exchange_id: str, symbol: str) -> str:
         "mexc": f"https://futures.mexc.com/exchange/{b_up}_{q_up}",
         "kucoin": f"https://www.kucoin.com/futures/trade/{b_up}{q_up}M",
         "gateio": f"https://www.gate.com/futures/USDT/{b_up}_{q_up}",
-        "bingx": f"https://bingx.com/en-us/perpetual/{b_up}{q_up}/",
+        "bingx": f"https://bingx.com/en/perpetual/{b_up}-{q_up}",
         "htx": f"https://www.htx.com/futures/linear_swap/exchange/{b_lo}-{q_lo}/",
         "coinex": f"https://www.coinex.com/futures/{b_lo}-{q_lo}",
         "okx": f"https://www.okx.com/en/trade-swap/{b_lo}-{q_lo}-swap",

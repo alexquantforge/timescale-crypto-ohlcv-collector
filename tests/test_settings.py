@@ -21,7 +21,13 @@ def test_allowed_exchanges_empty():
 
 def test_dash_warm_neighbors_default_and_alias():
     st = Settings()
-    assert st.dash_warm_neighbors == 5
+    # 2, not 5: prefetching 11 pairs (2 timeframes of candles, up to 20 exchange
+    # range fetches, 3 feed calls and a chart build each) cost more database and
+    # network than it saved in clicks — the app felt slower to use, which is the
+    # one thing prefetching must never do.
+    assert st.dash_warm_neighbors == 2
+    assert Settings().dash_warm_delay_sec == 1.5
+    assert Settings().dash_warm_stale_skip_sec == 172800.0
     st2 = Settings(DASH_WARM_NEIGHBORS="0")
     assert st2.dash_warm_neighbors == 0
 

@@ -6,16 +6,19 @@ from typing import Tuple
 
 
 def fmt_eta(seconds: float) -> str:
-    """Formats seconds into h:mm:ss or m:ss."""
+    """Formats seconds into a human ETA: '1h05m' / '22m13s'."""
     try:
         s = int(max(0, round(seconds)))
     except Exception:
         return "?"
     h, rem = divmod(s, 3600)
     m, sec = divmod(rem, 60)
+    # Unit suffixes on purpose: the bare "22:13" was routinely misread as a
+    # wall-clock time ("last updated at 22:13") instead of "22 min 13 s left".
     if h > 0:
-        return f"{h}:{m:02d}:{sec:02d}"
-    return f"{m}:{sec:02d}"
+        return f"{h}h{m:02d}m"
+    return f"{m}m{sec:02d}s"
+
 
 
 class GlobalProgress:

@@ -6,7 +6,11 @@ pair navigation (prev/next), table lookup across the timeframe summary frames,
 and a synthetic demo-data generator used when no TimescaleDB is reachable.
 """
 import json
-from typing import List, Optional
+import os
+import pickle
+import re as _re
+from functools import lru_cache
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -115,6 +119,9 @@ def generate_demo_summary(timeframe: str) -> pd.DataFrame:
                 "ob_min_7d_volume_usd": float(rng.uniform(1e6, 5e8)),
                 "ob_spread_atr_pct": float(rng.uniform(0.5, 8)),
                 "ob_atr_no_paranormal": close * 0.02,
+                # synthetic numbers, but labelled with the estimator they imitate:
+                # the demo panel must not show a bare "ATR" the real UI outgrew
+                "atr_label": format_atr_label("1D", 5),
                 "table_name": f"demo_{t.replace('/', '_').replace(':', '').lower()}_on_{ex}",
                 "db_name": "demo_db",
                 "volume_tier": "HIGH" if rng.random() < 0.6 else "LOW",
@@ -160,6 +167,401 @@ def generate_demo_candles(timeframe: str, ticker: str, exchange: str, n: int = 1
     })
 
 
+
+# ---------------------------------------------------------------------------
+# Summary scan SQL (one query per CHUNK of tables instead of one per table)
+# ---------------------------------------------------------------------------
+
+# Padding types for columns a table does not have. Tables whose orderbook
+# snapshot never landed simply lack the ob_* columns, so every subquery must
+# expose the same column list — NULL-casted where the column is missing.
+SUMMARY_COLUMN_TYPES = {
+    "ticker": "text",
+    "exchange": "text",
+    "asset_type": "text",
+    "ob_vitality_grade": "text",
+    "ob_is_barcode": "boolean",
+}
+SUMMARY_DEFAULT_TYPE = "double precision"
+
+# Every subquery of the chunk is ordered by "Timestamp" and projects it as
+# `max_ts`, so that column takes part in the UNION type resolution even though
+# it is not part of the requested summary keys.
+SUMMARY_ORDER_COLUMN = "Timestamp"
+SUMMARY_ORDER_ALIAS = "max_ts"
+
+# PostgreSQL unifies these type families inside a UNION ALL by itself. Two
+# DIFFERENT families in the same projected column (`double precision` vs `text`
+# being the classic) is a hard DatatypeMismatchError for the WHOLE query — i.e.
+# for all 120 tables of the chunk, which then degrades into 120 individual
+# round trips. That is what made the "batched" scan slower than the unbatched
+# one on databases whose legacy tables still carry TEXT-ified ob_* columns.
+# Both spellings are listed on purpose: information_schema.columns reports
+# SQL type NAMES ("double precision"), pg_catalog.pg_type reports typname
+# aliases ("float8") — and the scan reads pg_catalog, because
+# information_schema.columns is a VIEW that resolves has_table_privilege()
+# for every column of every table: on a 14k-table database it measured
+# 30…250 s, which was the real startup cost. Same families, two vocabularies.
+_PG_TYPE_GROUPS = {
+    "smallint": "number", "integer": "number", "bigint": "number",
+    "int2": "number", "int4": "number", "int8": "number", "serial": "number",
+    "real": "number", "double precision": "number", "float4": "number",
+    "float8": "number", "numeric": "number", "decimal": "number",
+    "money": "number",
+    "text": "text", "character varying": "text", "varchar": "text",
+    "character": "text",
+    "bpchar": "text", "name": "text", "citext": "text", "uuid": "text",
+    "boolean": "bool", "bool": "bool",
+    "date": "time", "timestamp without time zone": "time",
+    "timestamp with time zone": "time", "time without time zone": "time",
+    "time with time zone": "time", "interval": "time",
+    "json": "json", "jsonb": "json",
+}
+
+# Free-text columns the scan must NEVER try to convert to numbers.
+SUMMARY_TEXT_COLUMNS = (
+    "table_name", "db_name", "volume_tier", "ticker", "exchange", "asset_type",
+    "ob_vitality_grade", "open_time_msk", "open_time_almaty",
+    "url_of_trading_pair", "url_of_swap_contract_if_it_exists",
+)
+
+# A TEXT-typed number writes itself as '' when the source value was NULL, and
+# pandas reads that back as a non-null empty string: blanks count as nulls so
+# one legacy row cannot veto the conversion of the whole column.
+SUMMARY_BLANK_TOKENS = frozenset(("", "none", "null", "nan", "nat", "-"))
+SUMMARY_TRUE_TOKENS = frozenset(("true", "t", "yes", "y", "1", "1.0"))
+SUMMARY_FALSE_TOKENS = frozenset(("false", "f", "no", "n"))
+# Never numberified: bool(NaN) is True, so a flag column whose NULLs pandas
+# turned into a float NaN would read as "this market IS a barcode" — a DEAD
+# health chip on every pair that simply has no orderbook snapshot yet.
+SUMMARY_BOOL_COLUMNS = ("ob_is_barcode",)
+
+
+@lru_cache(maxsize=None)
+def _type_family(t: str) -> str:
+    return _PG_TYPE_GROUPS.get(t, t or "unknown")
+
+
+def pg_type_group(data_type) -> str:
+    """information_schema data_type -> UNION-compatibility family.
+
+    Cached: the plan is resolved for every (chunk table x projected column)
+    pair, which on a 8k-pair database is ~10^5 calls per scan — all of them
+    over a handful of distinct type names.
+    """
+    return _type_family((data_type or "").strip().lower())
+
+
+def normalize_summary_table_columns(tables) -> dict:
+    """
+    `tables` -> {table: {column: pg type or None}}.
+
+    Accepts both shapes the scan has historically used: a set of column names
+    (types unknown -> None) or a mapping column -> information_schema
+    `data_type`, which is what makes type-stable batching possible.
+    """
+    out: dict = {}
+    for tbl, cols in tables.items():
+        if isinstance(cols, dict):
+            out[tbl] = {c: (t or None) for c, t in cols.items()}
+        else:
+            out[tbl] = {c: None for c in cols}
+    return out
+
+
+def resolve_summary_union_casts(tables: dict, columns) -> Dict[str, str]:
+    """
+    Cast plan for one chunk: {column: "text"} for every projected column whose
+    type family is NOT uniform across the subqueries of this chunk.
+
+    Uniform (or type-unknown) chunks get an EMPTY plan, so the emitted SQL
+    stays byte-identical to the naive one and PostgreSQL does the work. Only a
+    genuinely mixed column is flattened to TEXT — the values are then converted
+    back in Python by `coerce_summary_types`, which cannot fail.
+    """
+    normalized = normalize_summary_table_columns(tables)
+    plan: Dict[str, str] = {}
+    if not normalized:
+        return plan
+    for col in list(columns) + [SUMMARY_ORDER_COLUMN]:
+        expected = SUMMARY_COLUMN_TYPES.get(col, SUMMARY_DEFAULT_TYPE)
+        groups = set()
+        for cols in normalized.values():
+            # A table without the column is padded with NULL::<expected>, so
+            # it contributes the expected family to the UNION as well.
+            declared = cols.get(col, None) if col in cols else None
+            groups.add(pg_type_group(declared) if declared else pg_type_group(expected))
+        if len(groups) > 1:
+            plan[col] = "text"
+    return plan
+
+
+def summary_column_sql(table_columns, column: str, cast: Optional[str] = None) -> str:
+    """One projected column of a per-table subquery (real column or NULL pad).
+
+    `cast` overrides the projected type for the WHOLE chunk (see
+    `resolve_summary_union_casts`); without it the column is emitted natively.
+    """
+    if column in table_columns:
+        return f'"{column}"::{cast}' if cast else f'"{column}"'
+    pg_type = cast or SUMMARY_COLUMN_TYPES.get(column, SUMMARY_DEFAULT_TYPE)
+    return f'NULL::{pg_type} AS "{column}"'
+
+
+def build_summary_union_sql(tables: dict, columns, force_text: bool = False) -> str:
+    """
+    UNION ALL of `last row of table` subqueries for a chunk of tables.
+
+    The scan used to issue ONE round trip per table: ~7.5k tables per
+    timeframe meant ~15k queries on dashboard startup, which turns into a
+    minutes-long spinner as soon as the collector puts the database under
+    load. Batching keeps the exact same result (last row, missing columns
+    padded) at ~1/100th of the round trips.
+
+    `tables` maps table_name -> set of its column names, or -> {column:
+    data_type} when the caller also read information_schema types (strongly
+    preferred: it is what keeps the UNION type-stable). Tables without a
+    "Timestamp" column are skipped.
+
+    `force_text` flattens EVERY column to TEXT. It is the cheap second attempt
+    for a chunk that still failed for an unforeseeable type reason: one extra
+    round trip per chunk instead of `len(chunk)` per-table reads.
+    """
+    parts = []
+    if force_text:
+        plan = {c: "text" for c in list(columns) + [SUMMARY_ORDER_COLUMN]}
+    else:
+        plan = resolve_summary_union_casts(tables, columns)
+    for tbl, cols in tables.items():
+        if SUMMARY_ORDER_COLUMN not in cols:
+            continue
+        projected = ", ".join(
+            summary_column_sql(cols, c, plan.get(c)) for c in columns
+        )
+        order_cast = plan.get(SUMMARY_ORDER_COLUMN)
+        ts = f'"{SUMMARY_ORDER_COLUMN}"'
+        if order_cast:
+            ts = f"{ts}::{order_cast}"
+        parts.append(
+            f"(SELECT '{tbl}'::text AS table_name, {ts} AS {SUMMARY_ORDER_ALIAS}, {projected}"
+            f' FROM "{tbl}" ORDER BY "{SUMMARY_ORDER_COLUMN}" DESC LIMIT 1)'
+        )
+    return "\nUNION ALL\n".join(parts)
+
+
+def coerce_summary_types(df):
+    """
+    Restore numeric/boolean dtypes of a summary frame.
+
+    A chunk whose column types disagreed is flattened to TEXT in SQL (that is
+    the price of batching), and a legacy table may hand back a TEXT column on
+    the per-table path too — pandas would then sort `ob_vitality_score`
+    lexicographically and every NumberColumn format would choke on a str.
+
+    A column is converted ONLY when nothing is lost: every value that is not
+    blank/None must parse. A genuinely textual column is therefore left alone
+    instead of being silently erased into NaN.
+    """
+    if df is None or df.empty:
+        return df
+    for col in df.columns:
+        if col in SUMMARY_TEXT_COLUMNS:
+            continue
+        s = df[col]
+        if getattr(s, "dtype", None) is None or s.dtype.kind not in ("O", "S", "U", "f"):
+            continue  # already int / bool / datetime
+        lowered = s.astype(str).str.strip().str.lower()
+        if col in SUMMARY_BOOL_COLUMNS:
+            # 'true'/'false' text, 1/0 floats or plain None -> a real bool
+            df[col] = lowered.isin(SUMMARY_TRUE_TOKENS)
+            continue
+        blank = s.isna() | lowered.isin(SUMMARY_BLANK_TOKENS)
+        conv = pd.to_numeric(s, errors="coerce")
+        if not (conv.isna() & ~blank).any():
+            df[col] = conv
+    return df
+
+
+def chunked(items, size: int):
+    """Yields consecutive slices of `items` (list or dict) of at most `size`."""
+    if isinstance(items, dict):
+        keys = list(items.keys())
+        for i in range(0, len(keys), size):
+            yield {k: items[k] for k in keys[i:i + size]}
+        return
+    items = list(items)
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+
+# ---------------------------------------------------------------------------
+# Summary snapshot on disk (stale-while-revalidate startup)
+# ---------------------------------------------------------------------------
+
+def snapshot_path(directory: str, timeframe: str) -> str:
+    """File the last good summary of a timeframe is cached in."""
+    base = directory or os.path.join(
+        os.path.expanduser("~"), ".cache", "timescale-ohlcv-dashboard"
+    )
+    return os.path.join(base, f"summary_{timeframe}.pkl")
+
+
+def save_summary_snapshot(path: str, df: pd.DataFrame) -> bool:
+    """Persists a scan result; failures are non-fatal (cache is an optimisation)."""
+    if df is None or df.empty:
+        return False
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        df.to_pickle(path)
+        return True
+    except Exception:
+        return False
+
+
+def load_summary_snapshot(path: str, max_age_sec: float):
+    """
+    Returns (frame, age_sec) of the stored snapshot, or (None, None).
+
+    Lets the dashboard paint the pair list and charts IMMEDIATELY on startup
+    instead of waiting for a full database scan — which, while the collector
+    is writing, is exactly the difference between a usable page and an endless
+    spinner. The fresh scan then replaces it.
+    """
+    try:
+        age = _time.time() - os.path.getmtime(path)
+        if age > float(max_age_sec):
+            return None, None
+        return coerce_summary_types(pd.read_pickle(path)), age
+    except Exception:
+        return None, None
+
+
+# ---------------------------------------------------------------------------
+# Table/column inventory on disk — the same idea one level down
+# ---------------------------------------------------------------------------
+
+def _safe_component(text: str) -> str:
+    return _re.sub(r"[^A-Za-z0-9_.-]", "_", str(text or ""))[:64]
+
+
+def inventory_path(directory: str, db_host: str, db_port, db_name: str) -> str:
+    """File the last catalog listing of one database is cached in."""
+    base = directory or os.path.join(
+        os.path.expanduser("~"), ".cache", "timescale-ohlcv-dashboard"
+    )
+    return os.path.join(
+        base, f"inventory_{_safe_component(db_host)}_{db_port}_{_safe_component(db_name)}.pkl"
+    )
+
+
+def save_inventory_snapshot(path: str, tables: dict) -> bool:
+    """Persist `{table: {column: data_type}}` after a REAL pg_catalog read.
+
+    The listing is the most expensive thing a sweep does on a big database — the
+    operator's own restarts each began with `+catalog 23.6s` / `27.3s` in front of
+    the first chunk — and it changes on the order of listings and migrations, not
+    seconds. Written once per read (TTL `DASH_SCAN_INVENTORY_TTL_SEC`, and never
+    in the middle of a sweep), through a temp file, because a cache poisoned by an
+    interrupted write is worse than no cache.
+    """
+    if not tables:
+        return False
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as fh:
+            pickle.dump({"at": _time.time(), "tables": dict(tables)}, fh,
+                        protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def load_inventory_snapshot(path: str, max_age_sec: float):
+    """Returns (tables, age_sec) or (None, None).
+
+    `max_age_sec` is deliberately SHORTER than the summary snapshot's: a stale
+    pair list self-heals (a table the database no longer has is dropped by
+    `forget_missing_relations`, a new listing appears at the next real read), but
+    a table that was MOVED out of `public` by the zombie prune must not stay
+    selectable for a day.
+    """
+    try:
+        age = _time.time() - os.path.getmtime(path)
+        if age > float(max_age_sec):
+            return None, None
+        with open(path, "rb") as fh:
+            blob = pickle.load(fh)
+        tables = blob.get("tables") if isinstance(blob, dict) else None
+        if not isinstance(tables, dict) or not tables:
+            return None, None
+        return tables, age
+    except Exception:
+        return None, None
+
+
+def markets_path(directory: str, ccxt_id: str) -> str:
+    """File the last market catalog of one exchange is cached in."""
+    base = directory or os.path.join(
+        os.path.expanduser("~"), ".cache", "timescale-ohlcv-dashboard"
+    )
+    return os.path.join(base, f"markets_{_safe_component(ccxt_id)}.pkl")
+
+
+def save_markets_snapshot(path: str, markets) -> bool:
+    """Persist the PARSED market dicts after a real `load_markets()`.
+
+    A ccxt market load is a sequence of large list requests (gate: spot
+    `…/spot/currency_pairs` ~94 KB plus a ~1.3 MB swap list, each under one
+    per-request timeout) — the slowest thing the dashboard does before it can
+    show a price, and the reason one unreachable endpoint used to blank every
+    gate chart, tape and gap stitch in the process. The catalog itself changes
+    on the scale of listings and delistings, so the last good one is worth more
+    than a live one on a page that only needs symbol metadata to draw candles.
+    Only a network load writes this: a disk-seeded catalog must never refresh
+    its own file, or a broken API would keep the cache warm forever.
+    """
+    if markets is None:
+        return False
+    try:
+        values = list(markets.values()) if isinstance(markets, dict) else list(markets)
+        payload = [dict(m) for m in values if isinstance(m, dict)]
+        if not payload:
+            return False
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as fh:
+            pickle.dump({"at": _time.time(), "markets": payload}, fh,
+                        protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def load_markets_snapshot(path: str, max_age_sec: float):
+    """Returns (list_of_market_dicts, age_sec) or (None, None).
+
+    A list, not the dict: ccxt's `set_markets()` derives the symbol keys and the
+    `markets_by_id` index itself, and feeding it the exact shape `fetch_markets`
+    would have returned is what keeps `precision`/`contractSize` defaults intact.
+    """
+    try:
+        age = _time.time() - os.path.getmtime(path)
+        if age > float(max_age_sec):
+            return None, None
+        with open(path, "rb") as fh:
+            blob = pickle.load(fh)
+        markets = blob.get("markets") if isinstance(blob, dict) else None
+        if not isinstance(markets, list) or not markets:
+            return None, None
+        return markets, age
+    except Exception:
+        return None, None
+
+
 # ---------------------------------------------------------------------------
 # Health strip (compact green→red indicators at the top of the Charts tab)
 # ---------------------------------------------------------------------------
@@ -188,8 +590,40 @@ def score_depth_usd(depth) -> float:
     return _clamp01((np.log10(float(depth)) - 3.0) / (np.log10(50_000.0) - 3.0))
 
 
+def format_atr_label(timeframe, period, style: str = "") -> str:
+    """The name every mention of ATR in the UI should print: `1D_ATR(5)`.
+
+    Which ATR is which matters here more than in most dashboards, because the
+    same column names are fed by three different estimators:
+
+    * `1D_ATR(n)` — median-seeded mean of True Range over the last n CLOSED
+      daily bars, iteratively trimmed to [0.5×ATR, 1.8×ATR]
+      (`compute_atr_no_paranormal_bars`) — used by the 1D engine and by the
+      health strip (whose n comes from the sidebar slider, not from `ATR_PERIOD`);
+    * `15m_ATR(n)` — the same window over 15-minute bars, smoothed Gerchik-style
+      (`compute_gerchik_atr`) — used by the 15m engine for `ob_atr_no_paranormal`
+      / `ob_spread_atr_pct` of 15m tables.
+
+    So the label is BUILT from the parameters that were actually used, never
+    hardcoded: a chip that says 5 while the setting says 14 is worse than no
+    label at all, because users read it as methodology.
+
+    `style` is for the rare case where the estimator itself is the point
+    (e.g. "Gerchik"); the long explanation belongs in the tooltip.
+    """
+    tf = str(timeframe or "?").upper().replace("M", "m") if timeframe else "?"
+    try:
+        n = int(period)
+    except (TypeError, ValueError):
+        n = 0
+    label = f"{tf}_ATR({n})" if n > 0 else f"{tf}_ATR(?)"
+    if style:
+        label += f"·{style}"
+    return label
+
+
 def score_spread_atr_pct(pct) -> float:
-    """1 = spread below 5% of daily filtered ATR, 0 = 15% or wider."""
+    """1 = spread below 5% of the ATR named in the chip, 0 = 15% or wider."""
     if pct is None:
         return 0.0
     pct = float(pct)
@@ -245,6 +679,11 @@ def build_health_strip_html(row: dict) -> str:
         except (TypeError, ValueError):
             return None
 
+    # Which ATR this frame's numbers came from, in the reader's terms. The live
+    # strip passes the label it computed the ATR with; a row read straight from a
+    # pair table carries no label, because the value was written by whichever
+    # engine owns that table (`_atr_label_for_db_row` fills that in).
+    atr_name = row.get("atr_label") or "ATR"
     tpm = _num("ob_trades_per_min")
     depth = _num("ob_total_depth_usd")
     spread_pct = _num("ob_spread_atr_pct")
@@ -252,7 +691,16 @@ def build_health_strip_html(row: dict) -> str:
 
     dead = bool(row.get("ob_is_barcode")) or (tpm is not None and tpm < 3.0)
 
-    tpm_txt = f"{tpm:.0f}/min" if tpm is not None else "n/a"
+    # Below the dead threshold the number has to be readable AT the threshold:
+    # a 0.6/min market was painted `1/min · DEAD` beside a metric card that said
+    # `0.6 trades/min`, and two renderings of one value is how a chip gets
+    # believed or disbelieved by accident.
+    if tpm is None:
+        tpm_txt = "n/a"
+    elif tpm < 3.0:
+        tpm_txt = f"{tpm:.1f}/min"
+    else:
+        tpm_txt = f"{tpm:.0f}/min"
     if dead:
         tpm_txt += " · DEAD"
 
@@ -260,11 +708,25 @@ def build_health_strip_html(row: dict) -> str:
         _health_chip("⚡ Tape", tpm_txt, 0.02 if dead else score_trades_per_min(tpm),
                      "Trades per minute: live ≥ 42/min, dead < 3/min (barcode market)"),
         _health_chip("🌊 Depth ±1%", fmt_usd_compact(depth), score_depth_usd(depth),
-                     "Orderbook depth within ±1% of price: deep ≥ $50K, thin < $1K"),
-        _health_chip("↔ Spread % ATR",
+                     "Orderbook depth within ±1% of price: deep ≥ $50K, thin < $1K"
+                     + (" — n/a: no orderbook row for this pair. The live writer "
+                        "fetches the book for the pair you have OPEN; a neighbouring "
+                        "or unwatched pair is sampled with the ticker alone (bid/ask "
+                        "only), and its table may hold no ob_* snapshot either"
+                        if depth is None else "")),
+        _health_chip(f"↔ Spread % {atr_name}",
                      f"{spread_pct:.1f}%" if spread_pct is not None else "n/a",
                      score_spread_atr_pct(spread_pct),
-                     "Spread as % of daily filtered ATR: green < 5%, red ≥ 15%"),
+                     f"(Ask − Bid) / {atr_name} × 100 — the ATR is the filtered "
+                     f"mean of True Range over the named bars (paranormal and tiny "
+                     f"bars trimmed to [0.5×ATR, 1.8×ATR], ≥3 bars needed), NOT "
+                     f"Wilder's smoothing. Green < 5%, red ≥ 15%. The absolute "
+                     f"spread and its % of the mid price are on the LIVE line below "
+                     f"— same numerator, different denominator."
+                     + (" — n/a needs BOTH the bid/ask and a value for "
+                        f"{atr_name}: a pair with fewer than 3 bars on that "
+                        "timeframe has no ATR to divide by"
+                        if spread_pct is None else "")),
         _health_chip("💰 Min 7d $Vol", fmt_usd_compact(minvol), score_min_volume_usd(minvol),
                      "min(vol×low) over the last 7 days: HIGH tier ≥ $500K/day, LOW tier < $100K/day"),
     ]
@@ -323,6 +785,53 @@ def filter_sane_summary_rows(df: pd.DataFrame, min_ts: int = 1356998400) -> pd.D
     now = _time.time()
     ok = (ts >= min_ts) & (ts <= now + 2 * 86400)
     return df[ok.fillna(False)]
+
+
+def drop_stale_spot_duplicates(
+    df: pd.DataFrame, max_lag_sec: int = 3 * 86400
+) -> pd.DataFrame:
+    """
+    Drops SPOT summary rows that are dead leftovers of the perp-first switch.
+
+    When a base asset gets a perpetual contract on an exchange, the collector
+    starts writing only `BASE/USDT:USDT` and the old `BASE/USDT` spot table is
+    never touched again (nothing drops it). It still shows up in the pair list
+    and opening it looks like a bug: candles end weeks ago while the live price
+    line sits at the current price (0G/USDT @bybit — spot 983h behind, perp
+    0.7h behind).
+
+    A spot row is dropped only when BOTH hold for the same (base, exchange):
+      * a perp row exists, and
+      * the spot table's last candle is more than `max_lag_sec` older than the
+        perp one (a spot market that is still actively collected stays).
+    """
+    if df is None or df.empty or "ticker" not in df.columns:
+        return df
+
+    ts = pd.to_numeric(df.get("max_ts"), errors="coerce").fillna(0)
+    ts = ts.where(ts < 1e11, ts // 1000)  # ms-epoch rows → seconds
+
+    perp_ts: dict = {}
+    for (idx, ticker), exchange in zip(df["ticker"].items(), df.get("exchange", "")):
+        if ":" in str(ticker):
+            base = str(ticker).split("/")[0].upper()
+            key = (base, exchange)
+            perp_ts[key] = max(perp_ts.get(key, 0), float(ts.get(idx, 0)))
+
+    if not perp_ts:
+        return df
+
+    keep = []
+    for (idx, ticker), exchange in zip(df["ticker"].items(), df.get("exchange", "")):
+        ticker = str(ticker)
+        if ":" in ticker:
+            keep.append(True)
+            continue
+        base = ticker.split("/")[0].upper()
+        p_ts = perp_ts.get((base, exchange), 0)
+        keep.append(not (p_ts and float(ts.get(idx, 0)) < p_ts - max_lag_sec))
+
+    return df[pd.Series(keep, index=df.index)]
 
 
 # ---------------------------------------------------------------------------
@@ -712,11 +1221,14 @@ def build_lightweight_chart_html(
             const fmtPrice = (p) => {{
                 const a = Math.abs(p);
                 const trim = (x) => {{
+                    // 6 significant digits, trailing zeros stripped.
+                    // `toFixed(0)` above 100 used to collapse a whole axis to
+                    // "129 / 129 / 129" and print the last price as 129
+                    // instead of 129.46 — never round away digits the chart
+                    // is actually resolving.
                     const ax = Math.abs(x);
-                    let s;
-                    if (ax >= 100) s = x.toFixed(0);
-                    else if (ax >= 1) s = x.toFixed(2);
-                    else s = x.toPrecision(4);
+                    if (ax === 0) return '0';
+                    let s = ax >= 1 ? x.toPrecision(6) : x.toPrecision(4);
                     return parseFloat(s).toString();
                 }};
                 if (a >= 1e9) return trim(p / 1e9) + 'B';
@@ -876,7 +1388,25 @@ _LIVE_POLLER_TEMPLATE = """
         const now = Math.floor(Date.now() / 1000);
         const barTs = now - (now % STEP);
         if (!lastBar || barTs > lastBar.time) {
-          lastBar = { time: barTs, open: price, high: price, low: price, close: price };
+          // A new interval starts: OPEN AT THE PREVIOUS CLOSE, not at the
+          // current live price.
+          //
+          // The poller samples the ticker once per second, so the first
+          // sample of a fresh bar is already N seconds into it. Using that
+          // sample as the open made every bar start away from where the
+          // previous one ended — a visible vertical break at each 15m
+          // boundary that the exchange chart (whose open IS the first trade,
+          // i.e. the previous close in a continuous market) never shows.
+          // The real open replaces this as soon as the candle is read back
+          // from the database.
+          const prevClose = lastBar ? lastBar.close : price;
+          lastBar = {
+            time: barTs,
+            open: prevClose,
+            high: Math.max(prevClose, price),
+            low: Math.min(prevClose, price),
+            close: price
+          };
         } else {
           lastBar.close = price;
           if (price > lastBar.high) { lastBar.high = price; }
@@ -988,6 +1518,40 @@ def build_live_poller_js(
 # In-memory gap stitching (dashboard-side, DB untouched)
 # ---------------------------------------------------------------------------
 
+def merge_summary_frames(new_rows, old_rows, key=("db_name", "table_name")):
+    """Union of a resumed scan and the list it must never shrink below.
+
+    A pair list is the dashboard's only answer to "which charts exist", so a
+    scan that read FEWER tables than the one before it must not replace it — that
+    is how every 15m chart disappeared from the selector at once: the sweep
+    resumed at its saved cursor, found the database busy, answered zero chunks,
+    and its zero rows became the truth because it was the newest.
+
+    The newer rows win per table (a pair may move tier, rename or die), and the
+    older rows are kept only for tables the new scan did not reach. So a partial
+    sweep can only ADD to what the user can open, never subtract.
+    """
+    import pandas as pd
+
+    if new_rows is None or (hasattr(new_rows, "empty") and new_rows.empty):
+        return old_rows if old_rows is not None else pd.DataFrame()
+    if old_rows is None or (hasattr(old_rows, "empty") and old_rows.empty):
+        return new_rows
+
+    new_df = new_rows if isinstance(new_rows, pd.DataFrame) else pd.DataFrame(new_rows)
+    old_df = old_rows if isinstance(old_rows, pd.DataFrame) else pd.DataFrame(old_rows)
+    if any(k not in new_df.columns or k not in old_df.columns for k in key):
+        return new_df
+    seen = {tuple(r) for r in new_df[list(key)].itertuples(index=False, name=None)}
+    keep = ~old_df[list(key)].apply(
+        lambda r: tuple(r) in seen, axis=1, result_type="reduce"
+    )
+    leftover = old_df[keep]
+    if leftover.empty:
+        return new_df
+    return pd.concat([new_df, leftover], ignore_index=True)
+
+
 def find_missing_bucket_ranges(buckets, step: int):
     """
     Given sorted unique bucket numbers (ts // step), returns the half-open
@@ -1012,15 +1576,28 @@ def stitch_candle_gaps(
     max_gap_buckets: int = 2000,
     include_tail: bool = True,
     now_sec: Optional[int] = None,
+    max_tail_buckets: int = 40_000,
+    errors: Optional[list] = None,
 ):
     """
     Fills gaps in a candle frame by fetching the missing bars through `fetcher`
     (a callable (start_bucket, end_bucket) -> [[ts_ms, o, h, l, c, v], ...]).
     With include_tail=True it also fetches the CLOSED bars between the last
     stored candle and now (the still-forming bar is left to the live poller —
-    closed bars are immutable and safe to cache). Pure data operation (fully
+    closed bars are immutable and safe to cache). The TAIL has its own, much
+    larger budget (`max_tail_buckets`, ~40k bars ≈ 1.1 years of 15m): an
+    interior hole of 3 weeks is suspicious, but a 3-week-stale table tail is
+    exactly the case that MUST be bridged — otherwise the chart ends weeks
+    before the live price line and the user sees a big empty price gap.
+    Pure data operation (fully
     testable with a fake fetcher); returns (new_df, added_count). The database
     itself is NOT modified.
+
+    `errors` (a list, optional) collects a line per range the fetcher refused to
+    answer. Without it a caller cannot tell "the exchange has no candles here"
+    (draw them flat, that is what its own chart does) from "the request timed
+    out / failed" (the chart is MISSING data and must say so in red) — those two
+    used to look identical, and the identical-looking one is the lie.
     """
     if df is None or df.empty:
         return df, 0
@@ -1032,7 +1609,7 @@ def stitch_candle_gaps(
     if include_tail and buckets:
         now = int(now_sec if now_sec is not None else _time.time())
         now_bucket = now // step
-        if buckets[-1] < now_bucket and now_bucket - buckets[-1] <= max_gap_buckets:
+        if buckets[-1] < now_bucket and now_bucket - buckets[-1] <= max_tail_buckets:
             ranges.append((buckets[-1] + 1, now_bucket))  # half-open: forming bar excluded
 
     if not ranges:
@@ -1046,7 +1623,9 @@ def stitch_candle_gaps(
     for r0, r1 in ranges:
         try:
             candles = fetcher(r0, r1) or []
-        except Exception:
+        except Exception as e:
+            if errors is not None:
+                errors.append(f"range {r0}-{r1}: {type(e).__name__}: {e}")
             candles = []
         for c in candles:
             b = int(c[0]) // (step * 1000)
@@ -1070,6 +1649,66 @@ def stitch_candle_gaps(
         .reset_index(drop=True)
     )
     return merged, len(add_df)
+
+
+
+def fill_missing_bars(
+    df: pd.DataFrame, step: int, max_filled: int = 2000
+) -> Tuple[pd.DataFrame, int]:
+    """
+    Renders intervals without trades the way exchange charts do.
+
+    Illiquid pairs (JUSUNG/USDT:USDT @gateio) simply have no kline for a
+    15m interval in which nothing traded: the exchange's own chart draws a
+    flat carry-forward bar there, ours drew a hole, and the two charts looked
+    like they disagreed about the data. Missing buckets between the first and
+    the last stored bar are filled with a zero-range bar at the previous
+    close (volume 0), so the price line stays continuous without inventing
+    any movement.
+
+    Returns (frame, filled_count); a no-op when nothing is missing or when
+    more than `max_filled` bars would have to be synthesized (a genuinely
+    dead table must still look dead).
+    """
+    if df is None or df.empty or "ts" not in df.columns or len(df) < 2:
+        return df, 0
+
+    frame = df.sort_values("ts").reset_index(drop=True)
+    buckets = [int(t) // step for t in frame["ts"]]
+    missing = find_missing_bucket_ranges(buckets, step)
+    if not missing:
+        return df, 0
+
+    total = sum(r1 - r0 for r0, r1 in missing)
+    if total > max_filled:
+        return df, 0
+
+    closes = {int(t) // step: c for t, c in zip(frame["ts"], frame["close"])}
+    rows = []
+    for r0, r1 in missing:
+        prev_close = closes.get(r0 - 1)
+        if prev_close is None:
+            continue
+        for b in range(r0, r1):
+            price = float(prev_close)
+            rows.append({
+                "ts": b * step,
+                "open": price, "high": price, "low": price, "close": price,
+                "volume": 0.0,
+            })
+
+    if not rows:
+        return df, 0
+
+    add = pd.DataFrame(rows)
+    add["time"] = pd.to_datetime(add["ts"], unit="s")
+    out = (
+        pd.concat([frame, add], ignore_index=True)
+        .drop_duplicates(subset="ts", keep="first")
+        .sort_values("ts")
+        .reset_index(drop=True)
+    )
+    return out, len(rows)
 
 
 def build_metric_chart_html(
@@ -1162,3 +1801,143 @@ def sanitize_metric_points(rows, now_sec: int) -> list:
         out.append([ts, float(v)])
     out.sort(key=lambda p: p[0])
     return out
+
+
+# ---------------------------------------------------------------------------
+# Progressive chart rendering (paint from DB now, patch from the exchange later)
+# ---------------------------------------------------------------------------
+
+def chart_render_plan(entry, stitch_wanted: bool, now: float, ttl: float) -> Tuple[str, bool]:
+    """
+    Decides what ONE chart slot renders: ("plain", warm?) | ("stitched", warm?).
+
+    `entry` is the record of a previously background-built stitched page (None
+    when there is none); only its `at` build time matters here.
+
+    The chart page used to be built *synchronously*: candles from the DB, then
+    the gap/tail stitch, which pages the exchange under a wall-clock budget
+    (DASH_STITCH_BUDGET_SEC, 4 s by default). Every flip to a pair whose table
+    is stale therefore blocked the UI for exactly that budget — the user
+    watched a spinner instead of the candles that were already in the
+    database. The stitch is a PATCH (it fills holes and a stale tail), so it
+    belongs in the background: render the DB page now, swap in the stitched
+    page when the daemon thread has built it.
+
+    Returns (variant, should_warm):
+      * "stitched" — a fresh background page exists; render it (a memory
+        lookup, and the only case where the chart repaints after the initial
+        paint).
+      * "plain"    — nothing ready yet; render the DB-only page.
+      * should_warm — kick the background builder (deduped by key, so this is
+        also the keep-warm refresh that stops the stitched page from ever
+        being rebuilt on the UI thread when its cache expires).
+    """
+    if not stitch_wanted:
+        return "plain", False
+    if entry:
+        age = float(now) - float(entry.get("at") or 0.0)
+        if age <= ttl:
+            # fresh: render it; refresh ahead of expiry so the swap is invisible
+            return "stitched", age > ttl * 0.6
+        return "plain", True
+    return "plain", True
+
+
+def feed_should_use(entry, now: float, ttl: float) -> bool:
+    """A cached exchange feed may be displayed if it exists and is not older
+    than `ttl`. Stale-but-present beats blocking the render on a 8 s REST call;
+    the caller shows the DB snapshot values meanwhile."""
+    if not entry:
+        return False
+    return (float(now) - float(entry.get("at") or 0.0)) <= float(ttl)
+
+
+def snapshot_refresh_due(last_started: float, now: float, min_interval_sec: float) -> bool:
+    """
+    Whether the stale-while-revalidate background rescan may start again.
+
+    With a snapshot on disk, EVERY rerun of the app (every pair click, every
+    1 s fragment tick that re-runs the script, every 60 s auto-reload) used to
+    launch a full 4-database scan. On a box where one scan costs tens of
+    seconds that is a self-sustaining load loop: the scans slow down the
+    collector's database, the slower scans then hit their time budget and
+    return an ever smaller pair list, which is re-scanned just as eagerly.
+    The pair list is a list of TABLES — it changes on the order of minutes, so
+    it is refreshed at most once per `min_interval_sec`.
+    """
+    if not last_started:
+        return True
+    return (float(now) - float(last_started)) >= float(min_interval_sec)
+
+
+# Scan failures that mean "the server is busy", as opposed to "this chunk is
+# broken". Retrying the latter is useful; retrying the former is how a
+# dashboard turns a slow database into an overloaded one.
+_TRANSIENT_SCAN_MARKERS = (
+    "timeouterror", "cancellederror", "connectionerror", "connectionrefusederror",
+    "interfaceerror", "too many connections", "server closed the connection",
+    "could not serialize", "deadlock detected", "tuple concurrently",
+    "remaining connection slots", "memory", "shared memory",
+    # asyncpg/uvloop noise when a connection is cancelled mid-handshake: the
+    # transport is gone, the query never ran, and the tables are as reachable
+    # as they were — nothing here says "this chunk is broken".
+    "tcptransport", "invalid state", "connection reset", "connection was closed",
+    "connection lost", "connection is closed",
+)
+
+
+def scan_failure_is_transient(exc) -> bool:
+    """Is this scan error "the database is under load" rather than "broken"?
+
+    A DatatypeMismatchError on a legacy TEXT column needs the all-TEXT retry
+    and the per-table recovery. A TimeoutError needs neither: the same tables
+    are just as slow one by one, and the recovery fan-out (120 extra queries
+    per chunk, each waiting behind the same saturated pool) is what turned a
+    25 s scan into a 300 s one and made the NEXT scan slower still.
+    Accepts an exception or an already-formatted error string.
+    """
+    if isinstance(exc, str):
+        text = exc.lower()
+    else:
+        if isinstance(exc, (TimeoutError, ConnectionError)):   # asyncio.TimeoutError is TimeoutError
+            return True
+        text = f"{type(exc).__name__} {exc}".lower()
+    return any(m in text for m in _TRANSIENT_SCAN_MARKERS)
+
+
+def scan_retry_delay_sec(base_sec: float, attempts: int, cap_sec: float) -> float:
+    """How long to wait before rescanning after `attempts` truncated scans.
+
+    A truncated pair list must be retried — that is the only way the dashboard
+    ever shows the full list — but retrying it at a fixed short interval is
+    what produced the rescan storm: each retry added load, so the next scan
+    was truncated too. The delay doubles per consecutive partial scan and is
+    capped, so a busy collector is retried a few times and then left alone
+    (the data already in memory keeps rendering), while a database that
+    recovered is picked up within one base interval.
+    """
+    base = max(1.0, float(base_sec))
+    n = int(attempts or 0)
+    if n <= 0:
+        return base
+    delay = base * float(2 ** min(n, 10))
+    return min(delay, max(base, float(cap_sec)))
+
+
+def scan_pause_sec(now: float, last_interaction_at: float, gap_sec: float,
+                   budget_left: float) -> float:
+    """How long the summary sweep should sit still so a click wins.
+
+    PostgreSQL has no query priority: while the scan walks thousands of tables,
+    the candle query of a Prev/Next click queues behind it, and "instant
+    switching" becomes however long a second or two feels like on that box. So
+    the sweep yields briefly right after an interaction — bounded in total per
+    sweep (`budget_left`), because a scan that never finishes is how the pair
+    list stays incomplete and gets rescanned.
+    """
+    if not last_interaction_at or budget_left <= 0 or gap_sec <= 0:
+        return 0.0
+    since = float(now) - float(last_interaction_at)
+    if since < 0.0 or since >= float(gap_sec):
+        return 0.0
+    return min(0.3, float(gap_sec) - since, float(budget_left))

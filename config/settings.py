@@ -160,7 +160,21 @@ class Settings(BaseSettings):
     # pre-warmed (candle loads + chart prebuilds) in background threads.
     # On low-RAM machines (16 GB, local Postgres) these bursts stutter the
     # whole desktop — set DASH_WARM_NEIGHBORS=0..2 to tame them. 5 = legacy.
-    dash_warm_neighbors: int = Field(default=5, alias="DASH_WARM_NEIGHBORS")
+    # How many pairs on each side get their charts prefetched. 2 (was 5): the
+    # neighbours beyond that were never clicked often enough to pay for 9 × the
+    # database and exchange traffic they generated.
+    dash_warm_neighbors: int = Field(default=2, alias="DASH_WARM_NEIGHBORS")
+    # Delay before a prefetch starts, so the click that scheduled it is served
+    # first. The app felt SLOWER while warming was unthrottled: the prefetch was
+    # competing with the render for the same connections.
+    dash_warm_delay_sec: float = Field(default=1.5, alias="DASH_WARM_DELAY_SEC")
+    # A chart render slower than this prints one "[switch] …" line to the
+    # dashboard console saying where the milliseconds went. 0 = every render.
+    dash_switch_report_ms: int = Field(default=250, alias="DASH_SWITCH_REPORT_MS")
+    # Pairs whose collector stopped writing this long ago (the dead spot tables
+    # left by a spot→perp migration) are pre-built from the database only — no
+    # exchange round trips for hundreds of missing candles nobody will watch.
+    dash_warm_stale_skip_sec: float = Field(default=172800.0, alias="DASH_WARM_STALE_SKIP_SEC")
     update_interval_seconds_1d: int = Field(default=3600, alias="UPDATE_INTERVAL_SECONDS_1D")
     update_interval_seconds_15m: int = Field(default=300, alias="UPDATE_INTERVAL_SECONDS_15M")  # 5 minutes for 15m
 
@@ -222,6 +236,248 @@ class Settings(BaseSettings):
 
     progress_log_every: int = Field(default=25, alias="PROGRESS_LOG_EVERY")
     precount_pairs: bool = Field(default=True, alias="PRECOUNT_PAIRS")
+
+    # Priority lane: 1-second refresh of the pairs the dashboard is showing.
+    # The dashboard publishes the open pair ±5 neighbours into
+    # `dashboard_priority_pairs`; the 15m engine refreshes exactly those
+    # tables in parallel with the full sweep, so the dashboard never has to
+    # download or compute anything itself.
+    # Wall-clock budget for the dashboard's in-memory gap stitching. It runs
+    # while the user waits for a chart, so it is bounded by time, not only
+    # by page count.
+    dash_stitch_budget_sec: float = Field(default=4.0, alias="DASH_STITCH_BUDGET_SEC")
+    # How soon a stitch range that FAILED (or came back only half-answered) is
+    # asked again. A successful answer is kept for an hour — closed bars do not
+    # change — but a failure is not an answer, and caching it for an hour is what
+    # left a chart with a hole long after the exchange was reachable again.
+    dash_stitch_retry_sec: float = Field(default=20.0, alias="DASH_STITCH_RETRY_SEC")
+    # How long ONE exchange's `load_markets()` may take in the dashboard. It is
+    # deliberately longer than a candle-fetch timeout (2-4 requests), runs under a
+    # per-exchange lock, and only ever in a background thread when the caller is
+    # the render path — a failed load backs off exponentially instead of being
+    # retried by every pair every second. 60s, not 25: gate's own
+    # `GET /api/v4/spot/currency_pairs` (its market list — the currency table is
+    # no longer requested, see `ccxt_fetch_currencies`) measured 16s on a good
+    # minute and >25s on a bad one, and a market load that times out is not a
+    # slower chart, it is NO chart work at all: every gap stitch and live feed on
+    # that exchange answers MarketsUnavailable until it succeeds. A load that never
+    # completes costs one background thread its timeout, and nothing else.
+    dash_market_load_sec: float = Field(default=60.0, alias="DASH_MARKET_LOAD_TIMEOUT_SEC")
+    # A market catalog is the most expensive thing the dashboard fetches (gate: a
+    # ~94 KB spot list and a ~1.3 MB swap list, in sequence, each under the load
+    # timeout) and the first thing a cold process needs before it can show a
+    # price. The last catalog a REAL load produced is therefore kept in the cache
+    # directory and applied without asking the exchange, as long as it is younger
+    # than this. Delistings and precision changes are the cost; an hour of chart
+    # availability per endpoint outage is the benefit.
+    dash_markets_disk_ttl_sec: float = Field(default=86400.0,
+                                             alias="DASH_MARKETS_DISK_TTL_SEC")
+    # …and a disk-seeded catalog older than this also triggers a real reload in
+    # the background (never on the click path). SIX HOURS, not an hour: a reload
+    # of gate's spot+swap lists is ~200 KB of compressed JSON, and the operator's
+    # measured throughput to that endpoint is 11-50 KB/s while the collector is
+    # using the same pipe — an hourly refresh would spend the link to re-learn
+    # something that changes on the scale of listings. Set it to 0 to reload on
+    # every start, or above the TTL to never reload while the process lives.
+    dash_markets_refresh_sec: float = Field(default=21600.0,
+                                            alias="DASH_MARKETS_REFRESH_SEC")
+    # Wall-clock budget for the whole-database summary scan. Whatever came
+    # back in time is rendered — the dashboard must stay usable while the
+    # collector writes.
+    dash_scan_budget_sec: float = Field(default=25.0, alias="DASH_SCAN_BUDGET_SEC")
+    # Scan shape: all tables of a timeframe are read in CHUNKS of
+    # dash_scan_chunk_size, each chunk being ONE UNION ALL query executed by
+    # one of dash_scan_pool_size pooled connections. Bigger chunks = fewer
+    # round trips (the scan is round-trip bound, not CPU bound); a chunk that
+    # PostgreSQL rejects for any reason retries as an all-TEXT query, so a
+    # legacy TEXT-typed column no longer costs the whole batch its batching.
+    dash_scan_chunk_size: int = Field(default=120, alias="DASH_SCAN_CHUNK_SIZE")
+    dash_scan_pool_size: int = Field(default=6, alias="DASH_SCAN_POOL_SIZE")
+    # How long the sweep stays out of the way after a pair switch. There is no
+    # query priority in PostgreSQL, so this is the mechanism by which a click
+    # beats a 69-chunk catalog sweep; 0 disables it.
+    dash_scan_yield_gap_sec: float = Field(default=1.2, alias="DASH_SCAN_YIELD_GAP_SEC")
+    # Databases scanned at the same time INSIDE one summary scan. 1 (default)
+    # walks HIGH then LOW; the two timeframes never overlap either, because the
+    # whole scan holds a process-wide gate. Parallel sweeps looked faster on an
+    # idle box and were several times slower on a loaded one: each extra
+    # connection is a query the collector has to wait for.
+    dash_scan_max_parallel_dbs: int = Field(default=1, alias="DASH_SCAN_MAX_PARALLEL_DBS")
+    # When a chunk query fails on a SCHEMA/type problem it is retried table by
+    # table; this caps how many tables of that chunk may be probed that way. A
+    # chunk that merely TIMED OUT is skipped instead (the tables are just as
+    # slow one by one, and 120 extra queries per chunk is what turned a 25 s
+    # scan into a 300 s one). 0 = never fall back to per-table reads.
+    dash_scan_recovery_max_tables: int = Field(default=24, alias="DASH_SCAN_RECOVERY_MAX_TABLES")
+    # How often the table/column inventory of a database is re-read from
+    # pg_catalog. New listings and engine column migrations land here, so this
+    # is a freshness knob for the PAIR LIST only (candles and live data are
+    # unaffected). 0 = re-read on every scan (the pre-fix behaviour, and on a
+    # 14k-table database it is what made startup slow).
+    dash_scan_inventory_ttl_sec: float = Field(
+        default=600.0, alias="DASH_SCAN_INVENTORY_TTL_SEC"
+    )
+    # How long ONE catalog listing read may take before the sweep stops waiting
+    # for it: with a previous listing in hand that listing is reused for this
+    # pass, without one the pass reports a failed read (never "no pairs"). Their
+    # log: the first sweep after a restart spent 27.3s of its 28.7s on
+    # pg_catalog and answered 0 of 69 chunks — an unbounded catalog read is a
+    # scan budget leak, and it is the one read a sweep cannot work around.
+    dash_scan_catalog_timeout_sec: float = Field(
+        default=45.0, alias="DASH_SCAN_CATALOG_TIMEOUT_SEC"
+    )
+    # Sweep budget for a revalidation while nobody is touching the page. The
+    # FIRST paint always uses dash_scan_budget_sec, so opening the dashboard
+    # costs exactly what it cost before; later passes run while the browser is
+    # idle, and a sweep never re-reads a chunk it already answered, so a longer
+    # pass is FEWER passes rather than more work.
+    #
+    # 120s is sized by their measurements, not by taste: 8 245 pair tables at
+    # ~0.05s a table on 6 pooled connections is one pass of ~70-110s, which is
+    # the whole 15m tier in ONE idle pass instead of the ~20 passes of 25s that
+    # took their list half an hour to build. A click still cuts in: a chunk
+    # re-checks the deadline after it is granted a connection, and
+    # dash_scan_yield_gap_sec pauses the sweep behind the interaction for at
+    # most 3s per pass whatever this is. 0 = never extend (pre-fix behaviour).
+    dash_scan_budget_idle_sec: float = Field(default=120.0, alias="DASH_SCAN_BUDGET_IDLE_SEC")
+    # Keep the last good summary on disk and paint it instantly on startup,
+    # refreshing in the background (stale-while-revalidate). A scan cut short
+    # by the budget is NOT persisted, so a busy collector cannot shrink the
+    # pair list from launch to launch.
+    dash_snapshot_enabled: bool = Field(default=True, alias="DASH_SNAPSHOT_ENABLED")
+    dash_snapshot_dir: str = Field(default="", alias="DASH_SNAPSHOT_DIR")
+    dash_snapshot_max_age_sec: float = Field(default=86400.0, alias="DASH_SNAPSHOT_MAX_AGE_SEC")
+    # Minimum gap between two background rescans. Without it EVERY rerun
+    # (every pair click, every 60 s auto-reload) launched a full 4-database
+    # scan, which on a busy machine is a self-sustaining load loop: the scans
+    # slow the database, the slower scans hit their budget and return a
+    # shorter pair list, and that list is re-scanned just as eagerly.
+    dash_snapshot_refresh_sec: float = Field(default=120.0, alias="DASH_SNAPSHOT_REFRESH_SEC")
+    # Ceiling for that gap once scans keep coming back truncated: the delay
+    # doubles per consecutive partial scan (120 -> 240 -> 480 … ) so a busy
+    # database is retried a few times and then left alone, instead of every
+    # retry making the next scan truncate as well.
+    dash_scan_retry_max_sec: float = Field(default=1800.0, alias="DASH_SCAN_RETRY_MAX_SEC")
+    # How long the rows an EARLIER sweep answered stay usable. A 25 s budget
+    # covers ~12 of an 8271-table database's 69 chunks, so the full list takes a
+    # few sweeps; carrying their rows is what makes the pair list grow towards
+    # complete instead of showing a different slice each time. Rows older than
+    # this are re-read rather than shown stale — 0 disables carry-over.
+    dash_scan_carryover_ttl_sec: float = Field(default=900.0, alias="DASH_SCAN_CARRYOVER_TTL_SEC")
+    # Retry delay when a scan could not start because ANOTHER timeframe holds the
+    # scan gate. A skip queries nothing, so waiting it out on the full backoff
+    # only left one tier unscanned for hours; 3 quick tries, then normal backoff.
+    dash_scan_defer_retry_sec: float = Field(default=8.0, alias="DASH_SCAN_DEFER_RETRY_SEC")
+    # Floor on rescanning a tier whose LAST scan came back complete. One scan
+    # gate serves both tiers, so a tier that keeps succeeding (1D: 8235 tables
+    # in ~20 s) can hold it often enough that the other one never finishes a
+    # sweep — the pair list the user then sees is whatever the truncated passes
+    # happened to add up to. A complete answer is good for minutes: pair tables
+    # appear when a listing is added, not every 30 s, and the candles the user
+    # watches reload on their own path regardless. 0 = rescan on every refresh.
+    dash_scan_rescan_complete_sec: float = Field(
+        default=300.0, alias="DASH_SCAN_RESCAN_COMPLETE_SEC")
+
+    priority_lane_enabled: bool = Field(default=True, alias="PRIORITY_LANE_ENABLED")
+    priority_lane_interval_sec: float = Field(default=1.0, alias="PRIORITY_LANE_INTERVAL_SEC")
+    # The daily bar moves with every trade too, but one refresh per second
+    # per engine would double the request rate for zero visible gain — the
+    # 1D lane ticks a bit slower by default.
+    priority_lane_interval_sec_1d: float = Field(default=2.0, alias="PRIORITY_LANE_INTERVAL_SEC_1D")
+    # A published set expires this fast, so closing the browser tab stops the
+    # lane instead of pinning the engine to an abandoned pair.
+    priority_lane_ttl_sec: float = Field(default=90.0, alias="PRIORITY_LANE_TTL_SEC")
+    # ccxt's load_markets() normally fetches the exchange's CURRENCY table first
+    # (gate: GET /spot/currencies). Nothing in this project reads currency
+    # metadata, and that extra request is what pushes market loading past the
+    # 30 s hard wait in `load_markets_with_retry` — a failed load means the
+    # exchange is skipped for the whole cycle. Keep it off unless you are
+    # debugging precision/limits issues.
+    ccxt_fetch_currencies: bool = Field(default=False, alias="CCXT_FETCH_CURRENCIES")
+    # Market categories to REMOVE from ccxt's market load. `load_markets()` asks
+    # an exchange for every category it declares in
+    # `options["fetchMarkets"]["types"]` — for gate that is
+    # spot, swap, future AND option, and a synchronous instance runs them one
+    # after another inside ONE timeout: the load is as slow as its slowest
+    # category, and if any one of them times out there are no markets at all, so
+    # every chart, tape and gap stitch on that exchange answers
+    # "markets are loading" (their BLUR/USDT:USDT perp was starved by the SPOT
+    # leg). This project stores spot and linear perpetual candles and never an
+    # option contract, so the option list is not fetched by default. Only
+    # exchanges that declare the types as a list are touched; one that models
+    # them as per-type flags (mexc) or declares nothing is left exactly as ccxt
+    # configured it. "" = never trim (ccxt's own behaviour).
+    ccxt_market_types_skip: str = Field(default="option", alias="CCXT_MARKET_TYPES_SKIP")
+    # Diagnostics for a market load that fails. On: after a failed load, each
+    # market category is timed separately and printed as
+    #   [markets] gate: probe with timeout 60s — spot ok, 1809 markets, 3.1s;
+    #               swap FAILED after 60.0s: RequestTimeout: …
+    # which is the only way to tell "this list is big and slow" from "the
+    # connection to this exchange is being throttled/blackholed" — the two need
+    # opposite answers (more timeout vs. fewer requests / another route). Costs
+    # one load per category, only after a failure, so it stays off in production.
+    dash_market_load_debug: bool = Field(default=False, alias="DASH_MARKET_LOAD_DEBUG")
+    # The order-book/Funding "live snapshot" card is the one dashboard path that
+    # builds an ASYNC client, and async clients follow `SOCKS5_PROXY` (default
+    # `socks5://127.0.0.1:10808`) while every other dashboard path is direct —
+    # because the sync path could not use it even if it tried (no PySocks). Set
+    # this to false to put the whole dashboard on one route so that a latency
+    # difference is never a route difference; the client logs which one it took.
+    dash_live_snapshot_via_proxy: bool = Field(default=True,
+                                               alias="DASH_LIVE_SNAPSHOT_VIA_PROXY")
+    # …and the opposite direction: put the dashboard's SYNCHRONOUS clients (markets
+    # load, tape, order book, gap stitching) on a proxy so that they share the
+    # engine's route instead of measuring a different network. An `http://` proxy
+    # URL works here out of the box; a `socks5://` one needs the `pysocks` package
+    # for `requests`, which this project does not depend on (it is checked and
+    # reported, not silently ignored).
+    dash_sync_proxy: str = Field(default="", alias="DASH_SYNC_PROXY")
+
+    # The same question on the ENGINE side, where it was silently fatal. Market
+    # lists travel at the speed of the slowest byte, and the measured figure on
+    # this box is 92,784 B in 12.2 s through the SOCKS5 tunnel = 7.6 KB/s, while
+    # the identical request DIRECT delivered 17,226 B in 45 s and never finished
+    # (both via curl against /api/v4/spot/currency_pairs, one with -x and one
+    # with --noproxy). gate's whole `fetchMarkets` — spot + perp + delivery — is
+    # ~1.4 MB compressed, so it needs MINUTES, whereas the clients were built with
+    # a 20 s (`updater_15m._make_exchange`) or 40 s (`exchanges.client`)
+    # per-request timeout and a 30 s total wait: `Failed to load markets for
+    # gateio after 3 attempts` was permanent in both engines while the same URL
+    # answered in a browser. This knob covers the LOAD ONLY — the engines widen the
+    # client's own timeout to it for the duration and put it straight back, so a
+    # dead exchange still cannot hold a candle fetch for minutes. Healthy
+    # exchanges answer in 1-3 s and never notice.
+    exchange_markets_load_sec: float = Field(default=240.0,
+                                             alias="EXCHANGE_MARKETS_LOAD_SEC")
+    # …and how often an engine re-downloads lists it already holds. 1800 keeps
+    # today's behaviour; at the speed above, ONE gate reload is ~3 minutes of the
+    # link, so every-30-minutes is roughly a 10% duty cycle spent on market lists
+    # before a single candle is fetched. Raising it to 21600 (what
+    # DASH_MARKETS_REFRESH_SEC now defaults to) is the throughput answer; the price
+    # is that a newly listed pair is picked up up to one TTL later. A negative value is ignored; 0 means
+    # "re-download the lists every cycle", which is the honest way to watch a new
+    # listing appear without waiting for a TTL.
+    exchange_markets_ttl_sec: float = Field(default=1800.0,
+                                           alias="EXCHANGE_MARKETS_TTL_SEC")
+    # "" = leave ccxt's own headers alone. `identity` asks for the market lists
+    # uncompressed, which is what `curl` does — see the size-shaped failure the
+    # timing probe measures (`spot FAILED after 91.8s … future ok, 2.8s`). Costs no
+    # extra requests; costs more bytes on a healthy connection.
+    dash_market_load_accept_encoding: str = Field(
+        default="", alias="DASH_MARKET_LOAD_ACCEPT_ENCODING")
+    # Coordination database holding the tiny handshake table (empty = 15m HIGH).
+    priority_lane_db: str = Field(default="", alias="PRIORITY_LANE_DB")
+    # How far back the lane may bridge a hole in the pair you are LOOKING at.
+    # The lane used to refetch the last bars only (a fixed `limit=10` anchored
+    # near `now`), so a collector that was off for a day left the chart with a
+    # hole that the lane re-refreshed around, never into. Now the fetch starts at
+    # the table's own last bar when the hole is at most this many bars — 2000 x
+    # 15m = ~20 days, 2000 x 1D = 5 years, so a restart or a filtered-out day is
+    # bridged in a few ticks while a two-year-old leftover stays the sweep's job.
+    # 0 restores the old tail-only behaviour.
+    priority_lane_catchup_max_bars: int = Field(
+        default=2000, alias="PRIORITY_LANE_CATCHUP_MAX_BARS"
+    )
 
 
 settings = Settings()

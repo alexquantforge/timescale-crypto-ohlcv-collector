@@ -147,6 +147,15 @@ def test_build_health_strip_dead_market():
     assert "DEAD" in html
     # red chips (score ~0 -> hsl(0))
     assert "hsl(0" in html
+    # …and the chip quotes the number at the precision the threshold needs: a
+    # 0.6/min market must not read `1/min` next to a card saying `0.6 trades/min`
+    assert "1.2/min · DEAD" in html
+
+
+def test_a_sub_minute_tape_is_not_rounded_up_to_alive():
+    from dashboard.helpers import build_health_strip_html
+    html = build_health_strip_html({"ob_trades_per_min": 0.6, "ob_is_barcode": True})
+    assert "0.6/min · DEAD" in html and "1/min" not in html
 
 
 def test_build_health_strip_empty_row_is_safe():
@@ -717,3 +726,419 @@ def test_build_metric_chart_html_empty_series_safe():
 
     html = build_metric_chart_html("[]", "OI X", "#4c9aff", 230)
     assert "addLineSeries" in html and "const points = [];" in html
+
+
+def test_stitch_candle_gaps_bridges_weeks_stale_tail():
+    """A 30-day-stale 15m table must still get its tail stitched: the old
+    2000-bucket cap silently skipped it and the chart ended weeks before the
+    live price line (visible price gap)."""
+    from dashboard.helpers import stitch_candle_gaps
+
+    step = 900
+    now = 1_790_000_000
+    last = now - 30 * 86400  # ~2880 buckets behind
+    df = _mk_df([last - step, last])
+
+    calls = []
+
+    def fetcher(r0, r1):
+        calls.append((r0, r1))
+        return [[b * step * 1000, 1.0, 1.0, 1.0, 1.0, 1.0] for b in range(r0, r1)]
+
+    out, added = stitch_candle_gaps(df, fetcher, step, include_tail=True, now_sec=now)
+    assert calls, "tail range must be requested from the exchange"
+    assert added == (now // step) - (last // step) - 1
+    assert int(out["ts"].max()) // step == now // step - 1  # forming bar excluded
+
+
+def _summary_row(ticker, exchange, max_ts):
+    return {"ticker": ticker, "exchange": exchange, "max_ts": max_ts}
+
+
+def test_drop_stale_spot_duplicates_removes_frozen_spot_keeps_perp():
+    """0G @bybit: spot table frozen 41 days ago, perp fresh -> only the perp
+    stays in the pair list."""
+    import pandas as pd
+    from dashboard.helpers import drop_stale_spot_duplicates
+
+    now = 1_790_000_000
+    df = pd.DataFrame([
+        _summary_row("0G/USDT:USDT", "bybit", now - 2_520),
+        _summary_row("0G/USDT", "bybit", now - 41 * 86400),
+        _summary_row("BTC/USDT", "bybit", now - 900),          # spot, no perp row
+        _summary_row("ETH/USDT", "bybit", now - 1_800),        # spot, fresh next to perp
+        _summary_row("ETH/USDT:USDT", "bybit", now - 900),
+        _summary_row("0G/USDT", "gateio", now - 41 * 86400),   # other exchange, no perp
+    ])
+    out = drop_stale_spot_duplicates(df)
+    tickers = list(zip(out["ticker"], out["exchange"]))
+    assert ("0G/USDT", "bybit") not in tickers
+    assert ("0G/USDT:USDT", "bybit") in tickers
+    assert ("BTC/USDT", "bybit") in tickers
+    assert ("ETH/USDT", "bybit") in tickers        # actively collected spot stays
+    assert ("0G/USDT", "gateio") in tickers        # no perp there -> keep
+
+
+def test_drop_stale_spot_duplicates_noop_without_perps():
+    import pandas as pd
+    from dashboard.helpers import drop_stale_spot_duplicates
+
+    df = pd.DataFrame([_summary_row("BTC/USDT", "bybit", 1_790_000_000)])
+    assert len(drop_stale_spot_duplicates(df)) == 1
+    assert drop_stale_spot_duplicates(pd.DataFrame()).empty
+
+
+# ---------------------------------------------------------------------------
+# Empty intervals: no candle on the exchange API, flat bar on the chart
+# ---------------------------------------------------------------------------
+
+def test_fill_missing_bars_draws_flat_carry_forward_bars():
+    from dashboard.helpers import fill_missing_bars
+
+    step = 900
+    t0 = 1_790_000_000 // step * step
+    df = _mk_df([t0, t0 + step, t0 + 4 * step])   # two intervals had no trades
+    df.loc[df["ts"] == t0 + step, "close"] = 129.46
+
+    out, filled = fill_missing_bars(df, step)
+
+    assert filled == 2
+    gap = out[out["ts"].isin([t0 + 2 * step, t0 + 3 * step])]
+    assert len(gap) == 2
+    # flat at the previous close, zero volume — no invented movement
+    assert set(gap["open"]) == {129.46}
+    assert set(gap["high"]) == {129.46}
+    assert set(gap["low"]) == {129.46}
+    assert set(gap["close"]) == {129.46}
+    assert set(gap["volume"]) == {0.0}
+    assert list(out["ts"]) == sorted(out["ts"])
+
+
+def test_fill_missing_bars_is_a_noop_when_nothing_is_missing_or_table_is_dead():
+    from dashboard.helpers import fill_missing_bars
+
+    step = 900
+    t0 = 1_790_000_000 // step * step
+    full = _mk_df([t0, t0 + step, t0 + 2 * step])
+    out, filled = fill_missing_bars(full, step)
+    assert filled == 0 and len(out) == 3
+
+    # a month-wide hole must stay visible instead of being papered over
+    dead = _mk_df([t0, t0 + 5000 * step])
+    out2, filled2 = fill_missing_bars(dead, step, max_filled=2000)
+    assert filled2 == 0 and len(out2) == 2
+
+
+def test_live_poller_opens_new_bar_at_previous_close():
+    """The once-per-second poller samples the ticker mid-interval. Opening a
+    fresh bar at that sample made every 15m boundary show a vertical break
+    (prev close ≠ next open) that the exchange chart does not have."""
+    from dashboard.helpers import build_live_poller_js
+
+    js = build_live_poller_js("gateio", "JUSUNG/USDT:USDT", 900, interval_ms=1000)
+
+    assert "const prevClose = lastBar ? lastBar.close : price;" in js
+    assert "open: prevClose," in js
+    assert "high: Math.max(prevClose, price)," in js
+    assert "low: Math.min(prevClose, price)," in js
+    # the old behaviour must be gone
+    assert "open: price, high: price, low: price, close: price" not in js
+
+
+# ---------------------------------------------------------------------------
+# Batched summary scan + snapshot cache
+# ---------------------------------------------------------------------------
+
+def test_build_summary_union_sql_pads_missing_columns_and_batches():
+    from dashboard.helpers import build_summary_union_sql
+
+    tables = {
+        "btc_usdt_on_bybit": {"Timestamp", "ticker", "close", "ob_cvd_5m"},
+        "pixel_usdt:usdt_on_bybit": {"Timestamp", "ticker", "close"},   # no ob_* yet
+        "broken_on_bybit": {"open", "close"},                            # no Timestamp
+    }
+    cols = ["ticker", "close", "ob_cvd_5m", "ob_is_barcode", "ob_vitality_grade"]
+    sql = build_summary_union_sql(tables, cols)
+
+    assert sql.count("UNION ALL") == 1                 # the Timestamp-less table is skipped
+    assert "broken_on_bybit" not in sql
+    assert 'NULL::double precision AS "ob_cvd_5m"' in sql   # padded for the perp table
+    assert 'NULL::boolean AS "ob_is_barcode"' in sql
+    assert 'NULL::text AS "ob_vitality_grade"' in sql
+    assert sql.count('ORDER BY "Timestamp" DESC LIMIT 1') == 2
+    # every subquery must project the columns in the same order
+    assert sql.index('"ticker"') < sql.index('"close"')
+
+
+def test_chunked_splits_dicts_and_lists():
+    from dashboard.helpers import chunked
+
+    assert [len(c) for c in chunked({f"t{i}": set() for i in range(250)}, 120)] == [120, 120, 10]
+    assert [c for c in chunked([1, 2, 3, 4, 5], 2)] == [[1, 2], [3, 4], [5]]
+    assert list(chunked([], 10)) == []
+
+
+def test_summary_snapshot_round_trip(tmp_path):
+    import pandas as pd
+    from dashboard.helpers import (
+        load_summary_snapshot,
+        save_summary_snapshot,
+        snapshot_path,
+    )
+
+    path = snapshot_path(str(tmp_path), "15m")
+    assert path.endswith("summary_15m.pkl")
+
+    df = pd.DataFrame([{"ticker": "0G/USDT:USDT", "exchange": "bybit", "max_ts": 1_790_000_000}])
+    assert save_summary_snapshot(path, df) is True
+
+    back, age = load_summary_snapshot(path, max_age_sec=3600)
+    assert back is not None and list(back["ticker"]) == ["0G/USDT:USDT"]
+    assert age is not None and age < 60
+
+    # expired snapshot is ignored, and a missing file never raises
+    assert load_summary_snapshot(path, max_age_sec=0.0) == (None, None)
+    assert load_summary_snapshot(str(tmp_path / "nope.pkl"), 3600) == (None, None)
+    assert save_summary_snapshot(path, pd.DataFrame()) is False
+
+
+# ---------------------------------------------------------------------------
+# Type-stable UNION batching (the "dashboard starts in minutes" regression)
+#
+# The scan batches 120 tables into ONE UNION ALL query. PostgreSQL resolves the
+# column types across all branches, so a single legacy table whose ob_* column
+# is TEXT (old HIGH<->LOW move) rejected the WHOLE chunk with
+# `DatatypeMismatchError: UNION types double precision and text cannot be
+# matched` — and the fallback then paid 120 individual round trips per chunk,
+# which is exactly what batching was supposed to remove.
+# ---------------------------------------------------------------------------
+
+def test_resolve_summary_union_casts_flags_only_mixed_columns():
+    from dashboard.helpers import resolve_summary_union_casts
+
+    cols = ["ticker", "close", "ob_vitality_score", "ob_is_barcode"]
+    # uniform chunk: nobody needs a cast -> SQL stays as it always was
+    uniform = {
+        "a_usdt_on_bybit": {"Timestamp": "bigint", "ticker": "text",
+                            "close": "double precision", "ob_vitality_score": "double precision",
+                            "ob_is_barcode": "boolean"},
+        "b_usdt_on_bybit": {"Timestamp": "bigint", "ticker": "text",
+                            "close": "double precision", "ob_vitality_score": "double precision",
+                            "ob_is_barcode": "boolean"},
+    }
+    assert resolve_summary_union_casts(uniform, cols) == {}
+
+    mixed = dict(uniform)
+    mixed["c_usdt_on_gateio"] = {"Timestamp": "bigint", "ticker": "text",
+                                 "close": "text"}            # TEXT-ified candle column
+    mixed["d_usdt_on_okx"] = {"Timestamp": "bigint", "ticker": "text",
+                              "close": "double precision",
+                              "ob_is_barcode": "text"}      # TEXT-ified flag
+    plan = resolve_summary_union_casts(mixed, cols)
+    assert plan == {"close": "text", "ob_is_barcode": "text"}
+    # a column every table agrees on (here: absent everywhere but padded) is
+    # never touched, and bigint-vs-double precision is legal in a UNION
+    assert "ob_vitality_score" not in plan
+    assert "ticker" not in plan
+
+
+def test_build_summary_union_sql_is_type_stable_when_a_chunk_is_mixed():
+    from dashboard.helpers import build_summary_union_sql
+
+    cols = ["close", "ob_is_barcode"]
+    tables = {
+        "a_usdt_on_bybit": {"Timestamp": "bigint", "close": "double precision"},
+        "b_usdt_on_gateio": {"Timestamp": "bigint", "close": "text"},
+    }
+    tables["c_usdt_on_okx"] = {"Timestamp": "bigint"}   # no ob_* at all
+    sql = build_summary_union_sql(tables, cols)
+    # both branches project the SAME type, or the UNION does not compile
+    assert sql.count('"close"::text') == 2
+    # a column nobody disagrees on keeps its declared pad type (no cast noise)
+    assert 'NULL::boolean AS "ob_is_barcode"' in sql
+    # a table WITHOUT the mixed column is padded to the flattened type, or the
+    # UNION would mix text and double precision again
+    assert 'NULL::text AS "close"' in sql
+
+
+def test_build_summary_union_sql_force_text_flattens_everything():
+    from dashboard.helpers import build_summary_union_sql
+
+    cols = ["close", "ticker"]
+    tables = {
+        "a_usdt_on_bybit": {"Timestamp": "bigint", "close": "numeric", "ticker": "text"},
+        "b_usdt:usdt_on_okx": {"Timestamp": "text", "close": "json"},  # anything exotic
+    }
+    sql = build_summary_union_sql(tables, cols, force_text=True)
+    assert '"close"::text' in sql and '"ticker"::text' in sql
+    assert '"Timestamp"::text AS max_ts' in sql          # ms/s/text tables unify
+    assert "NULL::text" in sql
+
+
+def test_coerce_summary_types_recovers_numbers_without_erasing_text():
+    import pandas as pd
+
+    from dashboard.helpers import coerce_summary_types
+
+    df = pd.DataFrame([
+        # TEXT-flattened numerics + a genuine string column + junk rows
+        {"ticker": "BTC/USDT:USDT", "close": "42500.5", "ob_vitality_score": None,
+         "ob_is_barcode": "false", "max_ts": "1787700000"},
+        {"ticker": "0G/USDT", "close": "", "ob_vitality_score": "7.5",
+         "ob_is_barcode": "true", "max_ts": 1787700001},
+    ])
+    out = coerce_summary_types(df)
+    assert out["close"].dtype.kind == "f"          # '' -> NaN, not a string column
+    assert out["ob_vitality_score"].dtype.kind == "f"
+    assert out["max_ts"].dtype.kind in "ifu"
+    assert bool(out["ob_is_barcode"].iloc[0]) is False
+    assert bool(out["ob_is_barcode"].iloc[1]) is True
+    assert list(out["ticker"]) == ["BTC/USDT:USDT", "0G/USDT"]  # never coerced
+
+    # a column that only LOOKS textual is left alone instead of becoming NaN
+    notes = pd.DataFrame([{"notes": "alpha"}, {"notes": "beta"}])
+    assert list(coerce_summary_types(notes)["notes"]) == ["alpha", "beta"]
+
+
+def test_coerce_summary_types_never_invents_a_barcode_flag():
+    """NULL flags must stay FALSY.
+
+    bool(NaN) is True in Python, so letting pandas turn a flag column's NULLs
+    into float NaN would brand every pair without an orderbook snapshot as a
+    dead barcode market — a red chip in the health strip and a 0 vitality
+    reading, on a perfectly healthy table.
+    """
+    import pandas as pd
+
+    from dashboard.helpers import coerce_summary_types
+
+    missing = coerce_summary_types(pd.DataFrame([{"ob_is_barcode": None}, {"ob_is_barcode": None}]))
+    assert missing["ob_is_barcode"].dtype.kind == "b"
+    assert not missing["ob_is_barcode"].any()
+
+    texty = coerce_summary_types(pd.DataFrame([
+        {"ob_is_barcode": "true"}, {"ob_is_barcode": "false"}, {"ob_is_barcode": ""},
+    ]))
+    assert list(texty["ob_is_barcode"]) == [True, False, False]
+
+    numeric = coerce_summary_types(pd.DataFrame([
+        {"ob_is_barcode": 1.0}, {"ob_is_barcode": 0.0}, {"ob_is_barcode": None},
+    ]))
+    assert list(numeric["ob_is_barcode"]) == [True, False, False]
+
+
+def test_chart_render_plan_paints_db_first_then_patches():
+    from dashboard.helpers import chart_render_plan
+
+    now, ttl = 1000.0, 45.0
+    # nothing warmed yet -> render what the DB has, and go build the patch
+    assert chart_render_plan(None, True, now, ttl) == ("plain", True)
+    # fresh stitched page -> render it; no refresh while it is clearly young
+    fresh = {"at": now - 5, "applied": True}
+    assert chart_render_plan(fresh, True, now, ttl) == ("stitched", False)
+    # fresh but ageing -> keep-warm, so the swap-in never has to rebuild inline
+    ageing = {"at": now - 40, "applied": True}
+    assert chart_render_plan(ageing, True, now, ttl) == ("stitched", True)
+    # expired -> back to the DB page while the background rebuilds
+    assert chart_render_plan({"at": now - 90}, True, now, ttl) == ("plain", True)
+    # stitch switched off by the user: nothing to patch, nothing to warm
+    assert chart_render_plan(None, False, now, ttl) == ("plain", False)
+    assert chart_render_plan({"at": now}, False, now, ttl) == ("plain", False)
+
+
+def test_feed_should_use_rejects_missing_and_stale_only():
+    from dashboard.helpers import feed_should_use
+
+    assert feed_should_use(None, 1000.0, 20.0) is False
+    assert feed_should_use({"value": None, "at": 999.0}, 1000.0, 20.0) is True
+    assert feed_should_use({"value": None, "at": 900.0}, 1000.0, 20.0) is False
+    assert feed_should_use({}, 1000.0, 20.0) is False          # no timestamp at all
+
+
+def test_transient_scan_errors_are_not_retried_harder():
+    """The scan must tell "database is busy" from "this chunk is broken".
+
+    Retrying a timeout as 120 individual queries is how the dashboard turned a
+    slow Postgres into an overloaded one; retrying a type mismatch is the
+    recovery that made legacy TEXT columns work again.
+    """
+    import asyncio
+
+    from dashboard.helpers import scan_failure_is_transient
+
+    busy = [
+        asyncio.TimeoutError(),
+        TimeoutError(),
+        ConnectionRefusedError("[Errno 111] Connection refused"),
+        "TimeoutError: ",
+        "ConnectionRefusedError: connection failed",
+        "asyncpg.exceptions.TooManyConnectionsError: remaining connection "
+        "slots are reserved",
+        "Fatal error on transport TCPTransport",
+        "InterfaceError: connection is closed",
+    ]
+    for b in busy:
+        assert scan_failure_is_transient(b) is True, b
+
+    broken = [
+        "DatatypeMismatchError: UNION types double precision and text cannot be matched",
+        "UndefinedTableError: relation \"btc_usdt_on_bybit\" does not exist",
+        "InvalidTextRepresentationError: invalid input syntax for integer: \"abc\"",
+        RuntimeError("relation disappeared mid-scan"),
+    ]
+    for b in broken:
+        assert scan_failure_is_transient(b) is False, b
+
+
+def test_retry_delay_backs_off_while_scans_stay_truncated():
+    """Backoff for the rescan: retry, but not at a cost that guarantees the
+    next retry fails the same way."""
+    from dashboard.helpers import scan_retry_delay_sec
+
+    assert scan_retry_delay_sec(120, 0, 1800) == 120      # first retry: base gap
+    assert scan_retry_delay_sec(120, 1, 1800) == 240
+    assert scan_retry_delay_sec(120, 2, 1800) == 480
+    assert scan_retry_delay_sec(120, 3, 1800) == 960
+    assert scan_retry_delay_sec(120, 4, 1800) == 1800     # capped
+    assert scan_retry_delay_sec(120, 99, 1800) == 1800
+    # a base of 0 (throttle disabled) must not lock up or divide by zero
+    assert scan_retry_delay_sec(0, 5, 1800) == 32.0
+
+
+def test_scan_pause_only_applies_right_after_an_interaction():
+    """The sweep yields to a click — briefly, and only right after one."""
+    from dashboard.helpers import scan_pause_sec
+
+    assert scan_pause_sec(1000.0, 0.0, 1.2, 3.0) == 0.0        # nobody clicked
+    assert scan_pause_sec(1000.0, 900.0, 1.2, 3.0) == 0.0      # long ago
+    assert scan_pause_sec(1000.0, 999.5, 1.2, 3.0) == 0.3      # just now: capped
+    assert scan_pause_sec(1000.0, 999.4, 1.2, 0.1) == 0.1      # budget-limited
+    assert scan_pause_sec(1000.0, 999.4, 0.05, 3.0) == 0.0      # gap already passed
+    assert scan_pause_sec(1000.0, 999.5, 1.2, 0.0) == 0.0       # no yield budget left
+    assert scan_pause_sec(1000.0, 1000.5, 1.2, 3.0) == 0.0       # clock skew
+
+
+def test_merge_summary_frames_only_adds_for_a_partial_pass():
+    """The pair list is the dashboard's only answer to "which charts exist", so
+    a resumed scan that reached fewer tables than the pass before it must not
+    become the truth — that is how all 15m charts vanished at once."""
+    import pandas as pd
+
+    from dashboard.helpers import merge_summary_frames
+
+    new = pd.DataFrame({"db_name": ["low"], "table_name": ["t2"], "ticker": ["B/USDT"],
+                        "last_price": [2.0]})
+    old = pd.DataFrame({"db_name": ["high", "low"],
+                        "table_name": ["t1", "t2"],
+                        "ticker": ["A/USDT", "B/USDT"],
+                        "last_price": [1.0, 1.5]})
+    out = merge_summary_frames(new, old)
+    assert sorted(out["table_name"]) == ["t1", "t2"]
+    # the newer read of a table wins, the older is not kept alongside it
+    assert float(out[out["table_name"] == "t2"]["last_price"].iloc[0]) == 2.0
+
+    # an empty partial answer keeps the whole previous list
+    assert len(merge_summary_frames(pd.DataFrame(), old)) == 2
+    # and a table only the old pass saw is not resurrected by a complete one:
+    # that decision is the caller's (it only merges when the pass was truncated)
+    assert len(merge_summary_frames(new, pd.DataFrame())) == 1
