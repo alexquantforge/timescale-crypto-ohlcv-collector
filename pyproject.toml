@@ -23,6 +23,9 @@ aiohttp-socks = ">=0.12"
 # SOCKS library; without it a socks5h:// URL is refused with a log line, not obeyed.
 pysocks = "^1.7.1"
 pandas = "^2.2.0"
+# Direct import in src/core/updater.py: only transitive via pandas, so it must be
+# declared explicitly for pip/CI installs that resolve from requirements.txt.
+pytz = ">=2023.3"
 numpy = "^2.0.0"
 pydantic = "^2.10.0"
 pydantic-settings = "^2.7.0"
