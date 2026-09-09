@@ -210,6 +210,20 @@ first version that matches the hook's current shape, and a failure whose cause i
 diagnosed once (`_proxy_clash_note`: versions + the command that fixes it) and then NOT retried on the other
 exchanges, because a per-process environment error asked six times is noise, not evidence.
 
+`load_markets()` is not a fetch: on an instance that already has a catalog ccxt returns it instantly. A
+"refresh" therefore has to pass `reload=True`, or it silently re-applies and RE-SAVES the cache it was seeded
+from — which resets that file's age, so nothing is ever refreshed again and staleness becomes permanent (here:
+`3233 markets loaded in 0.0s (by disk-refresh)` on every restart, and a `BadSymbol` for every pair listed since
+the file was written). Two rules follow, both tested: only a real network answer may reset a cached file's age,
+and a fake standing in for ccxt must reproduce the "answers from memory" contract, because a fake that always
+fetches cannot fail this test. Any `… loaded in 0.0s` line for a supposedly network-backed load is a bug report.
+
+Pair URLs are assembled once, in `get_exchange_url` / `get_swap_url`, and consumed by the engines' `🔗` log
+lines, the `url_of_trading_pair` column and the dashboard's `Spot ↗ / Swap ↗` row — so a format is wrong in
+three places or right in three, and each exchange's shape is a fact about that site, not a pattern to
+generalise (BingX: `/en/spot/BASEQUOTE` glued, `/en/perpetual/BASE-QUOTE` dashed, no `en-us`, no trailing
+slash, no `-SWAP`). Pin the URL a browser actually opened, and assert the two consumers too.
+
 A timeout that is shorter than payload_bytes ÷ measured_throughput is not a timeout
 setting, it is a permanent failure with a log line — and the number has to be applied
 to every ceiling in front of the request, not just the outer one: gate's ~1.4 MB of
