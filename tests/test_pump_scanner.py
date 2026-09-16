@@ -481,7 +481,8 @@ def test_apply_recent_args_sets_globals():
     # Дедупликации нужна история прогонов — не чистим, держим по ретеншену.
     assert ps.WIPE_PREVIOUS_RUNS is False
     assert ps.SAVE_TO_DB is True
-    assert ps.RECENT_DEDUP_HOURS == 24.0
+    # Дедупликация по умолчанию ВЫКЛЮЧЕНА: каждый прогон — полный список окна.
+    assert ps.RECENT_DEDUP_HOURS == 0.0
     # Блок «за N дней» не дублирует основной список recent-прогона.
     assert ps.RECENT_PUMPS_DAYS is None
 
@@ -502,6 +503,14 @@ def test_apply_recent_args_zero_dedup_disables():
     args = build_recent_parser().parse_args(["--hours", "6", "--dedup-hours", "0"])
     apply_recent_args(args)
     assert ps.RECENT_DEDUP_HOURS == 0.0
+
+
+def test_apply_recent_args_dedup_hours_reenables():
+    # --dedup-hours 24 включается поверх дефолта 0 (режим «только новое»).
+    from pump_scanner import build_recent_parser, apply_recent_args
+    args = build_recent_parser().parse_args(["--hours", "6", "--dedup-hours", "24"])
+    apply_recent_args(args)
+    assert ps.RECENT_DEDUP_HOURS == 24.0
 
 
 def test_apply_recent_args_concurrency_and_batch():

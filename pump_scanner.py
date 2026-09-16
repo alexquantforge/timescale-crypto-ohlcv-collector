@@ -233,9 +233,11 @@ WIPE_PREVIOUS_RUNS: bool = True  # True — перед записью новог
 # MODE — какой прогон выполняется (history = дефолт, recent = быстрый режим).
 MODE: str = "history"
 # Дедупликация: сколько часов назад смотреть в results-БД, чтобы не повторять
-# монеты, уже показанные предыдущим recent-прогоном (0 = выключить).
+# монеты, уже показанные предыдущим recent-прогоном.
+# Дефолт 0 = ВЫКЛЮЧЕНА: каждый прогон показывает полный список пампов окна.
+# Опция --dedup-hours 24 = режим «только новое с прошлого прогона» (для cron).
 # Ключ события: (base, день пика) — тот же памп за тот же день = дубль.
-RECENT_DEDUP_HOURS: float = 24.0
+RECENT_DEDUP_HOURS: float = 0.0
 # Сколько дней recent-прогонов хранить в results-БД (старые удаляются).
 RECENT_RETENTION_DAYS: float = 7.0
 # recent: размер батча UNION ALL-запроса. 1 (дефолт) = по одной таблице на
@@ -2055,15 +2057,15 @@ def build_recent_parser() -> argparse.ArgumentParser:
     Отличия от history (основного) режима:
       * окно данных = hours + pre-pump (остальная история НЕ читается);
       * сравнения порогов/методов выключены (только статистика, ~6x CPU);
-      * дедупликация по results-БД: монеты, уже показанные предыдущим
-        recent-прогоном, не повторяются;
+      * отчёт = полный список пампов окна КАЖДЫЙ прогон (дедупликация по
+        results-БД выключена по умолчанию; --dedup-hours 24 — «только новое»);
       * WIPE_PREVIOUS_RUNS выключен (дедупликации нужна история прогонов),
         старые прогоны убираются по RECENT_RETENTION_DAYS.
     """
     p = argparse.ArgumentParser(
         prog="pump_scanner.py recent",
         description="Быстрый режим: пампы за последние N часов "
-                    "(окно = N + pre-pump, без сравнений, с дедупликацией). "
+                    "(окно = N + pre-pump, без сравнений, полный список на каждый прогон). "
                     "Сделан для cron: python pump_scanner.py recent --hours 6 --pct 30",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -2087,8 +2089,9 @@ def build_recent_parser() -> argparse.ArgumentParser:
     p.add_argument("--top", type=int, default=REPORT_TOP_N,
                    help="Сколько строк печатать в консоль")
     p.add_argument("--dedup-hours", type=float, default=RECENT_DEDUP_HOURS,
-                   help="Сколько часов назад смотреть «уже показано» "
-                        "(0 = выключить дедупликацию)")
+                   help="Сколько часов назад смотреть «уже показано»: "
+                        "0 = полный список на каждый прогон; 24 = только новое "
+                        "с прошлого прогона (режим cron-мониторинга)")
     p.add_argument("--batch-size", type=int, default=RECENT_BATCH_SIZE,
                    help="Сколько таблиц читать одним UNION-запросом "
                         "(1 = по одной; замер на реальной базе: 50 МЕДЛЕННЕЕ, "
