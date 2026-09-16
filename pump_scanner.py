@@ -223,6 +223,17 @@ SAVE_TO_DB: bool = True          # False — только консоль, без
 WIPE_PREVIOUS_RUNS: bool = True  # True — перед записью нового прогона очистить таблицы результатов
                                  # (отчёт всегда "только актуальное"). False — история прогонов копится.
 
+# --- Режим recent («что отпампило за последние N часов») ---
+# Отдельный CLI: python pump_scanner.py recent --hours 6 --pct 30
+# MODE — какой прогон выполняется (history = дефолт, recent = быстрый режим).
+MODE: str = "history"
+# Дедупликация: сколько часов назад смотреть в results-БД, чтобы не повторять
+# монеты, уже показанные предыдущим recent-прогоном (0 = выключить).
+# Ключ события: (base, день пика) — тот же памп за тот же день = дубль.
+RECENT_DEDUP_HOURS: float = 24.0
+# Сколько дней recent-прогонов хранить в results-БД (старые удаляются).
+RECENT_RETENTION_DAYS: float = 7.0
+
 # --- Детальная статистика прогона (печатается в конце) ---
 PRINT_RUN_STATISTICS: bool = True      # True — в конце печатать статистику по датам/частоте пампов
 STATS_TOP_MONTHS: int = 8              # сколько самых «памповых» месяцев показать
@@ -580,6 +591,11 @@ def fmt_event_details_lines(ev: Dict[str, Any]) -> List[str]:
 def fmt_ts(ts_sec: int, tz=None) -> str:
     tz = tz or UTC_TZ
     return datetime.datetime.fromtimestamp(int(ts_sec), tz).strftime("%Y-%m-%d %H:%M")
+
+
+def fmt_window_label(days: float) -> str:
+    """'0.25' -> '6.0 ч', '3.0' -> '3 дн' — для заголовков блоков отчёта."""
+    return f"{days * 24:.1f} ч" if days < 1 else f"{days:.0f} дн"
 
 
 def fmt_price(x: Optional[float]) -> str:
@@ -1277,6 +1293,7 @@ RESULTS_CHUNK_INTERVAL: int = 7 * 86400
 def config_snapshot() -> Dict[str, Any]:
     """Текущий конфиг прогона — для колонки config в pump_scan_runs."""
     return {
+        "mode": MODE,
         "PUMP_MIN_PCT": PUMP_MIN_PCT,
         "PUMP_WINDOW_DAYS": PUMP_WINDOW_DAYS,
         "PUMP_PRICE_SOURCE": PUMP_PRICE_SOURCE,
@@ -1401,6 +1418,34 @@ async def save_results_to_db(pool: asyncpg.Pool, run_ts: int, duration_sec: floa
                 )
     log(f"✓ Результаты сохранены в БД «{RESULTS_DB}»: прогон {run_time_msk}, "
         f"монет {len(coin_rows)}, событий {len(event_rows)}")
+
+
+async def load_recent_dedup_keys(pool: asyncpg.Pool, now: int,
+                                 dedup_hours: float) -> set:
+    """Ключи (base, день пика), уже показанные recent-прогонами за последние
+    dedup_hours. Считаются ТОЛЬКО прогоны recent (config->>'mode' = 'recent'),
+    чтобы полный history-прогон не «замылил» монеты."""
+    since_ts = now - int(dedup_hours * 3600)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            '''SELECT c."base" AS base, c."peak_ts_max" AS peak_ts_max
+               FROM "pump_scan_coins" c
+               JOIN "pump_scan_runs" r ON r."run_ts" = c."run_ts"
+               WHERE r."run_ts" >= $1 AND r."config"->>'mode' = 'recent' ''',
+            since_ts,
+        )
+    return {(r["base"], int(r["peak_ts_max"]) // 86400) for r in rows}
+
+
+async def prune_old_recent_runs(pool: asyncpg.Pool, now: int) -> None:
+    """Удаляет из results-БД прогоны старше RECENT_RETENTION_DAYS
+    (в режиме recent WIPE_PREVIOUS_RUNS выключен — без уборки таблица росла бы вечно)."""
+    cutoff = now - int(RECENT_RETENTION_DAYS * 86400)
+    async with pool.acquire() as conn:
+        for tbl in ("pump_scan_events", "pump_scan_coins", "pump_scan_runs"):
+            await conn.execute(f'DELETE FROM "{tbl}" WHERE "run_ts" < $1', cutoff)
+    log(f"🧹 Results-БД: удалены прогоны старше {RECENT_RETENTION_DAYS:.0f} дн "
+        f"(до {fmt_ts(cutoff, MSK_TZ)})")
 
 
 # ==========================================================================
@@ -1621,6 +1666,10 @@ async def main() -> None:
     log(f"  Памп: рост >= {PUMP_MIN_PCT}% (x{THRESH_RATIO:.2f}) за <= {PUMP_WINDOW_DAYS} дн "
         f"({WINDOW_BARS} баров), цены: {PUMP_PRICE_SOURCE}, "
         f"последняя свеча: {'пропущена' if DROP_UNFINISHED_LAST_BAR else 'учитывается'}")
+    if MODE == "recent":
+        dedup_txt = f"{RECENT_DEDUP_HOURS:.0f} ч" if RECENT_DEDUP_HOURS > 0 else "выкл"
+        log(f"  Режим: RECENT — только пампы за последние "
+            f"{fmt_window_label(PUMP_WINDOW_DAYS)} (дедупликация: {dedup_txt})")
     log(f"  До пампа: {PRE_PUMP_DAYS} дн (или доступная история) цена ниже "
         f"peak*{PRE_PUMP_BELOW_PEAK_FACTOR}")
     if since_ts is not None:
@@ -1708,6 +1757,26 @@ async def main() -> None:
     coins, rej = build_coin_results(catalog, all_events, now)
     coins.sort(key=lambda c: c["min_pump_pct"], reverse=True)
 
+    # --- Дедупликация recent-режима: не повторять уже показанные монеты ---
+    # Ключ события: (base, день пика). Считаем ТОЛЬКО прогоны recent, чтобы
+    # history-прогон не «замылил» монеты.
+    if MODE == "recent" and RECENT_DEDUP_HOURS > 0:
+        try:
+            dedup_pool = await init_results_db()
+            try:
+                seen = await load_recent_dedup_keys(dedup_pool, now, RECENT_DEDUP_HOURS)
+            finally:
+                await dedup_pool.close()
+            fresh = [c for c in coins
+                     if (c["base"], int(c["peak_ts_max"]) // 86400) not in seen]
+            n_dup = len(coins) - len(fresh)
+            if n_dup:
+                log(f"Дедупликация: {n_dup} монет(ы) уже показаны recent-прогоном "
+                    f"за последние {RECENT_DEDUP_HOURS:.0f} ч — не повторяем")
+            coins = fresh
+        except Exception as e:
+            logger.warning(f"Дедупликация выключена (не удалось прочитать results-БД): {e}")
+
     el = time.time() - started
     log("=" * 78)
     log(f"Готово за {el:.1f}s (CPU на NumPy: {stats['cpu_ms'] / 1000:.1f}s). "
@@ -1778,7 +1847,8 @@ async def main() -> None:
                         if (now - c["peak_ts_max"]) / 86400.0 <= RECENT_PUMPS_DAYS]
         recent_coins.sort(key=lambda c: c["peak_ts_max"], reverse=True)
         out("=" * len(header))
-        out(f"ПАМПЫ ЗА ПОСЛЕДНИЕ {RECENT_PUMPS_DAYS:.0f} ДНЕЙ (по пику): {len(recent_coins)} монет")
+        out(f"ПАМПЫ ЗА ПОСЛЕДНИЕ {fmt_window_label(RECENT_PUMPS_DAYS)} (по пику): "
+            f"{len(recent_coins)} монет")
         if not recent_coins:
             out("  (нет пампов за этот период)")
         else:
@@ -1824,6 +1894,10 @@ async def main() -> None:
             res_pool = await init_results_db()
             try:
                 await save_results_to_db(res_pool, now, el, stats, rej, coins)
+                if MODE == "recent":
+                    # recent держит WIPE_PREVIOUS_RUNS=False (дедупликации нужна
+                    # история) — поэтому старые прогоны убираем по ретеншену.
+                    await prune_old_recent_runs(res_pool, now)
             finally:
                 await res_pool.close()
         except Exception as e:
@@ -1838,6 +1912,89 @@ async def main() -> None:
 # Флаги переопределяют соответствующие глобальные константы ДО запуска main().
 # Производные параметры (WINDOW_BARS, THRESH_RATIO, BAR_MINUTES, DB_NAMES, …)
 # пересчитываются функцией _recompute_derived() в apply_args().
+
+
+def build_recent_parser() -> argparse.ArgumentParser:
+    """Быстрый режим «что отпампило за последние N часов».
+
+    Отличия от history (основного) режима:
+      * окно данных = hours + pre-pump (остальная история НЕ читается);
+      * сравнения порогов/методов выключены (только статистика, ~6x CPU);
+      * дедупликация по results-БД: монеты, уже показанные предыдущим
+        recent-прогоном, не повторяются;
+      * WIPE_PREVIOUS_RUNS выключен (дедупликации нужна история прогонов),
+        старые прогоны убираются по RECENT_RETENTION_DAYS.
+    """
+    p = argparse.ArgumentParser(
+        prog="pump_scanner.py recent",
+        description="Быстрый режим: пампы за последние N часов "
+                    "(окно = N + pre-pump, без сравнений, с дедупликацией). "
+                    "Сделан для cron: python pump_scanner.py recent --hours 6 --pct 30",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--hours", type=float, required=True,
+                   help="Сколько часов назад смотреть пампы (по пику). "
+                        "6 = за последние 6 часов")
+    p.add_argument("--pct", type=float, default=30.0,
+                   help="Порог пампа: рост от минимума до пика, %%")
+    p.add_argument("--timeframe", choices=["1d", "15m"], default="15m",
+                   help="Какой набор баз сканировать (для часовых окон — 15m)")
+    p.add_argument("--pre-pump-days", type=float, default=PRE_PUMP_DAYS,
+                   help="Смотреть «до пампа» столько дней (идёт в окно чтения)")
+    p.add_argument("--exchanges", default=None,
+                   help="Только эти биржи, через запятую (bybit,okx); пусто = все")
+    p.add_argument("--min-vitality", default=MIN_OB_VITALITY,
+                   help="Мин. живость стакана (A/B/C проходят; ''=выкл)")
+    p.add_argument("--no-spot", dest="include_spot", action="store_false",
+                   default=INCLUDE_SPOT, help="Не сканировать спот-таблицы")
+    p.add_argument("--no-swap", dest="include_swap", action="store_false",
+                   default=INCLUDE_SWAP, help="Не сканировать перп-таблицы")
+    p.add_argument("--top", type=int, default=REPORT_TOP_N,
+                   help="Сколько строк печатать в консоль")
+    p.add_argument("--dedup-hours", type=float, default=RECENT_DEDUP_HOURS,
+                   help="Сколько часов назад смотреть «уже показано» "
+                        "(0 = выключить дедупликацию)")
+    p.add_argument("--no-save-to-db", dest="save_to_db", action="store_false",
+                   help="Только консоль. ВНИМАНИЕ: без записи в БД дедупликация "
+                        "не будет работать на следующих прогонах")
+    return p
+
+
+def apply_recent_args(args) -> None:
+    """Глобальные константы для recent-режима поверх history-дефолтов."""
+    global MODE, PUMP_MIN_PCT, PUMP_WINDOW_DAYS, SCAN_TIMEFRAME, EXCHANGES_INCLUDE
+    global PRE_PUMP_DAYS, RECENT_PUMPS_DAYS, REPORT_TOP_N, SAVE_TO_DB
+    global MIN_OB_VITALITY, INCLUDE_SPOT, INCLUDE_SWAP
+    global COMPARE_PUMP_THRESHOLDS_PCT, COMPARE_PRICE_SOURCES
+    global SCAN_SINCE_DAYS, WIPE_PREVIOUS_RUNS, RECENT_DEDUP_HOURS
+
+    MODE = "recent"
+    hours = float(args.hours)
+    PUMP_MIN_PCT = float(args.pct)
+    # И весь памп (low -> peak), и пик — внутри окна последних N часов.
+    PUMP_WINDOW_DAYS = hours / 24.0
+    # Блок «ПАМПЫ ЗА ПОСЛЕДНИЕ N» отключаем: основной список recent-прогона
+    # показывает ровно те же монеты (все их пики в пределах окна).
+    RECENT_PUMPS_DAYS = None
+    SCAN_TIMEFRAME = args.timeframe
+    PRE_PUMP_DAYS = float(args.pre_pump_days)
+    # Окно чтения: сам памп + проверка «до пампа» + небольшой запас.
+    # (Именно это и даёт ускорение: ~10 дней вместо истории с 2018.)
+    SCAN_SINCE_DAYS = hours / 24.0 + PRE_PUMP_DAYS + 0.25
+    EXCHANGES_INCLUDE = _parse_exchange_list(args.exchanges)
+    INCLUDE_SPOT = bool(args.include_spot)
+    INCLUDE_SWAP = bool(args.include_swap)
+    MIN_OB_VITALITY = (str(args.min_vitality).strip().upper() if args.min_vitality else "")
+    REPORT_TOP_N = int(args.top)
+    SAVE_TO_DB = bool(args.save_to_db)
+    RECENT_DEDUP_HOURS = (0.0 if args.dedup_hours <= 0 else float(args.dedup_hours))
+    # Сравнения — только статистика для длинных прогонов; в recent выключены.
+    COMPARE_PUMP_THRESHOLDS_PCT = []
+    COMPARE_PRICE_SOURCES = False
+    # Дедупликация читает пред. recent-прогоны — не чистим результаты.
+    WIPE_PREVIOUS_RUNS = False
+
+    _recompute_derived()
 
 
 def _parse_exchange_list(value: Optional[str]) -> Optional[set]:
@@ -1914,13 +2071,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def apply_args(args) -> None:
     """Перенос CLI-флагов в глобальные константы и пересчёт производных."""
-    global PUMP_MIN_PCT, PUMP_WINDOW_DAYS, SCAN_TIMEFRAME, PUMP_PRICE_SOURCE
+    global MODE, PUMP_MIN_PCT, PUMP_WINDOW_DAYS, SCAN_TIMEFRAME, PUMP_PRICE_SOURCE
     global EXCHANGES_INCLUDE, MIN_EXCHANGES, REQUIRE_ALL_EXCHANGES, PEAK_ALIGN_DAYS
     global PRE_PUMP_DAYS, PRE_PUMP_BELOW_PEAK_FACTOR, RECENT_PUMPS_DAYS, REPORT_TOP_N
     global SAVE_TO_DB, PRINT_RUN_STATISTICS, INCLUDE_SPOT, INCLUDE_SWAP
     global MIN_OB_VITALITY, SHORT_MIN_HISTORY_DAYS, SCAN_SINCE_DAYS
     global COMPARE_PUMP_THRESHOLDS_PCT, COMPARE_PRICE_SOURCES
 
+    MODE = "history"
     PUMP_MIN_PCT = float(args.pct)
     PUMP_WINDOW_DAYS = float(args.days)
     SCAN_TIMEFRAME = args.timeframe
@@ -1931,7 +2089,10 @@ def apply_args(args) -> None:
     PEAK_ALIGN_DAYS = (None if args.peak_align_days <= 0 else float(args.peak_align_days))
     PRE_PUMP_DAYS = float(args.pre_pump_days)
     PRE_PUMP_BELOW_PEAK_FACTOR = float(args.pre_pump_factor)
-    RECENT_PUMPS_DAYS = (None if args.recent <= 0 else float(args.recent))
+    # Дефолт --recent берётся из глобала на момент parse; если recent-режим
+    # в том же процессе до этого поставил RECENT_PUMPS_DAYS=None — не роняем.
+    RECENT_PUMPS_DAYS = (None if (args.recent is None or args.recent <= 0)
+                        else float(args.recent))
     REPORT_TOP_N = int(args.top)
     SAVE_TO_DB = bool(args.save_to_db)
     PRINT_RUN_STATISTICS = bool(args.statistics)
@@ -1950,8 +2111,17 @@ def apply_args(args) -> None:
 
 if __name__ == "__main__":
     try:
-        _args = build_arg_parser().parse_args()
-        apply_args(_args)
+        _argv = sys.argv[1:]
+        if _argv[:1] == ["recent"]:
+            _args = build_recent_parser().parse_args(_argv[1:])
+            apply_recent_args(_args)
+        else:
+            # history (дефолт): все флаги прежнего CLI, включая `--pct/--days/…`.
+            # Явная подкоманда `history` тоже работает.
+            if _argv[:1] == ["history"]:
+                _argv = _argv[1:]
+            _args = build_arg_parser().parse_args(_argv)
+            apply_args(_args)
         asyncio.run(main())
     except KeyboardInterrupt:
         sys.exit(0)

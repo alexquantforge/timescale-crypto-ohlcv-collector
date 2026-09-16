@@ -33,6 +33,7 @@ _CONFIG_GLOBALS = [
     "REPORT_TOP_N", "SAVE_TO_DB", "PRINT_RUN_STATISTICS", "INCLUDE_SPOT", "INCLUDE_SWAP",
     "MIN_OB_VITALITY", "SHORT_MIN_HISTORY_DAYS", "SCAN_SINCE_DAYS",
     "COMPARE_PUMP_THRESHOLDS_PCT", "COMPARE_PRICE_SOURCES",
+    "MODE", "RECENT_DEDUP_HOURS", "RECENT_RETENTION_DAYS", "WIPE_PREVIOUS_RUNS",
 ]
 
 _DERIVED_GLOBALS = [
@@ -455,3 +456,167 @@ def test_main_banner_prints_window_before_db(monkeypatch, caplog):
             raise AssertionError("create_pool should have raised")
 
     assert any("Окно истории: только последние 11.0 дн" in m for m in caplog.messages)
+
+# ---------------------------------------------------------------------------
+# Recent mode: fast "pumps of the last N hours" entry point
+# ---------------------------------------------------------------------------
+
+
+def test_apply_recent_args_sets_globals():
+    from pump_scanner import build_recent_parser, apply_recent_args
+    args = build_recent_parser().parse_args(["--hours", "6", "--pct", "30"])
+    apply_recent_args(args)
+    assert ps.MODE == "recent"
+    assert ps.PUMP_MIN_PCT == 30.0
+    assert ps.PUMP_WINDOW_DAYS == 0.25        # 6ч / 24
+    assert ps.WINDOW_BARS == 24               # 0.25 d * 96 bars/d (15m)
+    assert ps.SCAN_TIMEFRAME == "15m"
+    assert ps.BAR_MINUTES == 15
+    # Окно чтения = сам памп + pre-pump + запас.
+    assert abs(ps.SCAN_SINCE_DAYS - (0.25 + ps.PRE_PUMP_DAYS + 0.25)) < 1e-9
+    # Сравнения (статистика) в recent выключены.
+    assert ps.COMPARE_PUMP_THRESHOLDS_PCT == []
+    assert ps.COMPARE_PRICE_SOURCES is False
+    # Дедупликации нужна история прогонов — не чистим, держим по ретеншену.
+    assert ps.WIPE_PREVIOUS_RUNS is False
+    assert ps.SAVE_TO_DB is True
+    assert ps.RECENT_DEDUP_HOURS == 24.0
+    # Блок «за N дней» не дублирует основной список recent-прогона.
+    assert ps.RECENT_PUMPS_DAYS is None
+
+
+def test_apply_recent_args_requires_hours():
+    from pump_scanner import build_recent_parser
+    p = build_recent_parser()
+    try:
+        p.parse_args([])
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("--hours must be required")
+
+
+def test_apply_recent_args_zero_dedup_disables():
+    from pump_scanner import build_recent_parser, apply_recent_args
+    args = build_recent_parser().parse_args(["--hours", "6", "--dedup-hours", "0"])
+    apply_recent_args(args)
+    assert ps.RECENT_DEDUP_HOURS == 0.0
+
+
+def test_apply_args_sets_mode_history():
+    """history-режим (дефолт) фиксирует MODE и свои настройки."""
+    from pump_scanner import build_arg_parser, apply_args
+    apply_args(build_arg_parser().parse_args([]))
+    assert ps.MODE == "history"
+    assert ps.COMPARE_PRICE_SOURCES is True
+    assert ps.WIPE_PREVIOUS_RUNS is True
+    assert ps.RECENT_PUMPS_DAYS == 30.0
+
+
+def test_apply_args_tolerates_none_recent_after_recent_mode():
+    """recent ставит RECENT_PUMPS_DAYS=None (глобал), и history-parse в том же
+    процессе не должен роняться на дефолте --recent."""
+    from pump_scanner import build_recent_parser, apply_recent_args
+    from pump_scanner import build_arg_parser, apply_args
+    apply_recent_args(build_recent_parser().parse_args(["--hours", "6"]))
+    assert ps.RECENT_PUMPS_DAYS is None
+    apply_args(build_arg_parser().parse_args([]))  # не должно быть TypeError
+    assert ps.MODE == "history"
+
+
+def test_fmt_window_label_hours_and_days():
+    assert ps.fmt_window_label(0.25) == "6.0 ч"
+    assert ps.fmt_window_label(3.0) == "3 дн"
+    assert ps.fmt_window_label(10.0) == "10 дн"
+
+
+def test_load_recent_dedup_keys_shape():
+    import asyncio
+
+    seen_sql = {}
+
+    class FakeConn:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def fetch(self, sql, since_ts):
+            seen_sql["sql"] = sql
+            seen_sql["since_ts"] = since_ts
+            # (base, peak_ts_max) — ключ (base, день пика)
+            return [
+                {"base": "BTC", "peak_ts_max": 1000},
+                {"base": "ETH", "peak_ts_max": 90000},
+            ]
+
+    class FakePool:
+        def acquire(self):
+            return FakeConn()
+
+    keys = asyncio.run(ps.load_recent_dedup_keys(FakePool(), now=100000, dedup_hours=24))
+    # день пика = peak_ts // 86400
+    assert keys == {("BTC", 1000 // 86400), ("ETH", 90000 // 86400)}
+    assert seen_sql["since_ts"] == 100000 - int(24 * 3600)
+    assert "pump_scan_runs" in seen_sql["sql"]
+    assert "pump_scan_coins" in seen_sql["sql"]
+    assert "'recent'" in seen_sql["sql"]
+
+
+def test_prune_old_recent_runs_deletes_older_than_retention():
+    import asyncio
+
+    deleted = []
+
+    class FakeConn:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def execute(self, sql, cutoff):
+            deleted.append((sql, cutoff))
+
+    class FakePool:
+        def acquire(self):
+            return FakeConn()
+
+    now = 86400 * 100  # 100 дней
+    asyncio.run(ps.prune_old_recent_runs(FakePool(), now=now))
+
+    # три таблицы: events, coins, runs — по одной DELETE на каждую
+    assert len(deleted) == 3
+    cutoff = now - int(ps.RECENT_RETENTION_DAYS * 86400)
+    tables = " ".join(sql for sql, _ in deleted)
+    assert "pump_scan_runs" in tables
+    assert "pump_scan_coins" in tables
+    assert "pump_scan_events" in tables
+    for _, c in deleted:
+        assert c == cutoff
+
+
+def test_main_recent_banner(monkeypatch, caplog):
+    import asyncio
+    import logging
+
+    from pump_scanner import build_recent_parser, apply_recent_args
+
+    apply_recent_args(build_recent_parser().parse_args(["--hours", "6", "--pct", "30"]))
+
+    async def boom(*a, **k):
+        raise RuntimeError("no db in tests")
+
+    monkeypatch.setattr(ps.asyncpg, "create_pool", boom)
+
+    with caplog.at_level(logging.INFO, logger="pump_scanner"):
+        try:
+            asyncio.run(ps.main())
+        except RuntimeError as e:
+            assert "no db in tests" in str(e)
+
+    msgs = caplog.messages
+    assert any("Режим: RECENT" in m for m in msgs)
+    assert any("6.0 ч" in m for m in msgs)
+    assert any("Окно истории" in m for m in msgs)
