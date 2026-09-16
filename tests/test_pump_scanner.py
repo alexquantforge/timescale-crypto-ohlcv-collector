@@ -31,7 +31,8 @@ _CONFIG_GLOBALS = [
     "EXCHANGES_INCLUDE", "MIN_EXCHANGES", "REQUIRE_ALL_EXCHANGES", "PEAK_ALIGN_DAYS",
     "PRE_PUMP_DAYS", "PRE_PUMP_BELOW_PEAK_FACTOR", "RECENT_PUMPS_DAYS",
     "REPORT_TOP_N", "SAVE_TO_DB", "PRINT_RUN_STATISTICS", "INCLUDE_SPOT", "INCLUDE_SWAP",
-    "MIN_OB_VITALITY", "SHORT_MIN_HISTORY_DAYS",
+    "MIN_OB_VITALITY", "SHORT_MIN_HISTORY_DAYS", "SCAN_SINCE_DAYS",
+    "COMPARE_PUMP_THRESHOLDS_PCT", "COMPARE_PRICE_SOURCES",
 ]
 
 _DERIVED_GLOBALS = [
@@ -347,3 +348,79 @@ def test_bingx_urls_carry_no_broken_shapes():
             assert "en-us" not in url, url
             assert not url.endswith("/"), url
             assert "SWAP" not in url.upper(), url
+
+# ---------------------------------------------------------------------------
+# Scan window (--since-days) and --no-compare
+# ---------------------------------------------------------------------------
+
+
+def test_apply_args_since_days_window():
+    from pump_scanner import build_arg_parser, apply_args
+    args = build_arg_parser().parse_args(["--since-days", "11"])
+    apply_args(args)
+    assert ps.SCAN_SINCE_DAYS == 11.0
+
+
+def test_apply_args_since_days_zero_means_full_history():
+    from pump_scanner import build_arg_parser, apply_args
+    args = build_arg_parser().parse_args(["--since-days", "0"])
+    apply_args(args)
+    assert ps.SCAN_SINCE_DAYS is None
+
+
+def test_apply_args_no_compare_disables_stat_only_sections():
+    from pump_scanner import build_arg_parser, apply_args
+    args = build_arg_parser().parse_args(["--no-compare"])
+    apply_args(args)
+    assert ps.COMPARE_PUMP_THRESHOLDS_PCT == []
+    assert ps.COMPARE_PRICE_SOURCES is False
+
+
+def test_apply_args_compare_enabled_by_default():
+    from pump_scanner import build_arg_parser, apply_args
+    args = build_arg_parser().parse_args([])
+    apply_args(args)
+    assert ps.COMPARE_PRICE_SOURCES is True
+    assert ps.SCAN_SINCE_DAYS is None
+
+
+def _run_scan_with_fake_pool(captured, since_ts):
+    import asyncio
+
+    class FakeConn:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def fetch(self, sql, *args):
+            captured["sql"] = sql
+            captured["args"] = args
+            return []  # пустая таблица: событий нет, но запрос перехватывается
+
+    class FakePool:
+        def acquire(self):
+            return FakeConn()
+
+    stats = {"scanned": 0, "too_short": 0, "errors": 0}
+    sem = asyncio.Semaphore(1)
+    return asyncio.run(
+        ps.scan_one_table("db", FakePool(), "btc_usdt_on_bybit", sem,
+                          1_700_000_000, stats, None, None, since_ts=since_ts))
+
+
+def test_scan_one_table_filters_history_with_since_ts():
+    captured: dict = {}
+    evs = _run_scan_with_fake_pool(captured, since_ts=1_690_000_000)
+    assert evs == []
+    assert '"Timestamp" >= $1' in captured["sql"]
+    assert captured["args"] == (1_690_000_000,)
+
+
+def test_scan_one_table_reads_full_history_without_since_ts():
+    captured: dict = {}
+    evs = _run_scan_with_fake_pool(captured, since_ts=None)
+    assert evs == []
+    assert "WHERE" not in captured["sql"]
+    assert captured["args"] == ()

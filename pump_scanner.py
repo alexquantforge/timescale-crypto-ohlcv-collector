@@ -178,6 +178,13 @@ MERGE_GAP_DAYS: float = 5.0      # детекции одного пампа бл
 
 # --- Производительность ---
 DB_CONCURRENCY: int = 24         # сколько таблиц читаем из БД одновременно (на каждую базу свой пул).
+# --- Окно сканирования (производительность) ---
+# Читаем из каждой таблицы только последние N дней истории (None/0 = вся история).
+# Для «свежих пампов» достаточно --days + --pre-pump-days (+ небольшой запас):
+# сам памп занимает не больше --days, а проверка «до пампа» смотрит --pre-pump-days
+# назад от старта. Для 15m-баз это в ~150 раз меньше данных на таблицу
+# (вся история с 2018+ против ~11 дней).
+SCAN_SINCE_DAYS: Optional[float] = None
 PROGRESS_LOG_EVERY: int = 200    # как часто писать прогресс в лог (в таблицах).
 DEBUG: bool = False              # подробный лог ошибок.
 
@@ -1404,7 +1411,8 @@ async def scan_one_table(db_name: str, pool: asyncpg.Pool, tbl: str,
                          sem: asyncio.Semaphore, now: int,
                          stats: Dict[str, int],
                          cmp_store: Optional[Dict[float, List[Dict[str, Any]]]] = None,
-                         src_cmp_store: Optional[Dict[str, List[Dict[str, Any]]]] = None
+                         src_cmp_store: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+                         since_ts: Optional[int] = None
                          ) -> List[Dict[str, Any]]:
     ticker, exch, kind = parse_table_name(tbl)
 
@@ -1422,9 +1430,16 @@ async def scan_one_table(db_name: str, pool: asyncpg.Pool, tbl: str,
     async with sem:
         try:
             async with pool.acquire() as conn:
-                rows = await conn.fetch(
-                    f'SELECT "Timestamp", low, high, close FROM "{tbl}" ORDER BY "Timestamp" ASC'
-                )
+                if since_ts is not None:
+                    rows = await conn.fetch(
+                        f'SELECT "Timestamp", low, high, close FROM "{tbl}" '
+                        f'WHERE "Timestamp" >= $1 ORDER BY "Timestamp" ASC',
+                        since_ts,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f'SELECT "Timestamp", low, high, close FROM "{tbl}" ORDER BY "Timestamp" ASC'
+                    )
         except Exception as e:
             stats["errors"] += 1
             if DEBUG:
@@ -1604,6 +1619,9 @@ async def main() -> None:
         f"последняя свеча: {'пропущена' if DROP_UNFINISHED_LAST_BAR else 'учитывается'}")
     log(f"  До пампа: {PRE_PUMP_DAYS} дн (или доступная история) цена ниже "
         f"peak*{PRE_PUMP_BELOW_PEAK_FACTOR}")
+    if since_ts is not None:
+        log(f"  Окно истории: только последние {SCAN_SINCE_DAYS} дн "
+            f"(с {fmt_ts(since_ts, MSK_TZ)}) — остальная история не читается")
     if COMPARE_PRICE_SOURCES:
         others = [s for s in PUMP_PRICE_SOURCES_COMPARE if s != PUMP_PRICE_SOURCE]
         log(f"  Сравнение методов: считаем и {', '.join(others)} — отчёт в конце "
@@ -1626,6 +1644,9 @@ async def main() -> None:
         )
 
     now = int(time.time())
+    since_ts: Optional[int] = None
+    if SCAN_SINCE_DAYS is not None:
+        since_ts = now - int(SCAN_SINCE_DAYS * 86400)
     stats: Dict[str, int] = {
         "tables_total": 0, "scanned": 0, "too_short": 0, "errors": 0,
         "skipped_filter": 0, "raw_events": 0, "filtered_prepump": 0,
@@ -1664,7 +1685,8 @@ async def main() -> None:
     log(f"Таблиц к сканированию: {len(tasks)} | уникальных монет в каталоге: {len(catalog)}")
 
     async def runner(db, pool, tbl):
-        evs = await scan_one_table(db, pool, tbl, sem, now, stats, cmp_store, src_cmp_store)
+        evs = await scan_one_table(db, pool, tbl, sem, now, stats, cmp_store, src_cmp_store,
+                                   since_ts=since_ts)
         all_events.extend(evs)  # сразу — иначе до конца gather прогресс показывал бы 0
         stats["done"] += 1
         if stats["done"] % PROGRESS_LOG_EVERY == 0 or stats["done"] == len(tasks):
@@ -1868,6 +1890,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="max high до пампа должен быть ниже peak*factor")
     p.add_argument("--recent", type=float, default=RECENT_PUMPS_DAYS,
                    help="Блок пампов за последние N дней (0 = выключить)")
+    p.add_argument("--since-days", type=float, default=SCAN_SINCE_DAYS,
+                   help="Читать из каждой таблицы только последние N дней истории "
+                        "(0 = вся история, дефолт). Рекомендация: --days + --pre-pump-days "
+                        "(+ небольшой запас) — для --days 0.25 это ~11.")
+    p.add_argument("--no-compare", dest="compare", action="store_false",
+                   help="Выключить сравнение порогов и методов (раздел только статистики): "
+                        "экономит ~5 лишних проходов NumPy на каждую таблицу")
     p.add_argument("--top", type=int, default=REPORT_TOP_N,
                    help="Сколько строк печатать в консоль")
     p.add_argument("--save-to-db", dest="save_to_db", action="store_true",
@@ -1889,7 +1918,8 @@ def apply_args(args) -> None:
     global EXCHANGES_INCLUDE, MIN_EXCHANGES, REQUIRE_ALL_EXCHANGES, PEAK_ALIGN_DAYS
     global PRE_PUMP_DAYS, PRE_PUMP_BELOW_PEAK_FACTOR, RECENT_PUMPS_DAYS, REPORT_TOP_N
     global SAVE_TO_DB, PRINT_RUN_STATISTICS, INCLUDE_SPOT, INCLUDE_SWAP
-    global MIN_OB_VITALITY, SHORT_MIN_HISTORY_DAYS
+    global MIN_OB_VITALITY, SHORT_MIN_HISTORY_DAYS, SCAN_SINCE_DAYS
+    global COMPARE_PUMP_THRESHOLDS_PCT, COMPARE_PRICE_SOURCES
 
     PUMP_MIN_PCT = float(args.pct)
     PUMP_WINDOW_DAYS = float(args.days)
@@ -1909,6 +1939,11 @@ def apply_args(args) -> None:
     INCLUDE_SWAP = bool(args.include_swap)
     MIN_OB_VITALITY = (str(args.min_vitality).strip().upper() if args.min_vitality else "")
     SHORT_MIN_HISTORY_DAYS = float(args.min_history_days)
+    SCAN_SINCE_DAYS = (None if args.since_days is None or args.since_days <= 0
+                       else float(args.since_days))
+    if not args.compare:
+        COMPARE_PUMP_THRESHOLDS_PCT = []
+        COMPARE_PRICE_SOURCES = False
 
     _recompute_derived()
 
