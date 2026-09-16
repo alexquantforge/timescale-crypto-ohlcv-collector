@@ -1612,6 +1612,10 @@ async def list_tables(pool: asyncpg.Pool) -> List[str]:
 
 async def main() -> None:
     started = time.time()
+    now = int(time.time())
+    since_ts: Optional[int] = None
+    if SCAN_SINCE_DAYS is not None:
+        since_ts = now - int(SCAN_SINCE_DAYS * 86400)
     log("=" * 78)
     log("PUMP SCANNER — старт (кросс-биржевой режим)")
     log(f"  Памп: рост >= {PUMP_MIN_PCT}% (x{THRESH_RATIO:.2f}) за <= {PUMP_WINDOW_DAYS} дн "
@@ -1643,10 +1647,6 @@ async def main() -> None:
             database=db, min_size=2, max_size=DB_CONCURRENCY,
         )
 
-    now = int(time.time())
-    since_ts: Optional[int] = None
-    if SCAN_SINCE_DAYS is not None:
-        since_ts = now - int(SCAN_SINCE_DAYS * 86400)
     stats: Dict[str, int] = {
         "tables_total": 0, "scanned": 0, "too_short": 0, "errors": 0,
         "skipped_filter": 0, "raw_events": 0, "filtered_prepump": 0,

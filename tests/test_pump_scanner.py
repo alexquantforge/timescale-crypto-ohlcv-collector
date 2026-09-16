@@ -424,3 +424,34 @@ def test_scan_one_table_reads_full_history_without_since_ts():
     assert evs == []
     assert "WHERE" not in captured["sql"]
     assert captured["args"] == ()
+
+# ---------------------------------------------------------------------------
+# main(): the start banner (incl. the --since-days window line) must be
+# printed BEFORE the first DB access — regression for UnboundLocalError
+# on `since_ts` when the banner referenced it before the assignment.
+# ---------------------------------------------------------------------------
+
+
+def test_main_banner_prints_window_before_db(monkeypatch, caplog):
+    import asyncio
+    import logging
+
+    from pump_scanner import build_arg_parser, apply_args
+
+    args = build_arg_parser().parse_args(["--since-days", "11"])
+    apply_args(args)
+
+    async def boom(*a, **k):
+        raise RuntimeError("no db in tests")
+
+    monkeypatch.setattr(ps.asyncpg, "create_pool", boom)
+
+    with caplog.at_level(logging.INFO, logger="pump_scanner"):
+        try:
+            asyncio.run(ps.main())
+        except RuntimeError as e:
+            assert "no db in tests" in str(e)
+        else:
+            raise AssertionError("create_pool should have raised")
+
+    assert any("Окно истории: только последние 11.0 дн" in m for m in caplog.messages)
