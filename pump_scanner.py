@@ -163,6 +163,11 @@ def is_excluded_base(base: str, exch: Optional[str] = None) -> bool:
 # (биржи из списка основаны в 2018+, а в kline-истории встречается мусор
 # вроде таймстемпов 2007-2011 гг.). None = без отсечки.
 MIN_PLAUSIBLE_PEAK_DATE: Optional[str] = "2017-01-01"
+# Санити-отсечка по БУДУЩЕМУ пику: пик позже «now + N дней» = битые таймстемпы
+# (у mexc в kline-истории токенизированных акций встречались пики 2033–2059 гг. —
+# без этой отсечки они проходят MIN_PLAUSIBLE_PEAK_DATE и ломают период/статистику).
+# None = отсечка выключена.
+MAX_FUTURE_PEAK_DAYS: Optional[float] = 1.0
 TABLE_LIMIT: Optional[int] = None        # ограничить число таблиц (для быстрого теста); None = все.
 MIN_HISTORY_BARS: Optional[int] = None   # порог «новой» монеты (флаг NEW в отчёте);
                                          # None = WINDOW_BARS + PRE_PUMP_BARS (по умолчанию 15 дней).
@@ -233,6 +238,11 @@ MODE: str = "history"
 RECENT_DEDUP_HOURS: float = 24.0
 # Сколько дней recent-прогонов хранить в results-БД (старые удаляются).
 RECENT_RETENTION_DAYS: float = 7.0
+# recent: сколько таблиц читать ОДНИМ UNION-запросом. Фиксированная цена запроса
+# (планирование + каталог гипертаблиц) делится на N таблиц — 8531 запросов
+# становится ~170. В history (вся история, ~175k строк на таблицу) батчи не
+# применяются: один батч упрётся в объём памяти.
+RECENT_BATCH_SIZE: int = 50
 
 # --- Детальная статистика прогона (печатается в конце) ---
 PRINT_RUN_STATISTICS: bool = True      # True — в конце печатать статистику по датам/частоте пампов
@@ -307,6 +317,9 @@ MIN_PLAUSIBLE_PEAK_TS: Optional[int] = (
         .replace(tzinfo=datetime.timezone.utc).timestamp())
     if MIN_PLAUSIBLE_PEAK_DATE else None
 )
+MAX_FUTURE_PEAK_MARGIN_SEC: Optional[int] = (
+    int(MAX_FUTURE_PEAK_DAYS * 86400) if MAX_FUTURE_PEAK_DAYS is not None else None
+)
 
 DB_NAMES: List[str] = _default_db_names(SCAN_TIMEFRAME)
 
@@ -320,7 +333,7 @@ def _recompute_derived() -> None:
     """
     global BAR_MINUTES, BAR_SEC, BARS_IN_DAY, WINDOW_BARS, PRE_PUMP_BARS
     global MERGE_GAP_BARS, MIN_HISTORY_BARS, SHORT_MIN_HISTORY_BARS, THRESH_RATIO
-    global MIN_PLAUSIBLE_PEAK_TS, DB_NAMES
+    global MIN_PLAUSIBLE_PEAK_TS, MAX_FUTURE_PEAK_MARGIN_SEC, DB_NAMES
 
     BAR_MINUTES = 1440 if SCAN_TIMEFRAME == "1d" else 15
     BAR_SEC = BAR_MINUTES * 60
@@ -336,6 +349,9 @@ def _recompute_derived() -> None:
         int(datetime.datetime.strptime(MIN_PLAUSIBLE_PEAK_DATE, "%Y-%m-%d")
             .replace(tzinfo=datetime.timezone.utc).timestamp())
         if MIN_PLAUSIBLE_PEAK_DATE else None
+    )
+    MAX_FUTURE_PEAK_MARGIN_SEC = (
+        int(MAX_FUTURE_PEAK_DAYS * 86400) if MAX_FUTURE_PEAK_DAYS is not None else None
     )
     DB_NAMES = _default_db_names(SCAN_TIMEFRAME)
 
@@ -596,6 +612,13 @@ def fmt_ts(ts_sec: int, tz=None) -> str:
 def fmt_window_label(days: float) -> str:
     """'0.25' -> '6.0 ч', '3.0' -> '3 дн' — для заголовков блоков отчёта."""
     return f"{days * 24:.1f} ч" if days < 1 else f"{days:.0f} дн"
+
+
+def filter_peaks_within_days(coins: List[Dict[str, Any]], now: int,
+                             days: float) -> List[Dict[str, Any]]:
+    """Монеты, чей пик (peak_ts_max) был не раньше `days` дней назад."""
+    cutoff = now - int(days * 86400)
+    return [c for c in coins if int(c["peak_ts_max"]) >= cutoff]
 
 
 def fmt_price(x: Optional[float]) -> str:
@@ -1452,45 +1475,64 @@ async def prune_old_recent_runs(pool: asyncpg.Pool, now: int) -> None:
 #                       СКАНИРОВАНИЕ ОДНОЙ ТАБЛИЦЫ
 # ==========================================================================
 
-async def scan_one_table(db_name: str, pool: asyncpg.Pool, tbl: str,
-                         sem: asyncio.Semaphore, now: int,
-                         stats: Dict[str, int],
-                         cmp_store: Optional[Dict[float, List[Dict[str, Any]]]] = None,
-                         src_cmp_store: Optional[Dict[str, List[Dict[str, Any]]]] = None,
-                         since_ts: Optional[int] = None
-                         ) -> List[Dict[str, Any]]:
-    ticker, exch, kind = parse_table_name(tbl)
+def passes_name_filters(tbl: str, stats: Dict[str, int]) -> bool:
+    """Быстрые фильтры по имени таблицы (без обращения к данным).
+    При пропуске инкрементирует stats['skipped_filter']."""
+    _, exch, kind = parse_table_name(tbl)
+    if (EXCHANGES_INCLUDE is not None and exch not in EXCHANGES_INCLUDE) \
+            or (kind == "spot" and not INCLUDE_SPOT) \
+            or (kind == "swap" and not INCLUDE_SWAP):
+        stats["skipped_filter"] += 1
+        return False
+    return True
 
-    # Быстрые фильтры по имени таблицы (без запроса к данным).
-    if EXCHANGES_INCLUDE is not None and exch not in EXCHANGES_INCLUDE:
-        stats["skipped_filter"] += 1
-        return []
-    if kind == "spot" and not INCLUDE_SPOT:
-        stats["skipped_filter"] += 1
-        return []
-    if kind == "swap" and not INCLUDE_SWAP:
-        stats["skipped_filter"] += 1
-        return []
 
+async def fetch_batch_rows(pool: asyncpg.Pool, tbls: List[str], sem: asyncio.Semaphore,
+                           since_ts: Optional[int] = None
+                           ) -> Tuple[Dict[str, List[Tuple]], int]:
+    """Читает до RECENT_BATCH_SIZE таблиц ОДНИМ UNION ALL-запросом вместо
+    одного запроса на таблицу. Фиксированная цена запроса (план + каталог
+    чанков гипертаблиц) оплачивается 1/N раз вместо N.
+
+    since_ts=None — без WHERE (вся история; в recent не используется, но
+    делает батч безопасным при любом окне).
+
+    Возврат: ({таблица: строки}, число таблиц, не прочитанных из-за ошибки).
+    Батч падает атомарно: битая одна таблица обнуляет весь батч.
+    """
+    where = ' WHERE "Timestamp" >= $1' if since_ts is not None else ''
+    parts = []
+    for i, tbl in enumerate(tbls):
+        parts.append(
+            f'(SELECT {i} AS t, "Timestamp", low, high, close FROM "{tbl}"'
+            f'{where} ORDER BY "Timestamp" ASC)'
+        )
+    sql = " UNION ALL ".join(parts)
+    by_tbl: Dict[str, List[Tuple]] = {tbl: [] for tbl in tbls}
     async with sem:
         try:
             async with pool.acquire() as conn:
                 if since_ts is not None:
-                    rows = await conn.fetch(
-                        f'SELECT "Timestamp", low, high, close FROM "{tbl}" '
-                        f'WHERE "Timestamp" >= $1 ORDER BY "Timestamp" ASC',
-                        since_ts,
-                    )
+                    rows = await conn.fetch(sql, since_ts)
                 else:
-                    rows = await conn.fetch(
-                        f'SELECT "Timestamp", low, high, close FROM "{tbl}" ORDER BY "Timestamp" ASC'
-                    )
+                    rows = await conn.fetch(sql)
         except Exception as e:
-            stats["errors"] += 1
             if DEBUG:
-                log(f"  ⚠️ [{db_name}] {tbl}: ошибка чтения: {e}")
-            return []
+                log(f"  ⚠️ [батч из {len(tbls)} таблиц]: ошибка чтения: {e}")
+            return {}, len(tbls)
+    for r in rows:
+        by_tbl[tbls[r["t"]]].append((r["Timestamp"], r["low"], r["high"], r["close"]))
+    return by_tbl, 0
 
+
+async def analyze_table(db_name: str, pool: asyncpg.Pool, tbl: str,
+                        ticker: str, exch: str, kind: str,
+                        rows: List[Any], now: int, stats: Dict[str, int],
+                        cmp_store: Optional[Dict[float, List[Dict[str, Any]]]] = None,
+                        src_cmp_store: Optional[Dict[str, List[Dict[str, Any]]]] = None
+                        ) -> List[Dict[str, Any]]:
+    """Анализ данных ОДНОЙ таблицы (строки уже прочитаны). Общая для
+    scan_one_table (history, по одной таблице на запрос) и батч-режима recent."""
     stats["scanned"] += 1
     n = len(rows)
     if not history_length_ok(n):
@@ -1530,6 +1572,11 @@ async def scan_one_table(db_name: str, pool: asyncpg.Pool, tbl: str,
             stats["filtered_data_sanity"] += 1
             continue
         if MIN_PLAUSIBLE_PEAK_TS is not None and ev["peak_ts"] < MIN_PLAUSIBLE_PEAK_TS:
+            stats["filtered_data_sanity"] += 1
+            continue
+        # Пик в будущем (битые таймстемпы kline-истории, напр. mexc 2033–2059):
+        if (MAX_FUTURE_PEAK_MARGIN_SEC is not None
+                and ev["peak_ts"] > now + MAX_FUTURE_PEAK_MARGIN_SEC):
             stats["filtered_data_sanity"] += 1
             continue
         ok, pre_max = passes_prepump_filter(ref_price, ev["i"], ev["peak_price"])
@@ -1604,6 +1651,9 @@ async def scan_one_table(db_name: str, pool: asyncpg.Pool, tbl: str,
                     continue
                 if MIN_PLAUSIBLE_PEAK_TS is not None and cev["peak_ts"] < MIN_PLAUSIBLE_PEAK_TS:
                     continue
+                if (MAX_FUTURE_PEAK_MARGIN_SEC is not None
+                        and cev["peak_ts"] > now + MAX_FUTURE_PEAK_MARGIN_SEC):
+                    continue
                 cok, _ = passes_prepump_filter(ref_price, cev["i"], cev["peak_price"])
                 if not cok:
                     continue
@@ -1629,6 +1679,9 @@ async def scan_one_table(db_name: str, pool: asyncpg.Pool, tbl: str,
                     continue
                 if MIN_PLAUSIBLE_PEAK_TS is not None and se["peak_ts"] < MIN_PLAUSIBLE_PEAK_TS:
                     continue
+                if (MAX_FUTURE_PEAK_MARGIN_SEC is not None
+                        and se["peak_ts"] > now + MAX_FUTURE_PEAK_MARGIN_SEC):
+                    continue
                 sok, _ = passes_prepump_filter(sref, se["i"], se["peak_price"])
                 if not sok:
                     continue
@@ -1639,6 +1692,39 @@ async def scan_one_table(db_name: str, pool: asyncpg.Pool, tbl: str,
                      "pump_pct": se["pump_pct"]})
                 kept += 1
     return out
+
+
+async def scan_one_table(db_name: str, pool: asyncpg.Pool, tbl: str,
+                         sem: asyncio.Semaphore, now: int,
+                         stats: Dict[str, int],
+                         cmp_store: Optional[Dict[float, List[Dict[str, Any]]]] = None,
+                         src_cmp_store: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+                         since_ts: Optional[int] = None
+                         ) -> List[Dict[str, Any]]:
+    """history-режим: один запрос на таблицу (батчи только в recent)."""
+    if not passes_name_filters(tbl, stats):
+        return []
+    ticker, exch, kind = parse_table_name(tbl)
+    async with sem:
+        try:
+            async with pool.acquire() as conn:
+                if since_ts is not None:
+                    rows = await conn.fetch(
+                        f'SELECT "Timestamp", low, high, close FROM "{tbl}" '
+                        f'WHERE "Timestamp" >= $1 ORDER BY "Timestamp" ASC',
+                        since_ts,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f'SELECT "Timestamp", low, high, close FROM "{tbl}" ORDER BY "Timestamp" ASC'
+                    )
+        except Exception as e:
+            stats["errors"] += 1
+            if DEBUG:
+                log(f"  ⚠️ [{db_name}] {tbl}: ошибка чтения: {e}")
+            return []
+    return await analyze_table(db_name, pool, tbl, ticker, exch, kind,
+                               rows, now, stats, cmp_store, src_cmp_store)
 
 
 # ==========================================================================
@@ -1669,7 +1755,8 @@ async def main() -> None:
     if MODE == "recent":
         dedup_txt = f"{RECENT_DEDUP_HOURS:.0f} ч" if RECENT_DEDUP_HOURS > 0 else "выкл"
         log(f"  Режим: RECENT — только пампы за последние "
-            f"{fmt_window_label(PUMP_WINDOW_DAYS)} (дедупликация: {dedup_txt})")
+            f"{fmt_window_label(PUMP_WINDOW_DAYS)} (дедупликация: {dedup_txt}, "
+            f"батч: {RECENT_BATCH_SIZE} таблиц/запрос)")
     log(f"  До пампа: {PRE_PUMP_DAYS} дн (или доступная история) цена ниже "
         f"peak*{PRE_PUMP_BELOW_PEAK_FACTOR}")
     if since_ts is not None:
@@ -1731,24 +1818,59 @@ async def main() -> None:
         tasks = tasks[:TABLE_LIMIT]
         log(f"⚠️ TABLE_LIMIT={TABLE_LIMIT}: сканируем только первые {len(tasks)} таблиц")
 
-    log(f"Таблиц к сканированию: {len(tasks)} | уникальных монет в каталоге: {len(catalog)}")
+    total_tables = len(tasks)
+    log(f"Таблиц к сканированию: {total_tables} | уникальных монет в каталоге: {len(catalog)}")
 
-    async def runner(db, pool, tbl):
-        evs = await scan_one_table(db, pool, tbl, sem, now, stats, cmp_store, src_cmp_store,
-                                   since_ts=since_ts)
-        all_events.extend(evs)  # сразу — иначе до конца gather прогресс показывал бы 0
-        stats["done"] += 1
-        if stats["done"] % PROGRESS_LOG_EVERY == 0 or stats["done"] == len(tasks):
-            done, total = stats["done"], max(len(tasks), 1)
+    def _progress():
+        done, total = stats["done"], max(total_tables, 1)
+        if done % PROGRESS_LOG_EVERY == 0 or done == total:
             el = time.time() - started
             eta = _fmt_eta((el / done) * (total - done)) if done else "?"
             log(f"  ... {done}/{total} · {done / total * 100.0:.1f}% · "
                 f"прошло {_fmt_eta(el)} · ETA {eta} | в отчёт: {len(all_events)} | "
                 f"сырых: {stats['raw_events']} (отсев до-пампа: {stats['filtered_prepump']}, "
                 f"возраст: {stats['filtered_age']})")
-        return evs
 
-    await asyncio.gather(*[runner(*t) for t in tasks])
+    if MODE == "recent":
+        # Батч-режим: ОДИН UNION-запрос на RECENT_BATCH_SIZE таблиц — фиксированная
+        # цена запроса (план + каталог гипертаблиц) делится на N, а не умножается.
+        eligible = [(db, pool, tbl) for db, pool, tbl in tasks
+                    if passes_name_filters(tbl, stats)]
+        # Пропущенные быстрыми фильтрами сразу считаем сделанными — как в history
+        # (иначе прогресс не дойдёт до 100%).
+        stats["done"] += total_tables - len(eligible)
+        batches = [eligible[i:i + RECENT_BATCH_SIZE]
+                   for i in range(0, len(eligible), RECENT_BATCH_SIZE)]
+
+        async def runner_batch(chunk):
+            db, pool = chunk[0][0], chunk[0][1]
+            by_tbl, n_err = await fetch_batch_rows(
+                pool, [tbl for _, _, tbl in chunk], sem, since_ts)
+            if n_err:
+                # Битый батч: все таблицы батча считаем ошибкой чтения.
+                stats["errors"] += n_err
+                stats["done"] += n_err
+                _progress()
+                return
+            for _db, _pool, tbl in chunk:
+                ticker, exch, kind = parse_table_name(tbl)
+                evs = await analyze_table(_db, _pool, tbl, ticker, exch, kind,
+                                          by_tbl.get(tbl, []), now, stats,
+                                          cmp_store, src_cmp_store)
+                all_events.extend(evs)  # сразу — иначе прогресс показывал бы 0
+                stats["done"] += 1
+                _progress()
+
+        await asyncio.gather(*[runner_batch(c) for c in batches])
+    else:
+        async def runner(db, pool, tbl):
+            evs = await scan_one_table(db, pool, tbl, sem, now, stats, cmp_store,
+                                       src_cmp_store, since_ts=since_ts)
+            all_events.extend(evs)  # сразу — иначе до конца gather прогресс показывал бы 0
+            stats["done"] += 1
+            _progress()
+
+        await asyncio.gather(*[runner(*t) for t in tasks])
 
     for pool in pools.values():
         await pool.close()
@@ -1756,6 +1878,17 @@ async def main() -> None:
     # --- Кросс-биржевой отбор монет ---
     coins, rej = build_coin_results(catalog, all_events, now)
     coins.sort(key=lambda c: c["min_pump_pct"], reverse=True)
+
+    # --- Recent: пики СТРОГО в пределах последних N часов ---
+    # Основной список отчёта фильтрует по СТАРТУ (≤ 10 дн), и без этого отсечения
+    # в «6-часовой» отчёт попадали пампы с пиком 2–8 дней назад.
+    if MODE == "recent":
+        n_before = len(coins)
+        coins = filter_peaks_within_days(coins, now, PUMP_WINDOW_DAYS)
+        n_drop = n_before - len(coins)
+        if n_drop:
+            log(f"Recent: отброшено {n_drop} монет(ы) с пиком старше "
+                f"{fmt_window_label(PUMP_WINDOW_DAYS)}")
 
     # --- Дедупликация recent-режима: не повторять уже показанные монеты ---
     # Ключ события: (base, день пика). Считаем ТОЛЬКО прогоны recent, чтобы

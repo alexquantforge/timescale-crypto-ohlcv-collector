@@ -34,12 +34,13 @@ _CONFIG_GLOBALS = [
     "MIN_OB_VITALITY", "SHORT_MIN_HISTORY_DAYS", "SCAN_SINCE_DAYS",
     "COMPARE_PUMP_THRESHOLDS_PCT", "COMPARE_PRICE_SOURCES",
     "MODE", "RECENT_DEDUP_HOURS", "RECENT_RETENTION_DAYS", "WIPE_PREVIOUS_RUNS",
+    "MAX_FUTURE_PEAK_DAYS", "RECENT_BATCH_SIZE",
 ]
 
 _DERIVED_GLOBALS = [
     "BAR_MINUTES", "BAR_SEC", "BARS_IN_DAY", "WINDOW_BARS", "PRE_PUMP_BARS",
     "MERGE_GAP_BARS", "MIN_HISTORY_BARS", "SHORT_MIN_HISTORY_BARS", "THRESH_RATIO",
-    "MIN_PLAUSIBLE_PEAK_TS", "DB_NAMES",
+    "MIN_PLAUSIBLE_PEAK_TS", "MAX_FUTURE_PEAK_MARGIN_SEC", "DB_NAMES",
 ]
 
 
@@ -620,3 +621,104 @@ def test_main_recent_banner(monkeypatch, caplog):
     assert any("Режим: RECENT" in m for m in msgs)
     assert any("6.0 ч" in m for m in msgs)
     assert any("Окно истории" in m for m in msgs)
+
+# ---------------------------------------------------------------------------
+# Batched reads (recent), future-peak sanity, peak-recency filter
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_batch_rows_groups_by_table():
+    import asyncio
+
+    captured = {}
+
+    class FakeConn:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def fetch(self, sql, since_ts):
+            captured["sql"] = sql
+            captured["since_ts"] = since_ts
+            return [
+                {"t": 0, "Timestamp": 100, "low": 1.0, "high": 2.0, "close": 1.5},
+                {"t": 0, "Timestamp": 200, "low": 1.0, "high": 2.5, "close": 2.0},
+                {"t": 2, "Timestamp": 300, "low": 0.5, "high": 0.6, "close": 0.55},
+            ]
+
+    class FakePool:
+        def acquire(self):
+            return FakeConn()
+
+    tbls = ["a_usdt_on_x", "b_usdt_on_y", "c_usdt_on_z"]
+    by_tbl, n_err = asyncio.run(
+        ps.fetch_batch_rows(FakePool(), tbls, asyncio.Semaphore(1), 50))
+    assert n_err == 0
+    assert by_tbl["a_usdt_on_x"] == [(100, 1.0, 2.0, 1.5), (200, 1.0, 2.5, 2.0)]
+    assert by_tbl["b_usdt_on_y"] == []  # нет строк в окне — пустой список, не ошибка
+    assert by_tbl["c_usdt_on_z"] == [(300, 0.5, 0.6, 0.55)]
+    assert captured["sql"].count("UNION ALL") == 2
+    assert captured["since_ts"] == 50
+
+
+def test_fetch_batch_rows_error_counts_whole_batch():
+    import asyncio
+
+    class FakeConn:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def fetch(self, *a, **k):
+            raise RuntimeError("boom")
+
+    class FakePool:
+        def acquire(self):
+            return FakeConn()
+
+    by_tbl, n_err = asyncio.run(
+        ps.fetch_batch_rows(FakePool(), ["a_usdt_on_x", "b_usdt_on_y"],
+                            asyncio.Semaphore(1), 50))
+    assert by_tbl == {}
+    assert n_err == 2
+
+
+def test_future_peak_is_filtered_as_data_sanity():
+    """Пик позже now + MAX_FUTURE_PEAK_DAYS (битые kline-таймстемпы mexc
+    2033–2059) отбрасывается как мусор данных, а не попадает в отчёт."""
+    import asyncio
+
+    from pump_scanner import build_recent_parser, apply_recent_args
+    apply_recent_args(build_recent_parser().parse_args(["--hours", "6"]))
+
+    now = 1_700_000_000
+    n = 30
+    step = 900
+    t0 = now + 2 * 86400  # вся серия в будущем
+    close = [1.0] * (n - 3) + [1.2, 1.5, 2.0]
+    rows = [(t0 + i * step, close[i], close[i], close[i]) for i in range(n)]
+
+    stats = {"scanned": 0, "too_short": 0, "short_history": 0, "raw_events": 0,
+             "filtered_data_sanity": 0, "filtered_prepump": 0, "filtered_age": 0,
+             "filtered_ob_dead": 0, "ob_unverified": 0, "cpu_ms": 0}
+    evs = asyncio.run(ps.analyze_table(
+        "db", None, "btc_usdt_on_bybit", "BTC/USDT", "bybit", "spot",
+        rows, now, stats))
+    assert evs == []
+    assert stats["raw_events"] >= 1        # памп найден…
+    assert stats["filtered_data_sanity"] >= 1  # …но отсечён как мусор
+
+
+def test_filter_peaks_within_days():
+    now = 86400 * 100
+    coins = [
+        {"base": "A", "peak_ts_max": now - 3600},          # 1 ч — в окне
+        {"base": "B", "peak_ts_max": now - 2 * 3600},      # 2 ч — в окне 6 ч
+        {"base": "C", "peak_ts_max": now - 12 * 3600},     # 12 ч — вне окна 6 ч
+    ]
+    kept = ps.filter_peaks_within_days(coins, now, days=6 / 24)
+    assert [c["base"] for c in kept] == ["A", "B"]
