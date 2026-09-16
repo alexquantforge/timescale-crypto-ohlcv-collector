@@ -238,11 +238,11 @@ MODE: str = "history"
 RECENT_DEDUP_HOURS: float = 24.0
 # Сколько дней recent-прогонов хранить в results-БД (старые удаляются).
 RECENT_RETENTION_DAYS: float = 7.0
-# recent: сколько таблиц читать ОДНИМ UNION-запросом. Фиксированная цена запроса
-# (планирование + каталог гипертаблиц) делится на N таблиц — 8531 запросов
-# становится ~170. В history (вся история, ~175k строк на таблицу) батчи не
-# применяются: один батч упрётся в объём памяти.
-RECENT_BATCH_SIZE: int = 50
+# recent: размер батча UNION ALL-запроса. 1 (дефолт) = по одной таблице на
+# запрос. Опыт на реальной базе (2026-09-16): батчи по 50 гипертаблиц МЕДЛЕННЕЕ
+# 50 маленьких запросов (сервер упирается в план/буферы широкого UNION) —
+# включать только после замера на своей базе.
+RECENT_BATCH_SIZE: int = 1
 
 # --- Детальная статистика прогона (печатается в конце) ---
 PRINT_RUN_STATISTICS: bool = True      # True — в конце печатать статистику по датам/частоте пампов
@@ -1754,9 +1754,9 @@ async def main() -> None:
         f"последняя свеча: {'пропущена' if DROP_UNFINISHED_LAST_BAR else 'учитывается'}")
     if MODE == "recent":
         dedup_txt = f"{RECENT_DEDUP_HOURS:.0f} ч" if RECENT_DEDUP_HOURS > 0 else "выкл"
+        batch_txt = f", батч: {RECENT_BATCH_SIZE} табл/запрос" if RECENT_BATCH_SIZE > 1 else ""
         log(f"  Режим: RECENT — только пампы за последние "
-            f"{fmt_window_label(PUMP_WINDOW_DAYS)} (дедупликация: {dedup_txt}, "
-            f"батч: {RECENT_BATCH_SIZE} таблиц/запрос)")
+            f"{fmt_window_label(PUMP_WINDOW_DAYS)} (дедупликация: {dedup_txt}{batch_txt})")
     log(f"  До пампа: {PRE_PUMP_DAYS} дн (или доступная история) цена ниже "
         f"peak*{PRE_PUMP_BELOW_PEAK_FACTOR}")
     if since_ts is not None:
@@ -1831,9 +1831,11 @@ async def main() -> None:
                 f"сырых: {stats['raw_events']} (отсев до-пампа: {stats['filtered_prepump']}, "
                 f"возраст: {stats['filtered_age']})")
 
-    if MODE == "recent":
-        # Батч-режим: ОДИН UNION-запрос на RECENT_BATCH_SIZE таблиц — фиксированная
-        # цена запроса (план + каталог гипертаблиц) делится на N, а не умножается.
+    if MODE == "recent" and RECENT_BATCH_SIZE > 1:
+        # Батч-режим: ОДИН UNION-запрос на RECENT_BATCH_SIZE таблиц.
+        # ВНИМАНИЕ: на реальной базе (замер 2026-09-16) батчи по 50 МЕДЛЕННЕЕ,
+        # чем по одной таблице — сервер упирается в план/буферы широкого UNION.
+        # Дефолт RECENT_BATCH_SIZE=1; включать только после собственного замера.
         eligible = [(db, pool, tbl) for db, pool, tbl in tasks
                     if passes_name_filters(tbl, stats)]
         # Пропущенные быстрыми фильтрами сразу считаем сделанными — как в history
@@ -2087,6 +2089,14 @@ def build_recent_parser() -> argparse.ArgumentParser:
     p.add_argument("--dedup-hours", type=float, default=RECENT_DEDUP_HOURS,
                    help="Сколько часов назад смотреть «уже показано» "
                         "(0 = выключить дедупликацию)")
+    p.add_argument("--batch-size", type=int, default=RECENT_BATCH_SIZE,
+                   help="Сколько таблиц читать одним UNION-запросом "
+                        "(1 = по одной; замер на реальной базе: 50 МЕДЛЕННЕЕ, "
+                        "не включать без собственного замера)")
+    p.add_argument("--concurrency", type=int, default=DB_CONCURRENCY,
+                   help="Сколько таблиц читать параллельно. Если БД на этой же "
+                        "машине и одновременно крутится коллектор — уменьшите "
+                        "(8-12): конкуренция за CPU/диск замедляет 24 потока")
     p.add_argument("--no-save-to-db", dest="save_to_db", action="store_false",
                    help="Только консоль. ВНИМАНИЕ: без записи в БД дедупликация "
                         "не будет работать на следующих прогонах")
@@ -2100,6 +2110,7 @@ def apply_recent_args(args) -> None:
     global MIN_OB_VITALITY, INCLUDE_SPOT, INCLUDE_SWAP
     global COMPARE_PUMP_THRESHOLDS_PCT, COMPARE_PRICE_SOURCES
     global SCAN_SINCE_DAYS, WIPE_PREVIOUS_RUNS, RECENT_DEDUP_HOURS
+    global DB_CONCURRENCY, RECENT_BATCH_SIZE
 
     MODE = "recent"
     hours = float(args.hours)
@@ -2126,6 +2137,8 @@ def apply_recent_args(args) -> None:
     COMPARE_PRICE_SOURCES = False
     # Дедупликация читает пред. recent-прогоны — не чистим результаты.
     WIPE_PREVIOUS_RUNS = False
+    DB_CONCURRENCY = max(1, int(args.concurrency))
+    RECENT_BATCH_SIZE = max(1, int(args.batch_size))
 
     _recompute_derived()
 
@@ -2187,6 +2200,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-compare", dest="compare", action="store_false",
                    help="Выключить сравнение порогов и методов (раздел только статистики): "
                         "экономит ~5 лишних проходов NumPy на каждую таблицу")
+    p.add_argument("--concurrency", type=int, default=DB_CONCURRENCY,
+                   help="Сколько таблиц читать параллельно. Если БД на этой же "
+                        "машине и одновременно крутится коллектор — уменьшите "
+                        "(8-12): конкуренция за CPU/диск замедляет 24 потока")
     p.add_argument("--top", type=int, default=REPORT_TOP_N,
                    help="Сколько строк печатать в консоль")
     p.add_argument("--save-to-db", dest="save_to_db", action="store_true",
@@ -2209,7 +2226,7 @@ def apply_args(args) -> None:
     global PRE_PUMP_DAYS, PRE_PUMP_BELOW_PEAK_FACTOR, RECENT_PUMPS_DAYS, REPORT_TOP_N
     global SAVE_TO_DB, PRINT_RUN_STATISTICS, INCLUDE_SPOT, INCLUDE_SWAP
     global MIN_OB_VITALITY, SHORT_MIN_HISTORY_DAYS, SCAN_SINCE_DAYS
-    global COMPARE_PUMP_THRESHOLDS_PCT, COMPARE_PRICE_SOURCES
+    global COMPARE_PUMP_THRESHOLDS_PCT, COMPARE_PRICE_SOURCES, DB_CONCURRENCY
 
     MODE = "history"
     PUMP_MIN_PCT = float(args.pct)
@@ -2238,6 +2255,7 @@ def apply_args(args) -> None:
     if not args.compare:
         COMPARE_PUMP_THRESHOLDS_PCT = []
         COMPARE_PRICE_SOURCES = False
+    DB_CONCURRENCY = max(1, int(args.concurrency))
 
     _recompute_derived()
 

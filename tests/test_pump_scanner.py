@@ -34,7 +34,7 @@ _CONFIG_GLOBALS = [
     "MIN_OB_VITALITY", "SHORT_MIN_HISTORY_DAYS", "SCAN_SINCE_DAYS",
     "COMPARE_PUMP_THRESHOLDS_PCT", "COMPARE_PRICE_SOURCES",
     "MODE", "RECENT_DEDUP_HOURS", "RECENT_RETENTION_DAYS", "WIPE_PREVIOUS_RUNS",
-    "MAX_FUTURE_PEAK_DAYS", "RECENT_BATCH_SIZE",
+    "MAX_FUTURE_PEAK_DAYS", "RECENT_BATCH_SIZE", "DB_CONCURRENCY",
 ]
 
 _DERIVED_GLOBALS = [
@@ -502,6 +502,23 @@ def test_apply_recent_args_zero_dedup_disables():
     args = build_recent_parser().parse_args(["--hours", "6", "--dedup-hours", "0"])
     apply_recent_args(args)
     assert ps.RECENT_DEDUP_HOURS == 0.0
+
+
+def test_apply_recent_args_concurrency_and_batch():
+    from pump_scanner import build_recent_parser, apply_recent_args
+    args = build_recent_parser().parse_args(
+        ["--hours", "6", "--concurrency", "8", "--batch-size", "10"])
+    apply_recent_args(args)
+    assert ps.DB_CONCURRENCY == 8
+    assert ps.RECENT_BATCH_SIZE == 10
+
+
+def test_apply_args_history_concurrency():
+    from pump_scanner import build_arg_parser, apply_args
+    args = build_arg_parser().parse_args(["--concurrency", "12"])
+    apply_args(args)
+    assert ps.DB_CONCURRENCY == 12
+    assert ps.MODE == "history"
 
 
 def test_apply_args_sets_mode_history():
