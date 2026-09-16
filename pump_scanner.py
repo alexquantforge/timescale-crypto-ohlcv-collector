@@ -541,6 +541,34 @@ def _score_log(v: float, bad: float, good: float) -> float:
     return _clamp01((math.log10(v) - math.log10(bad)) / (math.log10(good) - math.log10(bad)))
 
 
+def ob_quality_score(ev: Dict[str, Any]) -> float:
+    """Сводный балл качества стакана (0..1) для сортировки бирж ВНУТРИ блока
+    монеты: чем НИЖЕ спред, чем ПЛОТНЕЕ и живее книга и чем ВЫШЕ ликвидность —
+    тем выше строка биржи. Без свежего снимка = -1 (в конец блока).
+
+    Состав: 0.40 · спред (доля ATR, меньше — лучше)
+           + 0.30 · ликвидность (лог-шкала $500..$50k)
+           + 0.30 · живость (грейд /10, сделок/мин, свежесть последней сделки).
+    Те же суб-баллы, что и раскраска строки OB в fmt_event_details_lines().
+    """
+    ob = ev.get("ob")
+    if not ob:
+        return -1.0
+    if bool(ob.get("ob_is_barcode")):  # мёртвый «штрихкод» — всегда в конец
+        return 0.0
+    spr_atr = float(ob.get("ob_spread_atr_pct") or 0)
+    g_spr = 1.0 - _clamp01(spr_atr / max(1e-9, OB_SPREAD_ATR_BAD_PCT))
+    g_liq = _score_log(ob.get("ob_total_depth_usd"),
+                       OB_LIQ_BAD_USD, OB_LIQ_GOOD_USD)
+    vit_s = float(ob.get("ob_vitality_score") or 0)
+    tpm = float(ob.get("ob_trades_per_min") or 0)
+    last_tr = float(ob.get("ob_last_trade_sec") or 0)
+    g_live = (_clamp01(vit_s / 10.0)
+              + _score_lerp(tpm, 0.0, 5.0)
+              + (1.0 - _clamp01(last_tr / 600.0))) / 3.0
+    return 0.40 * g_spr + 0.30 * g_liq + 0.30 * g_live
+
+
 def fmt_event_details_lines(ev: Dict[str, Any]) -> List[str]:
     """Строки деталей биржи события: ссылки спот/перп + снимок стакана (цветной)."""
     eid = ev.get("exchange", "")
@@ -1962,14 +1990,19 @@ async def main() -> None:
             f"{fmt_price(c['pre_max_high']):<12}")
         # Детали по биржам: ссылки спот/перп + книга ордеров (обновляет апдейтер).
         # Печатаем детали только по свежим событиям (старту ≤ REPORT_MAX_START_AGE_DAYS).
+        # Одна монета = один блок; внутри блока биржи сортируются по качеству
+        # стакана (спред/плотность-живость/ликвидность — см. ob_quality_score),
+        # блоки монет разделяет пустая строка.
         if PRINT_EVENT_DETAILS:
-            for ev in c["events"]:
-                if REPORT_MAX_START_AGE_DAYS is not None \
-                        and _ev_start_age(ev) > REPORT_MAX_START_AGE_DAYS:
-                    continue
+            evs = [ev for ev in c["events"]
+                   if REPORT_MAX_START_AGE_DAYS is None
+                   or _ev_start_age(ev) <= REPORT_MAX_START_AGE_DAYS]
+            evs.sort(key=ob_quality_score, reverse=True)
+            for ev in evs:
                 ev_line = fmt_event_details_lines(ev)
                 for ln in ev_line:
                     out(ln)
+        out("")
     if len(fresh_coins) > REPORT_TOP_N:
         out(f"... и ещё {len(fresh_coins) - REPORT_TOP_N} монет (полный список в БД {RESULTS_DB})")
     if REPORT_MAX_START_AGE_DAYS is not None and not fresh_coins:

@@ -315,6 +315,37 @@ def test_fmt_event_details_no_flag_no_ob():
     assert ps._parse_exchange_list("bybit,OKX") == {"bybit", "okx"}
 
 
+def _ob_event(vit, spr_atr, depth, tpm, last_tr, barcode=0):
+    return {"exchange": "x", "ticker": "AAA/USDT", "kind": "swap", "ob": {
+        "ob_vitality_score": vit, "ob_vitality_grade": "A",
+        "ob_is_barcode": barcode, "ob_spread_pct": 0.1,
+        "ob_spread_atr_pct": spr_atr, "ob_total_depth_usd": depth,
+        "ob_imbalance": 1.0, "ob_trades_per_min": tpm,
+        "ob_buy_pressure_pct": 50.0, "ob_cvd_5m": 0.0,
+        "ob_last_trade_sec": last_tr}}
+
+
+def test_ob_quality_score_orders_by_spread_liq_liveliness():
+    """Внутри блока монеты: низкий спред + плотная живая книга + ликвидность
+    дают больший балл, чем широкий спред / мёртвая / тонкая книга."""
+    good = _ob_event(vit=8, spr_atr=1.0, depth=100_000, tpm=20.0, last_tr=2)
+    mid = _ob_event(vit=5, spr_atr=2.5, depth=5_000, tpm=5.0, last_tr=60)
+    bad = _ob_event(vit=2, spr_atr=4.5, depth=300, tpm=0.5, last_tr=500)
+    no_snap = dict(exchange="y", ticker="BBB/USDT", kind="swap", ob=None)
+    barcode = _ob_event(vit=0, spr_atr=0.5, depth=50_000, tpm=10.0,
+                        last_tr=1, barcode=1)
+    good["exchange"], mid["exchange"], bad["exchange"] = "good", "mid", "bad"
+    s_good, s_mid, s_bad = (ps.ob_quality_score(e) for e in (good, mid, bad))
+    assert 0.0 <= s_good <= 1.0
+    assert s_good > s_mid > s_bad >= 0.0
+    assert ps.ob_quality_score(no_snap) == -1.0      # без снимка — в конец
+    assert ps.ob_quality_score(barcode) == 0.0       # «штрихкод» — в конец
+    # Сортировка как в отчёте: лучший стакан первым, без снимка — в конец.
+    evs = sorted([bad, good, mid, no_snap],
+                 key=ps.ob_quality_score, reverse=True)
+    assert [e["exchange"] for e in evs] == ["good", "mid", "bad", "y"]
+
+
 # ---------------------------------------------------------------------------
 # BingX pair URLs (must match src/exchanges/symbol_selector grammar)
 # ---------------------------------------------------------------------------
