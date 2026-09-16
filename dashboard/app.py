@@ -27,6 +27,7 @@ from typing import Optional
 import asyncpg
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -1480,6 +1481,64 @@ def load_candles_cached(db_host, db_port, db_user, db_pass, db_name: str, table_
     except Exception as e:
         st.warning(f"Could not load candles for {table_name}: {e}")
         return pd.DataFrame()
+
+
+# ---------------------------------------------------------------------------
+# Recent Pumps tab (data layer): `pump_scanner.py recent` runs read from the
+# results DB (pump_scanner_results — same server as the OHLCV data). Defined
+# here (before the sidebar Refresh button) so its caches can be cleared.
+# ---------------------------------------------------------------------------
+
+async def _fetch_recent_runs(db_host, db_port, db_user, db_pass, limit: int) -> list:
+    """Latest recent-mode runs (newest first) from pump_scan_runs."""
+    conn = await asyncpg.connect(
+        host=db_host, port=db_port, user=db_user, password=db_pass,
+        database="pump_scanner_results", timeout=15)
+    try:
+        return [dict(r) for r in await conn.fetch(
+            '''SELECT "run_ts", "run_time_msk", "coins_found", "raw_events",
+                      "qualified_events", "duration_sec", "tables_scanned", "config"
+               FROM "pump_scan_runs"
+               WHERE "config"->>'mode' = 'recent'
+               ORDER BY "run_ts" DESC
+               LIMIT $1''', int(limit))]
+    finally:
+        await conn.close()
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_recent_runs_cached(db_host, db_port, db_user, db_pass, limit: int = 14) -> list:
+    return asyncio.run(_fetch_recent_runs(db_host, db_port, db_user, db_pass, limit))
+
+
+async def _fetch_recent_run_rows(db_host, db_port, db_user, db_pass, run_ts: int) -> list:
+    """Coins + per-exchange events of one run (LEFT JOIN: a coin always has
+    >=1 event, but keep the join safe anyway)."""
+    conn = await asyncpg.connect(
+        host=db_host, port=db_port, user=db_user, password=db_pass,
+        database="pump_scanner_results", timeout=15)
+    try:
+        return [dict(r) for r in await conn.fetch(
+            '''SELECT c."base", c."exchanges_n", c."exchanges",
+                      c."min_pump_pct", c."max_pump_pct", c."peak_ts_max",
+                      c."peak_time_max_msk", c."min_price", c."peak_price",
+                      c."pre_max_high", c."short_history",
+                      e."exchange", e."ticker", e."kind", e."src_table",
+                      e."src_db", e."pump_pct", e."start_ts", e."peak_ts",
+                      e."last_close"
+               FROM "pump_scan_coins" c
+               LEFT JOIN "pump_scan_events" e
+                 ON e."run_ts" = $1 AND e."base" = c."base"
+               WHERE c."run_ts" = $1
+               ORDER BY c."min_pump_pct" DESC, c."base", e."exchange"''',
+            int(run_ts))]
+    finally:
+        await conn.close()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_recent_run_rows_cached(db_host, db_port, db_user, db_pass, run_ts: int) -> list:
+    return asyncio.run(_fetch_recent_run_rows(db_host, db_port, db_user, db_pass, run_ts))
 
 
 async def _fetch_metric_points(db_name, table_name, column, db_host, db_port, db_user, db_pass) -> list:
@@ -4204,6 +4263,8 @@ hide_spot_dupes = st.sidebar.checkbox(
 if st.sidebar.button("🔄 Refresh data (clear caches)"):
     load_summary_cached.clear()
     load_candles_cached.clear()
+    load_recent_runs_cached.clear()
+    load_recent_run_rows_cached.clear()
     fetch_live_cached.clear()
     _render_chart_html_cached.clear()
     # module-level stores are not Streamlit caches, so the button has to
@@ -4330,8 +4391,9 @@ if df_15m.empty and df_1d.empty:
 # Tabs: charts first
 # ---------------------------------------------------------------------------
 
-tab_charts, tab_liquidity, tab_info = st.tabs(
-    ["📈 Charts (15m + 1D)", "📊 Liquidity Monitor", "ℹ️ Methodology & Algorithms"]
+tab_charts, tab_recent, tab_liquidity, tab_info = st.tabs(
+    ["📈 Charts (15m + 1D)", "🚀 Recent Pumps", "📊 Liquidity Monitor",
+     "ℹ️ Methodology & Algorithms"]
 )
 
 
@@ -5271,6 +5333,147 @@ with tab_charts:
                 st.rerun(scope="app")
 
         _growth_progress_fragment()
+
+# ---------------------------------------------------------------------------
+# Recent Pumps tab (presentation): pick a run -> pick a coin -> 15m chart of
+# the coin's source table with the pump start/peak marked. Data functions
+# live near load_candles_cached() above.
+# ---------------------------------------------------------------------------
+
+def _group_pump_rows(rows: list) -> list:
+    """Flattened run rows -> one dict per coin (its per-exchange events nested)."""
+    coins = {}
+    order = []
+    for r in rows:
+        c = coins.get(r["base"])
+        if c is None:
+            c = {k: r[k] for k in ("base", "exchanges_n", "exchanges", "min_pump_pct",
+                                   "max_pump_pct", "peak_ts_max", "peak_time_max_msk",
+                                   "min_price", "peak_price", "pre_max_high",
+                                   "short_history")}
+            c["events"] = []
+            coins[r["base"]] = c
+            order.append(c)
+        if r.get("exchange"):
+            c["events"].append({k: r[k] for k in ("exchange", "ticker", "kind",
+                                                   "src_table", "src_db", "pump_pct",
+                                                   "start_ts", "peak_ts", "last_close")})
+    return order
+
+
+def render_pump_chart(df: pd.DataFrame, ticker: str, exchange: str,
+                      start_ts, peak_ts, min_price, peak_price):
+    """15m candlesticks + volume with the pump START (orange) and PEAK (green)
+    marked as vertical lines."""
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.75, 0.25], vertical_spacing=0.03)
+    fig.add_trace(go.Candlestick(
+        x=df["time"], open=df["open"], high=df["high"],
+        low=df["low"], close=df["close"], name="Candlesticks"), row=1, col=1)
+    fig.add_trace(go.Bar(x=df["time"], y=df["volume"], name="Volume",
+                         marker_color="#3a5a40", opacity=0.7), row=2, col=1)
+    if start_ts:
+        fig.add_vline(x=pd.Timestamp(int(start_ts), unit="s"),
+                      line_color="#ff9800", line_width=1.5, line_dash="dash",
+                      annotation_text=f"start {min_price:g}",
+                      annotation_font_color="#ff9800")
+    if peak_ts:
+        fig.add_vline(x=pd.Timestamp(int(peak_ts), unit="s"),
+                      line_color="#00e676", line_width=1.5, line_dash="dash",
+                      annotation_text=f"peak {peak_price:g}",
+                      annotation_font_color="#00e676")
+    fig.update_layout(
+        template="plotly_dark", height=560,
+        title=f"{ticker} ({exchange}) — pump review",
+        xaxis_rangeslider_visible=False,
+        margin=dict(l=10, r=10, t=45, b=10),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+
+with tab_recent:
+    st.subheader("🚀 Recent Pumps")
+    st.caption(
+        "Pairs found by `pump_scanner.py recent` runs (results DB: "
+        "`pump_scanner_results`, same server as the OHLCV data). Pick a run, "
+        f"pick a coin — the 15m chart shows the pump with start/peak markers "
+        f"(candles: last {limit_15m} bars of the coin's source table)."
+    )
+    if demo_mode:
+        st.info("Demo mode: Recent Pumps needs the real results DB. Turn off "
+                "Demo mode and point the sidebar at your TimescaleDB server.")
+    else:
+        try:
+            recent_runs = load_recent_runs_cached(db_host, db_port, db_user, db_pass)
+        except Exception as e:
+            st.warning(
+                f"Could not read results DB `pump_scanner_results`: {e}. "
+                "The sidebar must point at the server where `pump_scanner.py` "
+                "runs (and a recent run must have finished and saved results)."
+            )
+            recent_runs = []
+        if not recent_runs:
+            st.info(
+                "No recent-mode runs in `pump_scanner_results` yet. Run first: "
+                "`python pump_scanner.py recent --hours 6 --pct 10 --pre-pump-days 1`"
+            )
+        else:
+            def _run_label(i: int) -> str:
+                r = recent_runs[i]
+                return (f"{r['run_time_msk']} — {r['coins_found']} coins "
+                        f"(raw {r['raw_events']}, {r['duration_sec']:.0f}s)")
+            run_idx = st.selectbox("Recent run", range(len(recent_runs)),
+                                   format_func=_run_label)
+            run = recent_runs[run_idx]
+            cfg = run.get("config") or {}
+            window_h = (cfg.get("PUMP_WINDOW_DAYS") or 0) * 24
+            st.caption(
+                f"Run {run['run_time_msk']} · pump ≥ {cfg.get('PUMP_MIN_PCT')}% in "
+                f"≤ {window_h:.1f} h · pre-pump {cfg.get('PRE_PUMP_DAYS')} d · "
+                f"scanned {run['tables_scanned']:,} tables"
+            )
+            rows = load_recent_run_rows_cached(db_host, db_port, db_user, db_pass,
+                                               int(run["run_ts"]))
+            p_coins = _group_pump_rows(rows)
+            if not p_coins:
+                st.info("This run found no coins (empty report).")
+            else:
+                st.dataframe(
+                    pd.DataFrame([{
+                        "base": c["base"],
+                        "NEW": "NEW" if c["short_history"] else "",
+                        "exch": c["exchanges_n"],
+                        "exchanges": ",".join(c["exchanges"] or []),
+                        "pump%": f"{c['min_pump_pct']:.0f}..{c['max_pump_pct']:.0f}",
+                        "peak (MSK)": c["peak_time_max_msk"],
+                        "min": c["min_price"],
+                        "peak": c["peak_price"],
+                        "pre_max": c["pre_max_high"],
+                    } for c in p_coins]),
+                    width="stretch",
+                )
+                coin = st.selectbox("Coin", [c["base"] for c in p_coins])
+                c = next(x for x in p_coins if x["base"] == coin)
+                evs = c["events"]
+                if not evs:
+                    st.info("No per-exchange events stored for this coin.")
+                else:
+                    def _ev_label(j: int) -> str:
+                        e = evs[j]
+                        return (f"{e['exchange']} — {e['kind']} — "
+                                f"{e['pump_pct']:.0f}% — {e['src_table']}")
+                    ev = evs[st.selectbox("Exchange / table", range(len(evs)),
+                                           format_func=_ev_label)]
+                    cdf = load_candles_cached(db_host, db_port, db_user, db_pass,
+                                              ev["src_db"], ev["src_table"],
+                                              limit_15m)
+                    if cdf.empty:
+                        st.warning(
+                            f"No candles loaded for {ev['src_db']}.{ev['src_table']}.")
+                    else:
+                        render_pump_chart(cdf, ev["ticker"], ev["exchange"],
+                                          ev["start_ts"], ev["peak_ts"],
+                                          c["min_price"], c["peak_price"])
 
 with tab_liquidity:
     col1, col2, col3, col4, col5 = st.columns(5)
