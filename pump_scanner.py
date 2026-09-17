@@ -1441,13 +1441,16 @@ async def save_results_to_db(pool: asyncpg.Pool, run_ts: int, duration_sec: floa
 
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # config/stats передаём СЛОВАРЯМИ: asyncpg сам кодирует dict
+            # в JSONB-объект. Прежний json.dumps()+$n::jsonb двойно
+            # кодировал и хранил JSONB-СТРОКУ (читалась как str).
             await conn.execute(
                 '''INSERT INTO "pump_scan_runs"
                    ("run_ts", "run_time_msk", "duration_sec", "config", "stats",
                     "tables_scanned", "raw_events", "qualified_events", "coins_found")
-                   VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6,$7,$8,$9)''',
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)''',
                 run_ts, run_time_msk, round(duration_sec, 2),
-                json.dumps(config_snapshot()), json.dumps(run_stats),
+                config_snapshot(), run_stats,
                 stats["scanned"], stats["raw_events"], qualified, len(coins),
             )
             if coin_rows:

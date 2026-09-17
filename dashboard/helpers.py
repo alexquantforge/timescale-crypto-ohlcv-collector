@@ -16,6 +16,30 @@ import numpy as np
 import pandas as pd
 
 
+def parse_jsonb_config(value) -> dict:
+    """pump_scan_runs.config / .stats — dict или str, в зависимости от того,
+    КАКОЙ версией сканера прогон был сохранён:
+
+      * dict — новая запись (asyncpg кодирует словарь в JSONB-объект);
+      * str  — старые записи: json.dumps()+``$n::jsonb`` хранили JSON-строку,
+               которая читается обратно как Python str.
+
+    Возвращает {} для None/мусора/не-словаря, чтобы UI не падал ни на каких
+    исторических строках.
+    """
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (ValueError, TypeError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # Pair navigation (Prev / Next buttons)
 # ---------------------------------------------------------------------------

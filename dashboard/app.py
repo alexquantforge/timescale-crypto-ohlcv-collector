@@ -42,6 +42,7 @@ from src.exchanges.client import (apply_market_type_trim,
                           close_exchange_safely, create_exchange)
 from src.core.priority_pairs import lane_pulse, publish_priority_pairs
 from dashboard.helpers import (
+    parse_jsonb_config,
     shift_option,
     exchanges_for_ticker,
     find_table_row,
@@ -5425,7 +5426,7 @@ with tab_recent:
             run_idx = st.selectbox("Recent run", range(len(recent_runs)),
                                    format_func=_run_label)
             run = recent_runs[run_idx]
-            cfg = run.get("config") or {}
+            cfg = parse_jsonb_config(run.get("config"))
             window_h = (cfg.get("PUMP_WINDOW_DAYS") or 0) * 24
             st.caption(
                 f"Run {run['run_time_msk']} · pump ≥ {cfg.get('PUMP_MIN_PCT')}% in "
