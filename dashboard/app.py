@@ -5373,16 +5373,26 @@ def render_pump_chart(df: pd.DataFrame, ticker: str, exchange: str,
         low=df["low"], close=df["close"], name="Candlesticks"), row=1, col=1)
     fig.add_trace(go.Bar(x=df["time"], y=df["volume"], name="Volume",
                          marker_color="#3a5a40", opacity=0.7), row=2, col=1)
+    # Маркеры через add_shape+add_annotation, а НЕ add_vline(annotation_text):
+    # в plotly 5.x последний считает «среднее» по x-координатам фигуры, а с
+    # pd.Timestamp под pandas 2.x это TypeError (int + Timestamp запрещён).
+    def _marker(ts, color: str, text: str, *, xanchor: str, y_top: bool):
+        x = pd.Timestamp(int(ts), unit="s")
+        fig.add_shape(type="line", x0=x, x1=x, y0=0, y1=1, yref="y domain",
+                      line=dict(color=color, width=1.5, dash="dash"))
+        fig.add_annotation(x=x, y=1.0 if y_top else 0.9, yref="y domain",
+                           yanchor="top", xanchor=xanchor,
+                           text=text, showarrow=False,
+                           font=dict(color=color, size=11))
     if start_ts:
-        fig.add_vline(x=pd.Timestamp(int(start_ts), unit="s"),
-                      line_color="#ff9800", line_width=1.5, line_dash="dash",
-                      annotation_text=f"start {min_price:g}",
-                      annotation_font_color="#ff9800")
+        _marker(start_ts, "#ff9800", f"start {min_price:g}",
+                xanchor="right", y_top=True)
     if peak_ts:
-        fig.add_vline(x=pd.Timestamp(int(peak_ts), unit="s"),
-                      line_color="#00e676", line_width=1.5, line_dash="dash",
-                      annotation_text=f"peak {peak_price:g}",
-                      annotation_font_color="#00e676")
+        # Старт и пик близко (<=2 бара) — опускаем метку пика, чтобы подписи
+        # не наехали друг на друга.
+        close = bool(start_ts and abs(int(peak_ts) - int(start_ts)) <= 2 * 900)
+        _marker(peak_ts, "#00e676", f"peak {peak_price:g}",
+                xanchor="left", y_top=not close)
     fig.update_layout(
         template="plotly_dark", height=560,
         title=f"{ticker} ({exchange}) — pump review",
