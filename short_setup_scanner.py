@@ -29,12 +29,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config.settings import settings  # noqa: E402
 
 _IDENT = re.compile(r"^[a-zA-Z0-9_]+$")
+RESULTS_DB = "pump_scanner_results"
 
 
 def _db_names(timeframe: str) -> list[str]:
     if timeframe == "1d":
         return [settings.db_high_1d, settings.db_low_1d]
     return [settings.db_high_15m, settings.db_low_15m]
+
+
+def _ticker_from_table(table: str) -> str:
+    raw = str(table).lower().rsplit("_on_", 1)[0]
+    return raw.replace("_", "/").upper()
 
 
 def _parse_table(table: str) -> tuple[str, str, str]:
@@ -233,7 +239,11 @@ def _args() -> argparse.Namespace:
     p.add_argument("--no-swap", action="store_true", help="Не сканировать perpetual swaps")
     p.add_argument("--concurrency", type=int, default=4)
     p.add_argument("--limit-tables", type=int, default=0, help="Для теста ограничить число таблиц; 0 = все")
-    p.add_argument("--out", default="short_setups.csv", help="CSV-файл результатов")
+    p.add_argument("--out", default="short_setups.csv", help="Дополнительный CSV-экспорт результатов")
+    p.add_argument("--no-save-to-db", action="store_true",
+                   help="Не сохранять запуск и сетапы в pump_scanner_results")
+    p.add_argument("--import-csv", default="",
+                   help="Импортировать уже готовый CSV в базу без повторного сканирования")
     return p.parse_args()
 
 
@@ -340,9 +350,187 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
             await pool.close()
 
 
+
+async def _init_results_db() -> asyncpg.Pool:
+    """Create/reuse the shared scanner-results database and setup tables."""
+    admin = await asyncpg.connect(
+        user=settings.db_user, password=settings.db_password,
+        host=settings.db_host, port=settings.db_port, database="postgres",
+    )
+    try:
+        exists = await admin.fetchval(
+            "SELECT 1 FROM pg_database WHERE datname = $1", RESULTS_DB
+        )
+        if not exists:
+            await admin.execute(f'CREATE DATABASE "{RESULTS_DB}"')
+    finally:
+        await admin.close()
+
+    pool = await asyncpg.create_pool(
+        user=settings.db_user, password=settings.db_password,
+        host=settings.db_host, port=settings.db_port,
+        database=RESULTS_DB, min_size=1, max_size=4,
+    )
+    async with pool.acquire() as conn:
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS "short_setup_runs" (
+                "run_id" BIGSERIAL PRIMARY KEY,
+                "started_at" TIMESTAMPTZ NOT NULL DEFAULT now(),
+                "timeframe" TEXT NOT NULL,
+                "setups_count" INTEGER NOT NULL,
+                "config" JSONB NOT NULL
+            )
+        ''')
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS "short_setup_events" (
+                "run_id" BIGINT NOT NULL REFERENCES "short_setup_runs"("run_id") ON DELETE CASCADE,
+                "event_no" INTEGER NOT NULL,
+                "status" TEXT NOT NULL,
+                "invalidated" BOOLEAN NOT NULL,
+                "base" TEXT NOT NULL,
+                "exchange" TEXT NOT NULL,
+                "market" TEXT NOT NULL,
+                "ticker" TEXT NOT NULL,
+                "source_db" TEXT NOT NULL,
+                "source_table" TEXT NOT NULL,
+                "timeframe" TEXT NOT NULL,
+                "start_ts" BIGINT NOT NULL,
+                "a_ts" BIGINT NOT NULL,
+                "c_ts" BIGINT NOT NULL,
+                "b_ts" BIGINT NOT NULL,
+                "entry_ts" BIGINT NOT NULL,
+                "pump_start" DOUBLE PRECISION NOT NULL,
+                "a_price" DOUBLE PRECISION NOT NULL,
+                "c_price" DOUBLE PRECISION NOT NULL,
+                "b_price" DOUBLE PRECISION NOT NULL,
+                "entry" DOUBLE PRECISION NOT NULL,
+                "stop" DOUBLE PRECISION NOT NULL,
+                "target" DOUBLE PRECISION NOT NULL,
+                "pump_pct" DOUBLE PRECISION NOT NULL,
+                "ac_drop_pct" DOUBLE PRECISION NOT NULL,
+                "pump_retrace_pct" DOUBLE PRECISION NOT NULL,
+                "cb_bounce_pct" DOUBLE PRECISION NOT NULL,
+                "rr" DOUBLE PRECISION NOT NULL,
+                PRIMARY KEY ("run_id", "event_no")
+            )
+        ''')
+        await conn.execute('''
+            CREATE INDEX IF NOT EXISTS "short_setup_events_run_entry_idx"
+            ON "short_setup_events" ("run_id", "entry_ts" DESC)
+        ''')
+        await conn.execute('''
+            CREATE INDEX IF NOT EXISTS "short_setup_events_run_filter_idx"
+            ON "short_setup_events" ("run_id", "status", "exchange", "rr")
+        ''')
+    return pool
+
+
+async def _save_setups_to_db(events: list[dict[str, Any]], args: argparse.Namespace,
+                             source: str = "scan") -> int:
+    """Atomically save run metadata and all setup rows in pump_scanner_results."""
+    pool = await _init_results_db()
+    config = {
+        "source": source, "timeframe": args.timeframe,
+        "pump_pct": args.pump_pct, "pump_days": args.days,
+        "max_retrace_pct": args.max_retrace, "min_ac_drop_pct": args.min_ac_drop,
+        "min_cb_bounce_pct": args.min_cb_bounce,
+        "lower_high_pct": args.lower_high_pct,
+        "confirm_drop_pct": args.confirm_drop,
+        "stop_buffer_pct": args.stop_buffer, "min_rr": args.rr,
+        "pivot_width": args.pivot_bars, "setup_days": args.setup_days,
+        "active_hours": args.active_hours,
+    }
+    event_columns = [
+        "run_id", "event_no", "status", "invalidated", "base", "exchange", "market",
+        "ticker", "source_db", "source_table", "timeframe", "start_ts", "a_ts", "c_ts",
+        "b_ts", "entry_ts", "pump_start", "a_price", "c_price", "b_price", "entry",
+        "stop", "target", "pump_pct", "ac_drop_pct", "pump_retrace_pct", "cb_bounce_pct", "rr",
+    ]
+    records = []
+    for event_no, event in enumerate(events):
+        records.append((
+            None, event_no, str(event.get("status") or "HISTORY"),
+            bool(event.get("invalidated")), str(event["base"]), str(event["exchange"]),
+            str(event["market"]), _ticker_from_table(event["table"]),
+            str(event["database"]), str(event["table"]), str(args.timeframe),
+            int(event["start_ts"]), int(event["a_ts"]), int(event["c_ts"]),
+            int(event["b_ts"]), int(event["entry_ts"]), float(event["pump_start"]),
+            float(event["a_price"]), float(event["c_price"]), float(event["b_price"]),
+            float(event["entry"]), float(event["stop"]), float(event["target"]),
+            float(event["pump_pct"]), float(event["ac_drop_pct"]),
+            float(event["pump_retrace_pct"]), float(event["cb_bounce_pct"]), float(event["rr"]),
+        ))
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                run_id = await conn.fetchval(
+                    '''INSERT INTO "short_setup_runs" ("timeframe", "setups_count", "config")
+                       VALUES ($1, $2, $3::jsonb) RETURNING "run_id"''',
+                    args.timeframe, len(events), json.dumps(config),
+                )
+                if records:
+                    records = [(run_id, *record[1:]) for record in records]
+                    await conn.copy_records_to_table(
+                        "short_setup_events", records=records, columns=event_columns
+                    )
+        return int(run_id)
+    finally:
+        await pool.close()
+
+
+def _read_setups_csv(path: str) -> list[dict[str, Any]]:
+    """One-time migration of an existing scanner CSV into the results database."""
+    integer_fields = ("start_ts", "a_ts", "c_ts", "b_ts", "entry_ts")
+    float_fields = (
+        "pump_start", "a_price", "c_price", "b_price", "entry", "stop", "target",
+        "pump_pct", "ac_drop_pct", "pump_retrace_pct", "cb_bounce_pct", "rr",
+    )
+    events = []
+    with open(path, newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            for field in integer_fields:
+                row[field] = int(float(row[field]))
+            for field in float_fields:
+                row[field] = float(row[field])
+            row["invalidated"] = str(row.get("invalidated", "")).strip().lower() in {
+                "1", "true", "yes", "y"
+            }
+            row["status"] = str(row.get("status") or "HISTORY").upper()
+            row["database"] = row.get("database") or row.get("source_db") or ""
+            row["table"] = row.get("table") or row.get("source_table") or ""
+            row["base"] = str(row["base"]).upper()
+            row["exchange"] = str(row["exchange"]).lower()
+            row["market"] = str(row.get("market") or "spot")
+            if not row["database"] or not row["table"]:
+                raise ValueError("CSV row has no database/table source")
+            events.append(row)
+    return events
+
+
+
 def main() -> int:
     args = _args()
-    events = asyncio.run(_scan(args))
+    imported = bool(args.import_csv)
+    if imported:
+        if args.no_save_to_db:
+            raise SystemExit("--import-csv требует сохранения в БД; уберите --no-save-to-db")
+        events = _read_setups_csv(args.import_csv)
+        if events and events[0].get("timeframe") in ("15m", "1d"):
+            args.timeframe = events[0]["timeframe"]
+        print(f"Импортирую {len(events)} сетапов из {args.import_csv} в {RESULTS_DB}…")
+    else:
+        events = asyncio.run(_scan(args))
+
+    if not args.no_save_to_db:
+        run_id = asyncio.run(_save_setups_to_db(events, args, source="csv_import" if imported else "scan"))
+        print(f"Сохранено в БД {RESULTS_DB}: прогон #{run_id}, сетапов {len(events)}")
+    elif not imported:
+        print("Сохранение в БД отключено (--no-save-to-db).")
+
+    if imported:
+        print(f"Импорт завершён: {len(events)} сетапов → {RESULTS_DB}, прогон #{run_id}")
+        return 0
+
     fields = ["status", "invalidated", "base", "exchange", "market", "timeframe", "start_ts", "start_time",
               "a_ts", "a_time", "c_ts", "c_time", "b_ts", "b_time", "entry_ts", "entry_time",
               "pump_start", "a_price", "c_price", "b_price", "entry", "stop", "target",

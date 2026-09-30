@@ -225,12 +225,15 @@ timescale-crypto-ohlcv-collector/
    A-to-C correction no deeper than 30% of the preceding rise, then a lower
    high B followed by a confirmed 1% decline. The proposed stop is 0.5% above
    B, the target is C, and only setups with reward/risk of at least 2:1 are
-   reported. Results are printed and saved to `short_setups.csv`; `CURRENT`
-   means the signal appeared within the last 6 hours and neither stop nor target
+   reported. Results are printed, saved to `pump_scanner_results` in TimescaleDB,
+   and exported to `short_setups.csv`; `CURRENT` means the signal appeared within
+   the last 6 hours and neither stop nor target
    has since been touched; `RESOLVED` means one was hit, and older untriggered
    setups are marked `HISTORY`. Tune thresholds with `--help`, e.g. `--timeframe 1d` or
    `--exchanges bybit,okx`. This is a screening tool; it does not place trades.
-   The dashboard's **🎯 Short Setups** tab reads this CSV, filters the results,
+   To migrate an existing CSV without rescanning, run
+   `poetry run python short_setup_scanner.py --import-csv short_setups.csv`.
+   The dashboard's **🎯 Short Setups** tab reads the stored DB run, filters the results,
    and opens event-centred 15m and 1D charts with A/C/B, entry, stop and target
    markers. Choose a setup and explicitly load its charts; the current quote
    stays live, while a CURRENT setup also updates both chart tails.

@@ -1525,10 +1525,52 @@ def load_setup_candles_window_cached(db_host, db_port, db_user, db_pass,
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=10, show_spinner=False)
-def _read_short_setups_csv(path: str, modified_ns: int) -> pd.DataFrame:
-    """Reload scanner output when its file modification time changes."""
-    return pd.read_csv(path)
+async def _fetch_short_setup_runs(db_host, db_port, db_user, db_pass, limit: int = 30) -> list:
+    conn = await asyncpg.connect(
+        host=db_host, port=db_port, user=db_user, password=db_pass,
+        database="pump_scanner_results", timeout=10,
+    )
+    try:
+        return [dict(row) for row in await conn.fetch(
+            '''SELECT "run_id", "started_at", "timeframe", "setups_count", "config"
+               FROM "short_setup_runs" ORDER BY "run_id" DESC LIMIT $1''', int(limit)
+        )]
+    finally:
+        await conn.close()
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def load_short_setup_runs_cached(db_host, db_port, db_user, db_pass, limit: int = 30) -> list:
+    return asyncio.run(_fetch_short_setup_runs(db_host, db_port, db_user, db_pass, limit))
+
+
+async def _fetch_short_setup_events(db_host, db_port, db_user, db_pass, run_id: int) -> list:
+    conn = await asyncpg.connect(
+        host=db_host, port=db_port, user=db_user, password=db_pass,
+        database="pump_scanner_results", timeout=15,
+    )
+    try:
+        return [dict(row) for row in await conn.fetch(
+            '''SELECT "status", "invalidated", "base", "exchange", "market", "ticker",
+                      "source_db" AS "database", "source_table" AS "table", "timeframe",
+                      "start_ts", "a_ts", "c_ts", "b_ts", "entry_ts", "pump_start",
+                      "a_price", "c_price", "b_price", "entry", "stop", "target",
+                      "pump_pct", "ac_drop_pct", "pump_retrace_pct", "cb_bounce_pct", "rr"
+               FROM "short_setup_events" WHERE "run_id" = $1
+               ORDER BY "entry_ts" DESC, "base", "exchange"''', int(run_id)
+        )]
+    finally:
+        await conn.close()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_short_setup_events_cached(db_host, db_port, db_user, db_pass, run_id: int) -> pd.DataFrame:
+    rows = asyncio.run(_fetch_short_setup_events(db_host, db_port, db_user, db_pass, run_id))
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows)
+    frame["entry_time"] = pd.to_datetime(frame["entry_ts"], unit="s", utc=True).dt.tz_convert("Europe/Riga").dt.strftime("%Y-%m-%d %H:%M")
+    return frame
 
 
 def _setup_ticker_from_table(table_name: str) -> str:
@@ -5613,37 +5655,56 @@ with tab_recent:
 with tab_setups:
     st.subheader("🎯 Short Setups — паттерны A → C → B")
     st.caption(
-        "Сетапы читаются из `short_setups.csv`, созданного `short_setup_scanner.py`. "
+        "Сетапы и прогоны читаются из `pump_scanner_results` в TimescaleDB. "
         "Графики показывают историческое окно вокруг выбранного сетапа; текущая "
-        "цена запрашивается отдельно в LIVE-режиме. Для сигнала CURRENT 15m-график "
-        "также обновляет последнюю свечу в реальном времени."
+        "цена запрашивается отдельно в LIVE-режиме. Для сигнала CURRENT 15m- и "
+        "1D-графики также обновляют последнюю свечу в реальном времени."
     )
-    setups_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "short_setups.csv"))
-    if st.button("🔄 Перечитать short_setups.csv", key="reload_short_setups"):
-        _read_short_setups_csv.clear()
+    if st.button("🔄 Обновить список прогонов из БД", key="reload_short_setups"):
+        load_short_setup_runs_cached.clear()
+        load_short_setup_events_cached.clear()
         st.rerun()
     try:
-        setups_mtime = os.stat(setups_path).st_mtime_ns
-        setups_df = _read_short_setups_csv(setups_path, setups_mtime).copy()
-    except FileNotFoundError:
-        setups_df = pd.DataFrame()
-        st.info(
-            f"Файл `{setups_path}` не найден. Сначала запустите сканер из корня проекта "
-            "(или сохраните результат в этот файл): `poetry run python short_setup_scanner.py --days 1`."
-        )
+        setup_runs = load_short_setup_runs_cached(db_host, db_port, db_user, db_pass)
     except Exception as exc:
-        setups_df = pd.DataFrame()
-        st.error(f"Не удалось прочитать {setups_path}: {exc}")
+        setup_runs = []
+        st.warning(
+            f"Не удалось прочитать сетапы из `pump_scanner_results`: {exc}. "
+            "Сначала запустите сканер или импортируйте уже готовый CSV в БД."
+        )
 
-    if setups_df.empty and os.path.exists(setups_path):
-        st.info("В short_setups.csv пока нет ни одного подходящего сетапа.")
-
-    if not setups_df.empty:
-        required = {"status", "base", "exchange", "table", "database", "entry_ts", "rr"}
-        missing = required - set(setups_df.columns)
-        if missing:
-            st.error("CSV не похож на вывод short_setup_scanner.py; отсутствуют поля: "
-                     + ", ".join(sorted(missing)))
+    if not setup_runs:
+        st.info(
+            "В БД пока нет сохранённых запусков short setup scanner. "
+            "Чтобы записать новые результаты: `poetry run python short_setup_scanner.py --days 1`. "
+            "Чтобы сохранить существующие 2984 результата без повторного сканирования: "
+            "`poetry run python short_setup_scanner.py --import-csv short_setups.csv`."
+        )
+    else:
+        run_idx = st.selectbox(
+            "Прогон сканера",
+            options=list(range(len(setup_runs))),
+            format_func=lambda i: (
+                f"#{setup_runs[i]['run_id']} · "
+                f"{setup_runs[i]['started_at'].astimezone().strftime('%Y-%m-%d %H:%M:%S')} · "
+                f"{setup_runs[i]['timeframe']} · {setup_runs[i]['setups_count']:,} сетапов"
+            ),
+            key="short_setup_run_select",
+        )
+        setup_run = setup_runs[int(run_idx)]
+        try:
+            setups_df = load_short_setup_events_cached(
+                db_host, db_port, db_user, db_pass, int(setup_run["run_id"])
+            ).copy()
+        except Exception as exc:
+            setups_df = pd.DataFrame()
+            st.error(f"Не удалось загрузить события прогона #{setup_run['run_id']}: {exc}")
+        st.caption(
+            f"Прогон #{setup_run['run_id']} · {setup_run['started_at'].astimezone().strftime('%Y-%m-%d %H:%M:%S')} "
+            f"· timeframe {setup_run['timeframe']} · в базе {setup_run['setups_count']:,} сетапов"
+        )
+        if setups_df.empty:
+            st.info("В выбранном прогоне нет сетапов.")
         else:
             setups_df["status"] = setups_df["status"].fillna("HISTORY").astype(str).str.upper()
             setups_df["base"] = setups_df["base"].fillna("").astype(str).str.upper()
@@ -5652,8 +5713,6 @@ with tab_setups:
             setups_df["rr"] = pd.to_numeric(setups_df["rr"], errors="coerce")
             setups_df = setups_df.dropna(subset=["entry_ts", "rr"])
             setups_df = setups_df.sort_values("entry_ts", ascending=False).reset_index(drop=True)
-            st.caption(f"Файл: `{setups_path}` · найдено сетапов: **{len(setups_df):,}**")
-
             status_options = [x for x in ("CURRENT", "HISTORY", "RESOLVED")
                               if x in set(setups_df["status"])]
             ex_options = sorted(setups_df["exchange"].dropna().unique().tolist())
@@ -5700,7 +5759,7 @@ with tab_setups:
                     key="short_setup_selection",
                 )
                 ev = filtered.iloc[int(selected_i)].to_dict()
-                ticker = _setup_ticker_from_table(ev.get("table"))
+                ticker = str(ev.get("ticker") or _setup_ticker_from_table(ev.get("table")))
                 exchange = str(ev.get("exchange") or "").lower()
                 source_db = str(ev.get("database") or "")
                 source_table = str(ev.get("table") or "")
@@ -5724,7 +5783,6 @@ with tab_setups:
                     if not same_base.empty:
                         daily_row = same_base.iloc[0].to_dict()
                 live_db = _live_db_for(daily_row, setup_row)
-                ccxt_id = settings.exchange_map_1d.get(exchange, exchange)
                 if daily_row and str(daily_row.get("ticker") or "") != ticker:
                     st.caption(
                         f"На дневке показан доступный контракт той же монеты: "
