@@ -5753,7 +5753,7 @@ with tab_setups:
                     format_func=lambda i: (
                         f"{filtered.iloc[i]['status']} · {filtered.iloc[i]['base']} · "
                         f"{filtered.iloc[i]['exchange']} · "
-                        f"{filtered.iloc[i].get('entry_time', _fmt_time(int(filtered.iloc[i]['entry_ts'])))} · "
+                        f"{filtered.iloc[i]['entry_time']} · "
                         f"RR {filtered.iloc[i]['rr']:.2f}:1"
                     ),
                     key="short_setup_selection",
