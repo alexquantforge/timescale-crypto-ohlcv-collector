@@ -217,6 +217,20 @@ timescale-crypto-ohlcv-collector/
    poetry run python main.py summary
    ```
 
+6. Scan for lower-high short setups (historical and recent):
+   ```bash
+   poetry run python short_setup_scanner.py
+   ```
+   Defaults: 15-minute candles, a rise of at least 50% in at most 3 days, an
+   A-to-C correction no deeper than 30% of the preceding rise, then a lower
+   high B followed by a confirmed 1% decline. The proposed stop is 0.5% above
+   B, the target is C, and only setups with reward/risk of at least 2:1 are
+   reported. Results are printed and saved to `short_setups.csv`; `CURRENT`
+   means the signal appeared within the last 6 hours and neither stop nor target
+   has since been touched; `RESOLVED` means one was hit, and older untriggered
+   setups are marked `HISTORY`. Tune thresholds with `--help`, e.g. `--timeframe 1d` or
+   `--exchanges bybit,okx`. This is a screening tool; it does not place trades.
+
 ---
 
 ## 🧪 Running Tests

@@ -19,8 +19,9 @@ venv*/
 .cache/
 .pytest_cache/
 
-# swap_watch diagnostic output
+# Local scanner outputs
 swap_watch.csv
+short_setups.csv
 
 # IDE
 .idea/
