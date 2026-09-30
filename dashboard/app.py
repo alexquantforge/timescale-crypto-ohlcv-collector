@@ -4487,9 +4487,14 @@ if df_15m.empty and df_1d.empty:
 # Tabs: charts first
 # ---------------------------------------------------------------------------
 
+# A keyed, rerunning tab widget persists the selected page across app-scope
+# reruns (e.g. the periodic background refreshes), instead of falling back to
+# Charts whenever Streamlit reruns the script.
 tab_charts, tab_recent, tab_setups, tab_liquidity, tab_info = st.tabs(
     ["📈 Charts (15m + 1D)", "🚀 Recent Pumps", "🎯 Short Setups",
-     "📊 Liquidity Monitor", "ℹ️ Methodology & Algorithms"]
+     "📊 Liquidity Monitor", "ℹ️ Methodology & Algorithms"],
+    key="main_dashboard_tabs",
+    on_change="rerun",
 )
 
 
@@ -5657,7 +5662,8 @@ with tab_setups:
     st.subheader("🎯 Short Setups — паттерны A → C → B")
     st.caption(
         "Сетапы и прогоны читаются из `pump_scanner_results` в TimescaleDB. "
-        "Графики показывают историческое окно вокруг выбранного сетапа; текущая "
+        "Графики загружаются автоматически при выборе сетапа и показывают "
+        "историческое окно вокруг него; текущая "
         "цена запрашивается отдельно в LIVE-режиме. Для сигнала CURRENT 15m- и "
         "1D-графики также обновляют последнюю свечу в реальном времени."
     )
@@ -5797,84 +5803,78 @@ with tab_setups:
                 m4.metric("Потенциал / риск", f"{float(ev['rr']):.2f}:1")
                 st.markdown(build_pair_links_html(ticker, exchange,
                     find_perp_ticker([df_15m, df_1d], ev["base"], exchange)), unsafe_allow_html=True)
-                setup_chart_key = f"{source_db}.{source_table}:{int(float(ev['entry_ts']))}"
-                if st.button("📈 Загрузить графики 15m + 1D", key="load_selected_short_setup"):
-                    st.session_state["_loaded_short_setup_chart"] = setup_chart_key
-                if st.session_state.get("_loaded_short_setup_chart") != setup_chart_key:
-                    st.info("Выберите сетап и нажмите «Загрузить графики» — свечи из БД будут прочитаны только по запросу.")
-                else:
-                    live_interval = 0.0 if live_refresh == "Off" else float(live_refresh[:-1])
-                    if live_interval > 0 and hasattr(st, "fragment") and not demo_mode:
-                        @st.fragment(run_every=live_interval)
-                        def _setup_live_fragment():
-                            _render_live_panel(
-                                ticker, exchange, False, db_name=live_db,
-                                atr_label=format_atr_label("1D", atr_days),
-                                db_row=daily_row or setup_row,
-                            )
-                        _setup_live_fragment()
-                    elif demo_mode:
-                        st.info("Для реальной цены LIVE отключите Demo mode в боковой панели.")
-                    else:
+                live_interval = 0.0 if live_refresh == "Off" else float(live_refresh[:-1])
+                if live_interval > 0 and hasattr(st, "fragment") and not demo_mode:
+                    @st.fragment(run_every=live_interval)
+                    def _setup_live_fragment():
                         _render_live_panel(
                             ticker, exchange, False, db_name=live_db,
                             atr_label=format_atr_label("1D", atr_days),
                             db_row=daily_row or setup_row,
                         )
-
-                    try:
-                        start_ts = int(float(ev["start_ts"]))
-                        entry_ts = int(float(ev["entry_ts"]))
-                    except (KeyError, TypeError, ValueError):
-                        start_ts, entry_ts = int(float(ev["entry_ts"])), int(float(ev["entry_ts"]))
-                    now_ts = int(time.time())
-                    is_current = ev["status"] == "CURRENT"
-                    # Include post-entry movement so a resolved setup can be reviewed,
-                    # while CURRENT charts still extend through the latest stored bar.
-                    end_15m = max(entry_ts + 10 * 86400, now_ts if is_current else entry_ts + 10 * 86400)
-                    end_1d = max(entry_ts + 30 * 86400, now_ts if is_current else entry_ts + 30 * 86400)
-                    frame_15m = load_setup_candles_window_cached(
-                        db_host, db_port, db_user, db_pass, source_db, source_table,
-                        max(0, start_ts - 86400), end_15m,
-                    ) if source_db and source_table else pd.DataFrame()
-                    if daily_row and daily_row.get("db_name") and daily_row.get("table_name"):
-                        frame_1d = load_setup_candles_window_cached(
-                            db_host, db_port, db_user, db_pass,
-                            daily_row["db_name"], daily_row["table_name"],
-                            max(0, start_ts - 30 * 86400), end_1d,
-                        )
-                    else:
-                        frame_1d = pd.DataFrame()
-                        st.warning(f"Для {ticker} на {exchange} не нашлась дневная таблица.")
-
-                    infra = _live_infra_or_none() if (live_interval > 0 and not demo_mode) else None
-                    tick_port = (infra or {}).get("tick_port")
-                    tick_path = _live_tick_path(live_db, exchange, ticker) if tick_port else None
-                    poller = build_live_poller_js(
-                        exchange, ticker, 900, int(live_interval * 1000),
-                        tick_path=tick_path, tick_port=tick_port,
-                    ) if is_current and not demo_mode else ""
-                    poller_1d = build_live_poller_js(
-                        exchange, ticker, 86400, int(live_interval * 1000),
-                        tick_path=tick_path, tick_port=tick_port,
-                    ) if is_current and not demo_mode else ""
-
-                    stacked_setup = st.toggle(
-                        "⬓ Большие графики друг под другом", value=False, key="short_setup_stacked"
+                    _setup_live_fragment()
+                elif demo_mode:
+                    st.info("Для реальной цены LIVE отключите Demo mode в боковой панели.")
+                else:
+                    _render_live_panel(
+                        ticker, exchange, False, db_name=live_db,
+                        atr_label=format_atr_label("1D", atr_days),
+                        db_row=daily_row or setup_row,
                     )
-                    if stacked_setup:
+
+                try:
+                    start_ts = int(float(ev["start_ts"]))
+                    entry_ts = int(float(ev["entry_ts"]))
+                except (KeyError, TypeError, ValueError):
+                    start_ts, entry_ts = int(float(ev["entry_ts"])), int(float(ev["entry_ts"]))
+                now_ts = int(time.time())
+                is_current = ev["status"] == "CURRENT"
+                # Include post-entry movement so a resolved setup can be reviewed,
+                # while CURRENT charts still extend through the latest stored bar.
+                end_15m = max(entry_ts + 10 * 86400, now_ts if is_current else entry_ts + 10 * 86400)
+                end_1d = max(entry_ts + 30 * 86400, now_ts if is_current else entry_ts + 30 * 86400)
+                frame_15m = load_setup_candles_window_cached(
+                    db_host, db_port, db_user, db_pass, source_db, source_table,
+                    max(0, start_ts - 86400), end_15m,
+                ) if source_db and source_table else pd.DataFrame()
+                if daily_row and daily_row.get("db_name") and daily_row.get("table_name"):
+                    frame_1d = load_setup_candles_window_cached(
+                        db_host, db_port, db_user, db_pass,
+                        daily_row["db_name"], daily_row["table_name"],
+                        max(0, start_ts - 30 * 86400), end_1d,
+                    )
+                else:
+                    frame_1d = pd.DataFrame()
+                    st.warning(f"Для {ticker} на {exchange} не нашлась дневная таблица.")
+
+                infra = _live_infra_or_none() if (live_interval > 0 and not demo_mode) else None
+                tick_port = (infra or {}).get("tick_port")
+                tick_path = _live_tick_path(live_db, exchange, ticker) if tick_port else None
+                poller = build_live_poller_js(
+                    exchange, ticker, 900, int(live_interval * 1000),
+                    tick_path=tick_path, tick_port=tick_port,
+                ) if is_current and not demo_mode else ""
+                poller_1d = build_live_poller_js(
+                    exchange, ticker, 86400, int(live_interval * 1000),
+                    tick_path=tick_path, tick_port=tick_port,
+                ) if is_current and not demo_mode else ""
+
+                stacked_setup = st.toggle(
+                    "⬓ Большие графики друг под другом", value=False, key="short_setup_stacked"
+                )
+                if stacked_setup:
+                    st.markdown(f"**{ticker} · {exchange} · 15 минут**")
+                    _render_setup_chart(frame_15m, ev, ticker, exchange, "15m", poller, 470)
+                    st.markdown(f"**{ticker} · {exchange} · 1 день**")
+                    _render_setup_chart(frame_1d, ev, ticker, exchange, "1d", poller_1d, 470)
+                else:
+                    col15, col1d = st.columns(2)
+                    with col15:
                         st.markdown(f"**{ticker} · {exchange} · 15 минут**")
-                        _render_setup_chart(frame_15m, ev, ticker, exchange, "15m", poller, 470)
+                        _render_setup_chart(frame_15m, ev, ticker, exchange, "15m", poller, 420)
+                    with col1d:
                         st.markdown(f"**{ticker} · {exchange} · 1 день**")
-                        _render_setup_chart(frame_1d, ev, ticker, exchange, "1d", poller_1d, 470)
-                    else:
-                        col15, col1d = st.columns(2)
-                        with col15:
-                            st.markdown(f"**{ticker} · {exchange} · 15 минут**")
-                            _render_setup_chart(frame_15m, ev, ticker, exchange, "15m", poller, 420)
-                        with col1d:
-                            st.markdown(f"**{ticker} · {exchange} · 1 день**")
-                            _render_setup_chart(frame_1d, ev, ticker, exchange, "1d", poller_1d, 420)
+                        _render_setup_chart(frame_1d, ev, ticker, exchange, "1d", poller_1d, 420)
 with tab_liquidity:
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Total Pair Tables (1D)", f"{len(df_1d):,}")
