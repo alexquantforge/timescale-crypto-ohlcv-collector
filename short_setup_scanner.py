@@ -19,6 +19,7 @@ import datetime as dt
 import os
 import re
 import sys
+import time
 from typing import Any
 
 import asyncpg
@@ -187,6 +188,15 @@ def find_setups(
     return result
 
 
+def _fmt_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}ч {minutes:02d}м"
+    return f"{minutes}м {secs:02d}с"
+
+
 def _fmt_time(ts: int) -> str:
     return dt.datetime.fromtimestamp(ts, dt.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
 
@@ -259,9 +269,11 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
                 tasks.append((db, pool, table))
         if args.limit_tables:
             tasks = tasks[:args.limit_tables]
-        print(f"Сканирую {len(tasks)} таблиц, timeframe={args.timeframe}; критерии: "
+        total_tables = len(tasks)
+        print(f"Сканирую {total_tables} таблиц, timeframe={args.timeframe}; критерии: "
               f"памп ≥{args.pump_pct:g}% за ≤{args.days:g} дн, A→C ≤{args.max_retrace:g}% роста, "
               f"RR ≥{args.rr:g}:1")
+        scan_started = time.monotonic()
 
         async def one(db: str, pool: asyncpg.Pool, table: str) -> list[dict[str, Any]]:
             async with sem:
@@ -303,8 +315,12 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
             nonlocal completed
             found = await one(*task)
             completed += 1
-            if completed % 100 == 0 or completed == len(tasks):
-                print(f"Прогресс: {completed}/{len(tasks)} таблиц")
+            if completed % 100 == 0 or completed == total_tables:
+                elapsed = time.monotonic() - scan_started
+                rate = elapsed / completed if completed else 0.0
+                eta = rate * (total_tables - completed)
+                print(f"Прогресс: {completed}/{total_tables} таблиц | "
+                      f"прошло {_fmt_duration(elapsed)} | осталось ~{_fmt_duration(eta)}")
             return found
 
         batches = await asyncio.gather(*(run_task(task) for task in tasks))

@@ -1,6 +1,11 @@
 import numpy as np
 
-from short_setup_scanner import find_setups
+from short_setup_scanner import _fmt_duration, find_setups
+
+
+def test_formats_eta_duration():
+    assert _fmt_duration(65) == "1м 05с"
+    assert _fmt_duration(3661) == "1ч 01м"
 
 
 def candles(c_low=136.0):
