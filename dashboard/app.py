@@ -4506,6 +4506,19 @@ def _short_setups_tab_is_active() -> bool:
     return active_tab == "🎯 Short Setups"
 
 
+def _step_short_setup_selection(delta: int, event_numbers: list[int]) -> None:
+    """Select an adjacent event before Streamlit reruns the script."""
+    key = "short_setup_selection_event_no"
+    current = st.session_state.get(key)
+    try:
+        index = event_numbers.index(int(current))
+    except (TypeError, ValueError):
+        index = 0
+    target = index + int(delta)
+    if 0 <= target < len(event_numbers):
+        st.session_state[key] = int(event_numbers[target])
+
+
 def _unique_sorted(values):
     return sorted(set(v for v in values if v))
 
@@ -5786,6 +5799,8 @@ with tab_setups:
                     key="short_setup_selection_event_no",
                 )
                 ev = events_by_no[int(selected_event_no)]
+                event_numbers = list(events_by_no)
+                selected_position = event_numbers.index(int(selected_event_no))
                 ticker = str(ev.get("ticker") or _setup_ticker_from_table(ev.get("table")))
                 exchange = str(ev.get("exchange") or "").lower()
                 source_db = str(ev.get("database") or "")
@@ -5883,18 +5898,54 @@ with tab_setups:
                     "⬓ Большие графики друг под другом", value=False, key="short_setup_stacked"
                 )
                 if stacked_setup:
-                    st.markdown(f"**{ticker} · {exchange} · 15 минут**")
-                    _render_setup_chart(frame_15m, ev, ticker, exchange, "15m", poller, 470)
-                    st.markdown(f"**{ticker} · {exchange} · 1 день**")
-                    _render_setup_chart(frame_1d, ev, ticker, exchange, "1d", poller_1d, 470)
+                    nav_prev, chart_stack, nav_next = st.columns(
+                        [0.10, 1, 0.10], vertical_alignment="center"
+                    )
+                    with nav_prev:
+                        st.button(
+                            "◀", key="short_setup_prev", help="Предыдущий сетап",
+                            use_container_width=True, disabled=selected_position <= 0,
+                            on_click=_step_short_setup_selection,
+                            args=(-1, event_numbers),
+                        )
+                    with chart_stack:
+                        st.markdown(f"**{ticker} · {exchange} · 15 минут**")
+                        _render_setup_chart(frame_15m, ev, ticker, exchange, "15m", poller, 470)
+                        st.markdown(f"**{ticker} · {exchange} · 1 день**")
+                        _render_setup_chart(frame_1d, ev, ticker, exchange, "1d", poller_1d, 470)
+                    with nav_next:
+                        st.button(
+                            "▶", key="short_setup_next", help="Следующий сетап",
+                            use_container_width=True,
+                            disabled=selected_position >= len(event_numbers) - 1,
+                            on_click=_step_short_setup_selection,
+                            args=(1, event_numbers),
+                        )
                 else:
-                    col15, col1d = st.columns(2)
+                    nav_prev, col15, col1d, nav_next = st.columns(
+                        [0.10, 1, 1, 0.10], vertical_alignment="center"
+                    )
+                    with nav_prev:
+                        st.button(
+                            "◀", key="short_setup_prev", help="Предыдущий сетап",
+                            use_container_width=True, disabled=selected_position <= 0,
+                            on_click=_step_short_setup_selection,
+                            args=(-1, event_numbers),
+                        )
                     with col15:
                         st.markdown(f"**{ticker} · {exchange} · 15 минут**")
                         _render_setup_chart(frame_15m, ev, ticker, exchange, "15m", poller, 420)
                     with col1d:
                         st.markdown(f"**{ticker} · {exchange} · 1 день**")
                         _render_setup_chart(frame_1d, ev, ticker, exchange, "1d", poller_1d, 420)
+                    with nav_next:
+                        st.button(
+                            "▶", key="short_setup_next", help="Следующий сетап",
+                            use_container_width=True,
+                            disabled=selected_position >= len(event_numbers) - 1,
+                            on_click=_step_short_setup_selection,
+                            args=(1, event_numbers),
+                        )
 with tab_liquidity:
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Total Pair Tables (1D)", f"{len(df_1d):,}")
