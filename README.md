@@ -230,6 +230,10 @@ timescale-crypto-ohlcv-collector/
    has since been touched; `RESOLVED` means one was hit, and older untriggered
    setups are marked `HISTORY`. Tune thresholds with `--help`, e.g. `--timeframe 1d` or
    `--exchanges bybit,okx`. This is a screening tool; it does not place trades.
+   The dashboard's **🎯 Short Setups** tab reads this CSV, filters the results,
+   and opens event-centred 15m and 1D charts with A/C/B, entry, stop and target
+   markers. Choose a setup and explicitly load its charts; the current quote
+   stays live, while a CURRENT setup also updates both chart tails.
 
 ---
 

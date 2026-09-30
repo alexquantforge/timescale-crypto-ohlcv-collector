@@ -1484,6 +1484,58 @@ def load_candles_cached(db_host, db_port, db_user, db_pass, db_name: str, table_
         return pd.DataFrame()
 
 
+_SETUP_TABLE_RE = re.compile(r"^[A-Za-z0-9_:]{1,96}$")
+
+
+async def _load_setup_candles_window(db_name: str, table_name: str, start_ts: int,
+                                    end_ts: int, db_host, db_port, db_user, db_pass):
+    """Load a bounded candle window around one historical setup (seconds or ms tables)."""
+    if not _SETUP_TABLE_RE.fullmatch(table_name or ""):
+        raise ValueError(f"Unsafe OHLCV table name: {table_name!r}")
+    conn = await asyncpg.connect(
+        host=db_host, port=db_port, user=db_user, password=db_pass,
+        database=db_name, timeout=15,
+    )
+    try:
+        rows = await conn.fetch(
+            f'''SELECT "Timestamp" AS ts, open, high, low, close, volume
+                FROM "{table_name}"
+                WHERE ("Timestamp" >= $1 AND "Timestamp" <= $2)
+                   OR ("Timestamp" >= $3 AND "Timestamp" <= $4)
+                ORDER BY "Timestamp" ASC''',
+            int(start_ts), int(end_ts), int(start_ts) * 1000, int(end_ts) * 1000,
+        )
+    finally:
+        await conn.close()
+    return candle_rows_to_frame(rows)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_setup_candles_window_cached(db_host, db_port, db_user, db_pass,
+                                     db_name: str, table_name: str,
+                                     start_ts: int, end_ts: int) -> pd.DataFrame:
+    """Cached event-centred OHLCV window; avoids loading the whole table/history."""
+    try:
+        return asyncio.run(_load_setup_candles_window(
+            db_name, table_name, start_ts, end_ts,
+            db_host, db_port, db_user, db_pass,
+        ))
+    except Exception as exc:
+        st.warning(f"Could not load setup candles for {db_name}.{table_name}: {exc}")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def _read_short_setups_csv(path: str, modified_ns: int) -> pd.DataFrame:
+    """Reload scanner output when its file modification time changes."""
+    return pd.read_csv(path)
+
+
+def _setup_ticker_from_table(table_name: str) -> str:
+    raw = str(table_name or "").rsplit("_on_", 1)[0]
+    return raw.replace("_", "/").upper()
+
+
 # ---------------------------------------------------------------------------
 # Recent Pumps tab (data layer): `pump_scanner.py recent` runs read from the
 # results DB (pump_scanner_results — same server as the OHLCV data). Defined
@@ -4392,9 +4444,9 @@ if df_15m.empty and df_1d.empty:
 # Tabs: charts first
 # ---------------------------------------------------------------------------
 
-tab_charts, tab_recent, tab_liquidity, tab_info = st.tabs(
-    ["📈 Charts (15m + 1D)", "🚀 Recent Pumps", "📊 Liquidity Monitor",
-     "ℹ️ Methodology & Algorithms"]
+tab_charts, tab_recent, tab_setups, tab_liquidity, tab_info = st.tabs(
+    ["📈 Charts (15m + 1D)", "🚀 Recent Pumps", "🎯 Short Setups",
+     "📊 Liquidity Monitor", "ℹ️ Methodology & Algorithms"]
 )
 
 
@@ -5402,6 +5454,78 @@ def render_pump_chart(df: pd.DataFrame, ticker: str, exchange: str,
     st.plotly_chart(fig, width="stretch")
 
 
+def _setup_overlay_js(event: dict, timeframe: str) -> str:
+    """Marker + trade-level overlays for a selected A-C-B setup chart."""
+    markers_by_time = {}
+    marker_specs = [
+        ("start_ts", "L", "#ffb74d", "belowBar", "arrowUp"),
+        ("a_ts", "A", "#ff9800", "aboveBar", "arrowDown"),
+        ("c_ts", "C", "#26a69a", "belowBar", "arrowUp"),
+        ("b_ts", "B", "#ab47bc", "aboveBar", "arrowDown"),
+        ("entry_ts", "Entry", "#42a5f5", "aboveBar", "arrowDown"),
+    ]
+    for key, label, color, position, shape in marker_specs:
+        try:
+            ts = int(float(event.get(key)))
+        except (TypeError, ValueError):
+            continue
+        if timeframe == "1d":
+            ts = ts // 86400 * 86400
+        marker = markers_by_time.get(ts)
+        if marker is None:
+            markers_by_time[ts] = {"time": ts, "position": position, "color": color,
+                                   "shape": shape, "text": label}
+        else:
+            marker["text"] += "/" + label
+    markers = [markers_by_time[ts] for ts in sorted(markers_by_time)]
+
+    lines = []
+    for key, title, color in (
+        ("a_price", "A", "#ff9800"),
+        ("c_price", "C / target", "#26a69a"),
+        ("b_price", "B", "#ab47bc"),
+        ("entry", "Entry", "#42a5f5"),
+        ("stop", "Stop", "#ef5350"),
+    ):
+        try:
+            price = float(event.get(key))
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(price) or price <= 0:
+            continue
+        lines.append(
+            "mainSeries.createPriceLine({"
+            f"price:{price!r},color:{json.dumps(color)},lineWidth:1,"
+            "lineStyle:LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,"
+            f"title:{json.dumps(title)}}});"
+        )
+    markers_js = f"mainSeries.setMarkers({json.dumps(markers, separators=(',', ':'))});" if markers else ""
+    return "\n".join(lines + [markers_js])
+
+
+def _render_setup_chart(frame: pd.DataFrame, event: dict, ticker: str,
+                        exchange: str, timeframe: str, live_poller_js: str,
+                        chart_height: int = 430) -> None:
+    """Render the app's Lightweight Chart with A/C/B, entry, stop and target."""
+    if frame is None or frame.empty:
+        st.info(f"Нет свечей {timeframe} для {ticker} ({exchange}) в диапазоне сетапа.")
+        return
+    candles, volumes = build_series_arrays(frame, with_volume=bool(show_volume))
+    html = build_lightweight_chart_html(
+        candles_json=json.dumps(candles, separators=(",", ":")),
+        volume_json=json.dumps(volumes, separators=(",", ":")) if show_volume else None,
+        chart_height=chart_height,
+        chart_style=chart_style,
+        live_poller_js=live_poller_js,
+        history_loader_js="",
+    )
+    anchor = "mainSeries.setData(candlesData);"
+    overlay = _setup_overlay_js(event, timeframe)
+    if overlay:
+        html = html.replace(anchor, anchor + "\n" + overlay, 1)
+    _html_component(html, chart_height + 10 + HIST_STATUS_HEIGHT)
+
+
 with tab_recent:
     st.subheader("🚀 Recent Pumps")
     st.caption(
@@ -5486,6 +5610,212 @@ with tab_recent:
                                           ev["start_ts"], ev["peak_ts"],
                                           c["min_price"], c["peak_price"])
 
+with tab_setups:
+    st.subheader("🎯 Short Setups — паттерны A → C → B")
+    st.caption(
+        "Сетапы читаются из `short_setups.csv`, созданного `short_setup_scanner.py`. "
+        "Графики показывают историческое окно вокруг выбранного сетапа; текущая "
+        "цена запрашивается отдельно в LIVE-режиме. Для сигнала CURRENT 15m-график "
+        "также обновляет последнюю свечу в реальном времени."
+    )
+    setups_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "short_setups.csv"))
+    if st.button("🔄 Перечитать short_setups.csv", key="reload_short_setups"):
+        _read_short_setups_csv.clear()
+        st.rerun()
+    try:
+        setups_mtime = os.stat(setups_path).st_mtime_ns
+        setups_df = _read_short_setups_csv(setups_path, setups_mtime).copy()
+    except FileNotFoundError:
+        setups_df = pd.DataFrame()
+        st.info(
+            f"Файл `{setups_path}` не найден. Сначала запустите сканер из корня проекта "
+            "(или сохраните результат в этот файл): `poetry run python short_setup_scanner.py --days 1`."
+        )
+    except Exception as exc:
+        setups_df = pd.DataFrame()
+        st.error(f"Не удалось прочитать {setups_path}: {exc}")
+
+    if setups_df.empty and os.path.exists(setups_path):
+        st.info("В short_setups.csv пока нет ни одного подходящего сетапа.")
+
+    if not setups_df.empty:
+        required = {"status", "base", "exchange", "table", "database", "entry_ts", "rr"}
+        missing = required - set(setups_df.columns)
+        if missing:
+            st.error("CSV не похож на вывод short_setup_scanner.py; отсутствуют поля: "
+                     + ", ".join(sorted(missing)))
+        else:
+            setups_df["status"] = setups_df["status"].fillna("HISTORY").astype(str).str.upper()
+            setups_df["base"] = setups_df["base"].fillna("").astype(str).str.upper()
+            setups_df["exchange"] = setups_df["exchange"].fillna("").astype(str).str.lower()
+            setups_df["entry_ts"] = pd.to_numeric(setups_df["entry_ts"], errors="coerce")
+            setups_df["rr"] = pd.to_numeric(setups_df["rr"], errors="coerce")
+            setups_df = setups_df.dropna(subset=["entry_ts", "rr"])
+            setups_df = setups_df.sort_values("entry_ts", ascending=False).reset_index(drop=True)
+            st.caption(f"Файл: `{setups_path}` · найдено сетапов: **{len(setups_df):,}**")
+
+            status_options = [x for x in ("CURRENT", "HISTORY", "RESOLVED")
+                              if x in set(setups_df["status"])]
+            ex_options = sorted(setups_df["exchange"].dropna().unique().tolist())
+            fc1, fc2, fc3 = st.columns([2, 2, 1])
+            status_filter = fc1.multiselect(
+                "Статус", status_options, default=status_options, key="setup_status_filter"
+            )
+            exchange_filter = fc2.multiselect(
+                "Биржа", ex_options, default=ex_options, key="setup_exchange_filter"
+            )
+            rr_filter = fc3.number_input(
+                "Мин. RR", min_value=0.0, max_value=100.0, value=0.0, step=0.25,
+                key="setup_rr_filter",
+            )
+            search = st.text_input("Поиск монеты", key="setup_base_search").strip().upper()
+            filtered = setups_df[
+                setups_df["status"].isin(status_filter)
+                & setups_df["exchange"].isin(exchange_filter)
+                & (setups_df["rr"] >= float(rr_filter))
+            ]
+            if search:
+                filtered = filtered[filtered["base"].str.contains(re.escape(search), na=False)]
+            filtered = filtered.reset_index(drop=True)
+            st.caption(f"По фильтрам: **{len(filtered):,}** сетапов")
+
+            show_cols = [c for c in (
+                "status", "base", "exchange", "market", "entry_time", "pump_pct",
+                "pump_retrace_pct", "a_price", "c_price", "b_price", "entry",
+                "stop", "target", "rr",
+            ) if c in filtered.columns]
+            st.dataframe(filtered[show_cols], width="stretch", height=260, hide_index=True)
+
+            if filtered.empty:
+                st.info("Нет сетапов, подходящих под фильтры.")
+            else:
+                selected_i = st.selectbox(
+                    "Открыть сетап", options=list(range(len(filtered))),
+                    format_func=lambda i: (
+                        f"{filtered.iloc[i]['status']} · {filtered.iloc[i]['base']} · "
+                        f"{filtered.iloc[i]['exchange']} · "
+                        f"{filtered.iloc[i].get('entry_time', _fmt_time(int(filtered.iloc[i]['entry_ts'])))} · "
+                        f"RR {filtered.iloc[i]['rr']:.2f}:1"
+                    ),
+                    key="short_setup_selection",
+                )
+                ev = filtered.iloc[int(selected_i)].to_dict()
+                ticker = _setup_ticker_from_table(ev.get("table"))
+                exchange = str(ev.get("exchange") or "").lower()
+                source_db = str(ev.get("database") or "")
+                source_table = str(ev.get("table") or "")
+                source_match = pd.DataFrame()
+                if not df_15m.empty and {"table_name", "db_name"}.issubset(df_15m.columns):
+                    source_match = df_15m[
+                        (df_15m["table_name"].astype(str) == source_table)
+                        & (df_15m["db_name"].astype(str) == source_db)
+                    ]
+                setup_row = (source_match.iloc[0].to_dict() if not source_match.empty else {
+                    "ticker": ticker, "exchange": exchange,
+                    "db_name": source_db, "table_name": source_table,
+                })
+                daily_row = find_table_row(df_1d, ticker, exchange)
+                if daily_row is None and not df_1d.empty and "exchange" in df_1d.columns:
+                    same_base = df_1d[
+                        (df_1d["exchange"].astype(str).str.lower() == exchange)
+                        & df_1d["ticker"].astype(str).str.split("/").str[0].str.upper()
+                            .eq(str(ev["base"]).upper())
+                    ]
+                    if not same_base.empty:
+                        daily_row = same_base.iloc[0].to_dict()
+                live_db = _live_db_for(daily_row, setup_row)
+                ccxt_id = settings.exchange_map_1d.get(exchange, exchange)
+                if daily_row and str(daily_row.get("ticker") or "") != ticker:
+                    st.caption(
+                        f"На дневке показан доступный контракт той же монеты: "
+                        f"{daily_row.get('ticker')} ({exchange}); 15m остаётся исходной парой {ticker}."
+                    )
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Сетап", ev["status"])
+                m2.metric("Памп L→A", f"{float(ev.get('pump_pct', 0)):.1f}%")
+                m3.metric("Откат A→C", f"{float(ev.get('pump_retrace_pct', 0)):.1f}% роста")
+                m4.metric("Потенциал / риск", f"{float(ev['rr']):.2f}:1")
+                st.markdown(build_pair_links_html(ticker, exchange,
+                    find_perp_ticker([df_15m, df_1d], ev["base"], exchange)), unsafe_allow_html=True)
+                setup_chart_key = f"{source_db}.{source_table}:{int(float(ev['entry_ts']))}"
+                if st.button("📈 Загрузить графики 15m + 1D", key="load_selected_short_setup"):
+                    st.session_state["_loaded_short_setup_chart"] = setup_chart_key
+                if st.session_state.get("_loaded_short_setup_chart") != setup_chart_key:
+                    st.info("Выберите сетап и нажмите «Загрузить графики» — свечи из БД будут прочитаны только по запросу.")
+                else:
+                    live_interval = 0.0 if live_refresh == "Off" else float(live_refresh[:-1])
+                    if live_interval > 0 and hasattr(st, "fragment") and not demo_mode:
+                        @st.fragment(run_every=live_interval)
+                        def _setup_live_fragment():
+                            _render_live_panel(
+                                ticker, exchange, False, db_name=live_db,
+                                atr_label=format_atr_label("1D", atr_days),
+                                db_row=daily_row or setup_row,
+                            )
+                        _setup_live_fragment()
+                    elif demo_mode:
+                        st.info("Для реальной цены LIVE отключите Demo mode в боковой панели.")
+                    else:
+                        _render_live_panel(
+                            ticker, exchange, False, db_name=live_db,
+                            atr_label=format_atr_label("1D", atr_days),
+                            db_row=daily_row or setup_row,
+                        )
+
+                    try:
+                        start_ts = int(float(ev["start_ts"]))
+                        entry_ts = int(float(ev["entry_ts"]))
+                    except (KeyError, TypeError, ValueError):
+                        start_ts, entry_ts = int(float(ev["entry_ts"])), int(float(ev["entry_ts"]))
+                    now_ts = int(time.time())
+                    is_current = ev["status"] == "CURRENT"
+                    # Include post-entry movement so a resolved setup can be reviewed,
+                    # while CURRENT charts still extend through the latest stored bar.
+                    end_15m = max(entry_ts + 10 * 86400, now_ts if is_current else entry_ts + 10 * 86400)
+                    end_1d = max(entry_ts + 30 * 86400, now_ts if is_current else entry_ts + 30 * 86400)
+                    frame_15m = load_setup_candles_window_cached(
+                        db_host, db_port, db_user, db_pass, source_db, source_table,
+                        max(0, start_ts - 86400), end_15m,
+                    ) if source_db and source_table else pd.DataFrame()
+                    if daily_row and daily_row.get("db_name") and daily_row.get("table_name"):
+                        frame_1d = load_setup_candles_window_cached(
+                            db_host, db_port, db_user, db_pass,
+                            daily_row["db_name"], daily_row["table_name"],
+                            max(0, start_ts - 30 * 86400), end_1d,
+                        )
+                    else:
+                        frame_1d = pd.DataFrame()
+                        st.warning(f"Для {ticker} на {exchange} не нашлась дневная таблица.")
+
+                    infra = _live_infra_or_none() if (live_interval > 0 and not demo_mode) else None
+                    tick_port = (infra or {}).get("tick_port")
+                    tick_path = _live_tick_path(live_db, exchange, ticker) if tick_port else None
+                    poller = build_live_poller_js(
+                        exchange, ticker, 900, int(live_interval * 1000),
+                        tick_path=tick_path, tick_port=tick_port,
+                    ) if is_current and not demo_mode else ""
+                    poller_1d = build_live_poller_js(
+                        exchange, ticker, 86400, int(live_interval * 1000),
+                        tick_path=tick_path, tick_port=tick_port,
+                    ) if is_current and not demo_mode else ""
+
+                    stacked_setup = st.toggle(
+                        "⬓ Большие графики друг под другом", value=False, key="short_setup_stacked"
+                    )
+                    if stacked_setup:
+                        st.markdown(f"**{ticker} · {exchange} · 15 минут**")
+                        _render_setup_chart(frame_15m, ev, ticker, exchange, "15m", poller, 470)
+                        st.markdown(f"**{ticker} · {exchange} · 1 день**")
+                        _render_setup_chart(frame_1d, ev, ticker, exchange, "1d", poller_1d, 470)
+                    else:
+                        col15, col1d = st.columns(2)
+                        with col15:
+                            st.markdown(f"**{ticker} · {exchange} · 15 минут**")
+                            _render_setup_chart(frame_15m, ev, ticker, exchange, "15m", poller, 420)
+                        with col1d:
+                            st.markdown(f"**{ticker} · {exchange} · 1 день**")
+                            _render_setup_chart(frame_1d, ev, ticker, exchange, "1d", poller_1d, 420)
 with tab_liquidity:
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Total Pair Tables (1D)", f"{len(df_1d):,}")
