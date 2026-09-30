@@ -4498,6 +4498,14 @@ tab_charts, tab_recent, tab_setups, tab_liquidity, tab_info = st.tabs(
 )
 
 
+def _short_setups_tab_is_active() -> bool:
+    """Avoid background app reruns that repaint setup charts mid-selection."""
+    active_tab = st.session_state.get("main_dashboard_tabs")
+    if isinstance(active_tab, (list, tuple, set)):
+        return "🎯 Short Setups" in active_tab
+    return active_tab == "🎯 Short Setups"
+
+
 def _unique_sorted(values):
     return sorted(set(v for v in values if v))
 
@@ -5173,7 +5181,8 @@ with tab_charts:
     # case — the DB page already matches), the page is byte-identical, or the
     # last swap was too recent (a repaint resets zoom/pan and panning is the
     # main thing a user does while looking at a chart).
-    if stitch_gaps and not demo_mode and hasattr(st, "fragment"):
+    if (stitch_gaps and not demo_mode and hasattr(st, "fragment")
+            and not _short_setups_tab_is_active()):
         @st.fragment(run_every=1.0)
         def _stitch_swap_watcher():
             now = time.time()
@@ -5410,7 +5419,7 @@ with tab_charts:
         _set_live_target([])  # demo mode / no pair selected → live writer idles
 
     # --- Auto-reload DB data (full app rerun every 60 s) ---------------------
-    if auto_reload and hasattr(st, "fragment"):
+    if auto_reload and hasattr(st, "fragment") and not _short_setups_tab_is_active():
         def _auto_reload():
             # Rerun only on scheduled ticks, never on the initial creation run
             if getattr(_auto_reload, "armed", False):
@@ -5424,7 +5433,8 @@ with tab_charts:
     # A rerun reads the freshest cache; without a kick the list would only refresh
     # on a manual interaction or the 60 s auto-reload. This fragment reruns the
     # app scope once per progress advance so the pair list converges on its own.
-    if _growth_on and not demo_mode and hasattr(st, "fragment"):
+    if (_growth_on and not demo_mode and hasattr(st, "fragment")
+            and not _short_setups_tab_is_active()):
         @st.fragment(run_every=4.0)
         def _growth_progress_fragment():
             _g_done, _g_total, _g_busy = _growth_progress()
