@@ -17,6 +17,7 @@ Layout: the Charts tab is first — 15m chart on top, 1D chart below, with
 import os
 import re
 import inspect
+import math
 import sys
 import json
 import time
@@ -5533,7 +5534,7 @@ def _setup_overlay_js(event: dict, timeframe: str) -> str:
             price = float(event.get(key))
         except (TypeError, ValueError):
             continue
-        if not np.isfinite(price) or price <= 0:
+        if not math.isfinite(price) or price <= 0:
             continue
         lines.append(
             "mainSeries.createPriceLine({"
