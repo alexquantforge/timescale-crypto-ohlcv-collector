@@ -1552,7 +1552,7 @@ async def _fetch_short_setup_events(db_host, db_port, db_user, db_pass, run_id: 
     )
     try:
         return [dict(row) for row in await conn.fetch(
-            '''SELECT "status", "invalidated", "base", "exchange", "market", "ticker",
+            '''SELECT "event_no", "status", "invalidated", "base", "exchange", "market", "ticker",
                       "source_db" AS "database", "source_table" AS "table", "timeframe",
                       "start_ts", "a_ts", "c_ts", "b_ts", "entry_ts", "pump_start",
                       "a_price", "c_price", "b_price", "entry", "stop", "target",
@@ -5719,7 +5719,12 @@ with tab_setups:
             setups_df["entry_ts"] = pd.to_numeric(setups_df["entry_ts"], errors="coerce")
             setups_df["rr"] = pd.to_numeric(setups_df["rr"], errors="coerce")
             setups_df = setups_df.dropna(subset=["entry_ts", "rr"])
-            setups_df = setups_df.sort_values("entry_ts", ascending=False).reset_index(drop=True)
+            # Keep a deterministic order when multiple setups share an entry time.
+            # The selector below uses event_no rather than a positional index, so
+            # background app reruns cannot silently switch the selected chart.
+            setups_df = setups_df.sort_values(
+                ["entry_ts", "event_no"], ascending=[False, True], kind="mergesort"
+            ).reset_index(drop=True)
             status_options = [x for x in ("CURRENT", "HISTORY", "RESOLVED")
                               if x in set(setups_df["status"])]
             ex_options = sorted(setups_df["exchange"].dropna().unique().tolist())
@@ -5755,17 +5760,22 @@ with tab_setups:
             if filtered.empty:
                 st.info("Нет сетапов, подходящих под фильтры.")
             else:
-                selected_i = st.selectbox(
-                    "Открыть сетап", options=list(range(len(filtered))),
-                    format_func=lambda i: (
-                        f"{filtered.iloc[i]['status']} · {filtered.iloc[i]['base']} · "
-                        f"{filtered.iloc[i]['exchange']} · "
-                        f"{filtered.iloc[i]['entry_time']} · "
-                        f"RR {filtered.iloc[i]['rr']:.2f}:1"
+                events_by_no = {
+                    int(row["event_no"]): row.to_dict()
+                    for _, row in filtered.iterrows()
+                }
+                selected_event_no = st.selectbox(
+                    "Открыть сетап", options=list(events_by_no),
+                    format_func=lambda event_no: (
+                        f"{events_by_no[event_no]['status']} · "
+                        f"{events_by_no[event_no]['base']} · "
+                        f"{events_by_no[event_no]['exchange']} · "
+                        f"{events_by_no[event_no]['entry_time']} · "
+                        f"RR {events_by_no[event_no]['rr']:.2f}:1"
                     ),
-                    key="short_setup_selection",
+                    key="short_setup_selection_event_no",
                 )
-                ev = filtered.iloc[int(selected_i)].to_dict()
+                ev = events_by_no[int(selected_event_no)]
                 ticker = str(ev.get("ticker") or _setup_ticker_from_table(ev.get("table")))
                 exchange = str(ev.get("exchange") or "").lower()
                 source_db = str(ev.get("database") or "")
