@@ -65,6 +65,13 @@ def test_finds_lower_high_setup_with_two_to_one_rr():
     assert event["stop"] > event["b_price"]
 
 
+def test_rejects_lower_local_a_if_prior_high_in_pump_leg_is_higher():
+    ts, lows, highs, closes = candles()
+    highs[3] = 155.0  # Above the proposed A at index 4 (150), between L and A.
+    found = find_setups(ts, lows, highs, closes, bar_seconds=900, pivot_width=1)
+    assert found == []
+
+
 def test_rejects_setup_if_any_high_between_a_and_b_touches_or_crosses_a():
     ts, lows, highs, closes = candles()
     highs[8] = highs[4]  # B is still below A, but an intermediate wick retests A.

@@ -121,6 +121,10 @@ def find_setups(
         if left >= ai:
             continue
         li = left + int(np.argmin(lows[left:ai]))
+        # A is the peak of the complete L→A impulse, not just a local high.
+        # Reject a later, lower pivot if an earlier wick after L reached higher.
+        if np.max(highs[li:int(ai) + 1]) > highs[ai]:
+            continue
         leg = highs[ai] - lows[li]
         if lows[li] <= 0 or leg / lows[li] * 100.0 < pump_pct:
             continue
