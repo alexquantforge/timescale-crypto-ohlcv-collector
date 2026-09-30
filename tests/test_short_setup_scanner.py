@@ -65,6 +65,13 @@ def test_finds_lower_high_setup_with_two_to_one_rr():
     assert event["stop"] > event["b_price"]
 
 
+def test_rejects_setup_if_any_high_between_a_and_b_touches_or_crosses_a():
+    ts, lows, highs, closes = candles()
+    highs[8] = highs[4]  # B is still below A, but an intermediate wick retests A.
+    found = find_setups(ts, lows, highs, closes, bar_seconds=900, pivot_width=1)
+    assert found == []
+
+
 def test_rejects_a_to_c_retracement_over_30_percent_of_impulse():
     ts, lows, highs, closes = candles(c_low=130.0)
     found = find_setups(ts, lows, highs, closes, bar_seconds=900, pivot_width=1)

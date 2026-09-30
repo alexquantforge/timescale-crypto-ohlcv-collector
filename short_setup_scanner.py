@@ -134,12 +134,19 @@ def find_setups(
         b_candidates = high_pivots[(high_pivots > ai) & (high_pivots <= ai + setup_bars)]
         running_low_i = int(ai) + 1
         ci = running_low_i
+        high_crossed_a = False
         found_for_a = False
         for bi in b_candidates:
             while running_low_i <= bi:
+                if highs[running_low_i] >= highs[ai]:
+                    high_crossed_a = True
                 if lows[running_low_i] < lows[ci]:
                     ci = running_low_i
                 running_low_i += 1
+            # A is invalidated by ANY later wick touching/crossing A before B,
+            # even when the eventual rebound pivot B itself is a lower high.
+            if high_crossed_a:
+                break
             if ci not in low_pivot_set:
                 continue
             if ts[bi] - ts[ai] > setup_days * 86400:

@@ -223,7 +223,8 @@ timescale-crypto-ohlcv-collector/
    ```
    Defaults: 15-minute candles, a rise of at least 50% in at most 3 days, an
    A-to-C correction no deeper than 30% of the preceding rise, then a lower
-   high B followed by a confirmed 1% decline. The proposed stop is 0.5% above
+   high B with no intervening wick retesting A, followed by a confirmed 1% decline.
+   The proposed stop is 0.5% above
    B, the target is C, and only setups with reward/risk of at least 2:1 are
    reported. Results are printed, saved to `pump_scanner_results` in TimescaleDB,
    and exported to `short_setups.csv`; `CURRENT` means the signal appeared within
