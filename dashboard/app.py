@@ -2708,8 +2708,11 @@ _LIVE_TICK_PORTS = (8511, 8512, 8513, 8514, 8515)
 _LIVE_TARGET_TTL = 90.0   # writer idles when the pair page stops refreshing its target
 _LIVE_ROW_MAX_AGE = 30.0  # UI treats older rows as stale → direct fallback
 
-_LIVE_TARGET_LOCK = threading.Lock()
-_LIVE_TARGET: dict = {"ts": 0.0, "pairs": []}
+# The cached live-writer thread closes over process state created on the first
+# Streamlit run. These must survive later script reruns, otherwise UI updates
+# replace the globals while the writer keeps watching the original empty dict.
+_LIVE_TARGET_LOCK = _state("live_target_lock", threading.Lock)
+_LIVE_TARGET: dict = _state("live_target", lambda: {"ts": 0.0, "pairs": []})
 
 _KNOWN_DBS = {
     getattr(settings, "db_high_1d", ""),
