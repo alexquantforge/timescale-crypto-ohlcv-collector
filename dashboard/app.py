@@ -4382,7 +4382,9 @@ if st.sidebar.button("🔄 Refresh data (clear caches)"):
 st.markdown(
     """
     <style>
-        .block-container {padding-top: 0.6rem !important; padding-bottom: 0.5rem !important;}
+        /* Keep the tab labels below Streamlit's fixed toolbar instead of hiding
+           them under it; the old 0.6rem top padding clipped the navigation. */
+        .block-container {padding-top: 3.5rem !important; padding-bottom: 0.5rem !important;}
         .stTabs [data-baseweb="tab-list"] {gap: 6px; margin-bottom: 4px; height: 38px;}
         .stTabs [data-baseweb="tab"] {font-size: 14px; padding: 4px 12px;}
         h3 {margin-top: 0.2rem !important;}
