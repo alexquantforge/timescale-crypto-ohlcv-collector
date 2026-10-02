@@ -5830,6 +5830,20 @@ with tab_setups:
                     if not same_base.empty:
                         daily_row = same_base.iloc[0].to_dict()
                 live_db = _live_db_for(daily_row, setup_row)
+                setup_hist_1d = None
+                setup_atr_1d = 0.0
+                if daily_row is not None:
+                    setup_hist_1d = get_candles("1d", daily_row, max(limit_1d, 60), False)
+                    if (setup_hist_1d is not None and not setup_hist_1d.empty
+                            and len(setup_hist_1d) >= 3):
+                        setup_atr_1d = compute_atr_no_paranormal_bars(
+                            highs=setup_hist_1d["high"].to_numpy(dtype=float),
+                            lows=setup_hist_1d["low"].to_numpy(dtype=float),
+                            closes=setup_hist_1d["close"].to_numpy(dtype=float),
+                            period=atr_days,
+                            small_threshold=settings.atr_small_threshold,
+                            large_threshold=settings.atr_large_threshold,
+                        )
                 if daily_row and str(daily_row.get("ticker") or "") != ticker:
                     st.caption(
                         f"На дневке показан доступный контракт той же монеты: "
@@ -5844,23 +5858,32 @@ with tab_setups:
                 st.markdown(build_pair_links_html(ticker, exchange,
                     find_perp_ticker([df_15m, df_1d], ev["base"], exchange)), unsafe_allow_html=True)
                 live_interval = 0.0 if live_refresh == "Off" else float(live_refresh[:-1])
+                setup_atr_label = format_atr_label("1D" if daily_row else "15m", atr_days)
                 if live_interval > 0 and hasattr(st, "fragment") and not demo_mode:
                     @st.fragment(run_every=live_interval)
                     def _setup_live_fragment():
+                        live_row = _compute_live_health_row(
+                            ticker, exchange, setup_hist_1d, setup_atr_1d,
+                            daily_row or setup_row, db_name=live_db,
+                            atr_label=setup_atr_label,
+                        )
+                        st.markdown(build_health_strip_html(live_row), unsafe_allow_html=True)
                         _render_live_panel(
                             ticker, exchange, False, db_name=live_db,
-                            atr_label=format_atr_label("1D", atr_days),
-                            db_row=daily_row or setup_row,
+                            atr_label=setup_atr_label, db_row=daily_row or setup_row,
                         )
                     _setup_live_fragment()
-                elif demo_mode:
-                    st.info("Для реальной цены LIVE отключите Demo mode в боковой панели.")
                 else:
-                    _render_live_panel(
-                        ticker, exchange, False, db_name=live_db,
-                        atr_label=format_atr_label("1D", atr_days),
-                        db_row=daily_row or setup_row,
-                    )
+                    health_row = dict(daily_row or setup_row or {})
+                    health_row.setdefault("atr_label", _db_atr_label(daily_row is None))
+                    st.markdown(build_health_strip_html(health_row), unsafe_allow_html=True)
+                    if demo_mode:
+                        st.info("Для реальной цены LIVE отключите Demo mode в боковой панели.")
+                    else:
+                        _render_live_panel(
+                            ticker, exchange, False, db_name=live_db,
+                            atr_label=setup_atr_label, db_row=daily_row or setup_row,
+                        )
 
                 try:
                     start_ts = int(float(ev["start_ts"]))
