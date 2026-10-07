@@ -15,6 +15,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import math
+import time
 import datetime as dt
 import json
 import os
@@ -28,8 +30,9 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config.settings import settings  # noqa: E402
+from src.analytics.atr_filtered import compute_atr_no_paranormal_bars  # noqa: E402
 
-_IDENT = re.compile(r"^[a-zA-Z0-9_]+$")
+_IDENT = re.compile(r"^[a-zA-Z0-9_:]+$")
 RESULTS_DB = "pump_scanner_results"
 
 
@@ -126,7 +129,7 @@ def find_setups(
         if np.max(highs[li:int(ai) + 1]) > highs[ai]:
             continue
         leg = highs[ai] - lows[li]
-        if lows[li] <= 0 or leg / lows[li] * 100.0 < pump_pct:
+        if lows[li] <= 0 or leg / lows[li] * 100.0 <= pump_pct:
             continue
         if ts[ai] - ts[li] > pump_days * 86400:
             continue
@@ -225,7 +228,8 @@ def _args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--timeframe", choices=("15m", "1d"), default="15m")
-    p.add_argument("--pump-pct", type=float, default=50.0, help="Минимальный рост L→A, %")
+    p.add_argument("--pump-pct", type=float, default=50.0,
+                   help="Требуемый строгий минимум роста L→A, % (по умолчанию >50%)")
     p.add_argument("--days", type=float, default=3.0, help="Максимальная длительность L→A, дни")
     p.add_argument("--max-retrace", type=float, default=30.0,
                    help="Максимальный откат A→C как %% от роста L→A")
@@ -256,6 +260,20 @@ def _args() -> argparse.Namespace:
                    help="Не сохранять запуск и сетапы в pump_scanner_results")
     p.add_argument("--import-csv", default="",
                    help="Импортировать уже готовый CSV в базу без повторного сканирования")
+    p.add_argument("--watch", action="store_true",
+                   help="Непрерывно искать только текущие сетапы и печатать их каждый цикл")
+    p.add_argument("--interval-minutes", type=float, default=60.0,
+                   help="Интервал между стартами watch-проходов, минут")
+    p.add_argument("--watch-atr-period", type=int, default=5,
+                   help="Период 1D ATR для фильтра спреда в watch-режиме")
+    p.add_argument("--watch-min-tape", type=float, default=3.0,
+                   help="Минимум сделок/мин за последние 5 минут")
+    p.add_argument("--watch-min-depth-usd", type=float, default=1000.0,
+                   help="Минимальная глубина стакана ±1%, USD")
+    p.add_argument("--watch-max-spread-atr-pct", type=float, default=15.0,
+                   help="Максимальный спред как %% 1D ATR")
+    p.add_argument("--watch-min-7d-volume-usd", type=float, default=100000.0,
+                   help="Минимальный min(volume × low) за 7 закрытых дневных свечей")
     return p.parse_args()
 
 
@@ -293,7 +311,7 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
             tasks = tasks[:args.limit_tables]
         total_tables = len(tasks)
         print(f"Сканирую {total_tables} таблиц, timeframe={args.timeframe}; критерии: "
-              f"памп ≥{args.pump_pct:g}% за ≤{args.days:g} дн, A→C ≤{args.max_retrace:g}% роста, "
+              f"памп >{args.pump_pct:g}% за ≤{args.days:g} дн, A→C ≤{args.max_retrace:g}% роста, "
               f"RR ≥{args.rr:g}:1")
         scan_started = time.monotonic()
 
@@ -317,6 +335,10 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
                     )
                     base, exchange, kind = _parse_table(table)
                     for event in found:
+                        # Save the last database close for the live watcher's
+                        # documented fallback when a venue ticker is unavailable.
+                        event["last_close"] = float(arr[-1, 3])
+                        event["last_bar_ts"] = int(arr[-1, 0])
                         entry_i = int(np.searchsorted(arr[:, 0], event["entry_ts"], side="left"))
                         later_highs = arr[entry_i + 1:, 2]
                         later_lows = arr[entry_i + 1:, 1]
@@ -361,6 +383,347 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
         for pool in pools.values():
             await pool.close()
 
+
+
+def _daily_db_name(db_name: str, timeframe: str) -> str | None:
+    if timeframe == "1d":
+        return db_name
+    return {
+        settings.db_high_15m: settings.db_high_1d,
+        settings.db_low_15m: settings.db_low_1d,
+    }.get(db_name)
+
+
+def _finite_positive(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+async def _daily_health_metrics(pool: asyncpg.Pool, table: str, now_ts: int,
+                                atr_period: int) -> dict[str, float | None]:
+    """Read the closed daily bars used by the dashboard's spread/volume chips."""
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f'SELECT "Timestamp" AS ts, low, high, close, volume '
+                f'FROM "{table}" ORDER BY "Timestamp" DESC LIMIT $1',
+                max(60, atr_period + 2),
+            )
+    except Exception:
+        return {"min_7d_volume_usd": None, "atr_1d": None}
+    if not rows:
+        return {"min_7d_volume_usd": None, "atr_1d": None}
+
+    data = np.asarray([tuple(row) for row in rows], dtype=np.float64)[::-1]
+    timestamps = data[:, 0]
+    if np.nanmedian(timestamps) > 1e11:
+        timestamps = timestamps / 1000.0
+    closed = data[timestamps <= now_ts - 86400]
+    min_7d_volume = None
+    if len(closed):
+        tail = closed[-7:]
+        volumes = tail[:, 4] * tail[:, 1]
+        finite_volumes = volumes[np.isfinite(volumes) & (volumes >= 0)]
+        if len(finite_volumes) == len(tail):
+            min_7d_volume = float(np.min(finite_volumes))
+
+    atr = None
+    if len(data) >= 3:
+        atr_value = compute_atr_no_paranormal_bars(
+            highs=data[:, 2], lows=data[:, 1], closes=data[:, 3],
+            period=max(1, int(atr_period)),
+            small_threshold=settings.atr_small_threshold,
+            large_threshold=settings.atr_large_threshold,
+        )
+        atr = _finite_positive(atr_value)
+    return {"min_7d_volume_usd": min_7d_volume, "atr_1d": atr}
+
+
+async def _fetch_watch_market_snapshot(client, symbol: str, last_close: float,
+                                       daily_metrics: dict) -> dict:
+    """Fetch the current quote, book and tape for one candidate pair."""
+    ticker_result, book_result, trades_result = await asyncio.gather(
+        client.fetch_ticker(symbol),
+        client.fetch_order_book(symbol, limit=50),
+        client.fetch_trades(symbol, limit=200),
+        return_exceptions=True,
+    )
+    ticker = ticker_result if isinstance(ticker_result, dict) else {}
+    book = book_result if isinstance(book_result, dict) else {}
+    trades = trades_result if isinstance(trades_result, list) else []
+
+    last = _finite_positive(ticker.get("last"))
+    if last is None:
+        last, price_source = _finite_positive(last_close), "DB"
+    else:
+        price_source = "LIVE"
+
+    bids = book.get("bids") or []
+    asks = book.get("asks") or []
+    bid = ask = depth = spread_atr_pct = None
+    try:
+        bid, ask = _finite_positive(bids[0][0]), _finite_positive(asks[0][0])
+        if bid is not None and ask is not None and ask >= bid:
+            mid = (bid + ask) / 2.0
+            depth = sum(
+                float(price) * float(amount) for price, amount in bids
+                if _finite_positive(price) and _finite_positive(amount)
+                and float(price) >= mid * 0.99
+            ) + sum(
+                float(price) * float(amount) for price, amount in asks
+                if _finite_positive(price) and _finite_positive(amount)
+                and float(price) <= mid * 1.01
+            )
+            atr = daily_metrics.get("atr_1d")
+            if atr and atr > 0:
+                spread_atr_pct = (ask - bid) / atr * 100.0
+    except (TypeError, ValueError, IndexError):
+        bid = ask = depth = spread_atr_pct = None
+
+    now_ms = time.time() * 1000.0
+    recent = []
+    try:
+        recent = [
+            trade for trade in trades
+            if trade.get("timestamp")
+            and float(trade["timestamp"]) >= now_ms - 300_000
+        ]
+    except (TypeError, ValueError):
+        recent = []
+    trades_per_min = len(recent) / 5.0 if isinstance(trades_result, list) else None
+    trade_prices = []
+    try:
+        trade_prices = [float(t["price"]) for t in trades if t.get("price")]
+    except (TypeError, ValueError):
+        pass
+    barcode = len(trades) >= 30 and len(set(trade_prices)) <= 4
+
+    return {
+        "price": last, "price_source": price_source,
+        "bid": bid, "ask": ask, "depth_usd": depth,
+        "trades_per_min": trades_per_min, "is_barcode": barcode,
+        "spread_atr_pct": spread_atr_pct,
+        "min_7d_volume_usd": daily_metrics.get("min_7d_volume_usd"),
+    }
+
+
+def _screen_current_signal(event: dict, snapshot: dict, args: argparse.Namespace,
+                           now_ts: int) -> tuple[dict | None, str | None]:
+    """Apply current-price, RR and the dashboard's red-chip exclusion rules."""
+    if event.get("invalidated"):
+        return None, "already invalidated"
+    price = _finite_positive(snapshot.get("price"))
+    c_price = _finite_positive(event.get("c_price"))
+    b_price = _finite_positive(event.get("b_price"))
+    a_price = _finite_positive(event.get("a_price"))
+    if price is None or c_price is None or b_price is None or a_price is None:
+        return None, "missing price or pattern level"
+    if not c_price <= price <= b_price:
+        return None, "price outside C-B"
+
+    stop = b_price * (1.0 + args.stop_buffer / 100.0)
+    risk, reward = stop - price, price - c_price
+    if risk <= 0 or reward <= 0:
+        return None, "non-positive reward/risk"
+    current_rr = reward / risk
+    if current_rr < args.rr:
+        return None, "current RR below minimum"
+
+    tape = snapshot.get("trades_per_min")
+    if tape is None or tape < args.watch_min_tape or snapshot.get("is_barcode"):
+        return None, "dead/insufficient tape"
+    depth = snapshot.get("depth_usd")
+    if depth is None or depth <= args.watch_min_depth_usd:
+        return None, "thin/missing orderbook"
+    spread = snapshot.get("spread_atr_pct")
+    if spread is None or spread >= args.watch_max_spread_atr_pct:
+        return None, "wide/missing spread or ATR"
+    min_volume = snapshot.get("min_7d_volume_usd")
+    if min_volume is None or min_volume <= args.watch_min_7d_volume_usd:
+        return None, "low/missing 7d dollar volume"
+
+    signal = dict(event)
+    # In watch mode the persisted entry is the actionable current quote, while
+    # A/C/B and L remain the historical pattern points.
+    signal.update({
+        "status": "CURRENT", "invalidated": False,
+        "entry_ts": int(now_ts), "entry": price,
+        "stop": stop, "target": c_price, "rr": current_rr,
+        "current_price_source": snapshot.get("price_source", "DB"),
+        "depth_usd": depth, "trades_per_min": tape,
+        "spread_atr_pct": spread, "min_7d_volume_usd": min_volume,
+    })
+    return signal, None
+
+
+async def _collect_watch_snapshots(events: list[dict], args: argparse.Namespace,
+                                   now_ts: int) -> dict[tuple[str, str], dict]:
+    """Fetch one live market snapshot per structurally uninvalidated pair."""
+    from src.exchanges.client import close_exchange_safely, create_exchange
+
+    pairs: dict[tuple[str, str], dict] = {}
+    for event in events:
+        if event.get("invalidated"):
+            continue
+        key = (str(event["database"]), str(event["table"]))
+        pairs.setdefault(key, {
+            "db": key[0], "table": key[1], "exchange": event["exchange"],
+            "symbol": event.get("ticker") or _ticker_from_table(event["table"]),
+            "last_close": event.get("last_close"),
+        })
+    if not pairs:
+        return {}
+
+    daily_pools: dict[str, asyncpg.Pool | None] = {}
+    for candidate in pairs.values():
+        daily_db = _daily_db_name(candidate["db"], args.timeframe)
+        candidate["daily_db"] = daily_db
+        if daily_db and daily_db not in daily_pools:
+            try:
+                daily_pools[daily_db] = await asyncpg.create_pool(
+                    user=settings.db_user, password=settings.db_password,
+                    host=settings.db_host, port=settings.db_port, database=daily_db,
+                    min_size=1, max_size=max(2, min(8, args.concurrency * 2)),
+                )
+            except Exception as exc:
+                print(f"⚠️ Не удалось открыть дневную БД {daily_db}: {exc}", file=sys.stderr)
+                daily_pools[daily_db] = None
+
+    clients: dict[str, Any] = {}
+    try:
+        venue_ids = {
+            candidate["exchange"]: settings.exchange_map_1d.get(
+                candidate["exchange"], candidate["exchange"]
+            ) for candidate in pairs.values()
+        }
+        for exchange, ccxt_id in venue_ids.items():
+            client = None
+            try:
+                client = create_exchange(ccxt_id)
+                await client.load_markets()
+                clients[exchange] = client
+            except Exception as exc:
+                print(f"⚠️ Не удалось получить markets для {exchange}: {exc}", file=sys.stderr)
+                if client is not None:
+                    await close_exchange_safely(client, exchange)
+
+        semaphore = asyncio.Semaphore(max(1, min(args.concurrency, 8)))
+        snapshots: dict[tuple[str, str], dict] = {}
+
+        async def one(key, candidate):
+            async with semaphore:
+                daily_pool = daily_pools.get(candidate.get("daily_db"))
+                daily_metrics = (
+                    await _daily_health_metrics(
+                        daily_pool, candidate["table"], now_ts, args.watch_atr_period
+                    ) if daily_pool else {"min_7d_volume_usd": None, "atr_1d": None}
+                )
+                client = clients.get(candidate["exchange"])
+                if client:
+                    try:
+                        snapshot = await _fetch_watch_market_snapshot(
+                            client, candidate["symbol"], float(candidate.get("last_close") or 0),
+                            daily_metrics,
+                        )
+                    except Exception as exc:
+                        print(f"⚠️ {candidate['exchange']} {candidate['symbol']}: {exc}", file=sys.stderr)
+                        snapshot = {
+                            "price": _finite_positive(candidate.get("last_close")),
+                            "price_source": "DB", "depth_usd": None,
+                            "trades_per_min": None, "is_barcode": False,
+                            "spread_atr_pct": None,
+                            "min_7d_volume_usd": daily_metrics.get("min_7d_volume_usd"),
+                        }
+                else:
+                    snapshot = {
+                        "price": _finite_positive(candidate.get("last_close")),
+                        "price_source": "DB", "depth_usd": None,
+                        "trades_per_min": None, "is_barcode": False,
+                        "spread_atr_pct": None,
+                        "min_7d_volume_usd": daily_metrics.get("min_7d_volume_usd"),
+                    }
+                snapshots[key] = snapshot
+
+        await asyncio.gather(*(one(key, candidate) for key, candidate in pairs.items()))
+        return snapshots
+    finally:
+        for client in clients.values():
+            await close_exchange_safely(client)
+        for pool in daily_pools.values():
+            if pool:
+                await pool.close()
+
+
+async def _watch(args: argparse.Namespace) -> None:
+    if args.no_save_to_db:
+        raise SystemExit("--watch требует сохранения каждого прохода в БД")
+    if args.import_csv:
+        raise SystemExit("--watch нельзя сочетать с --import-csv")
+    if args.interval_minutes <= 0:
+        raise SystemExit("--interval-minutes должен быть больше нуля")
+    if args.timeframe != "15m":
+        raise SystemExit("--watch сканирует только 15m-данные; уберите --timeframe 1d")
+    if args.watch_atr_period < 1:
+        raise SystemExit("--watch-atr-period должен быть не меньше 1")
+
+    interval = args.interval_minutes * 60.0
+    print(
+        f"Текущий сканер запущен: проход раз в {args.interval_minutes:g} мин; "
+        f"цена в диапазоне C-B, RR ≥{args.rr:g}:1, ликвидность по красным порогам Dashboard. "
+        "Остановка: Ctrl+C.", flush=True,
+    )
+    while True:
+        cycle_started = time.monotonic()
+        now_ts = int(time.time())
+        print(f"\n=== Watch-проход {_fmt_time(now_ts)} ===", flush=True)
+        try:
+            events = await _scan(args)
+            snapshots = await _collect_watch_snapshots(events, args, now_ts)
+            accepted: list[dict[str, Any]] = []
+            rejected: dict[str, int] = {}
+            for event in events:
+                key = (str(event["database"]), str(event["table"]))
+                signal, reason = _screen_current_signal(
+                    event, snapshots.get(key, {}), args, now_ts
+                )
+                if signal:
+                    accepted.append(signal)
+                elif reason:
+                    rejected[reason] = rejected.get(reason, 0) + 1
+            accepted.sort(key=lambda item: (item["exchange"], item["base"], item["entry_ts"]))
+            run_id = await _save_setups_to_db(accepted, args, source="current_watch")
+            print(
+                f"Текущих сетапов: {len(accepted)}; прогон #{run_id} сохранён "
+                f"в {RESULTS_DB}. Отфильтровано: "
+                + (", ".join(f"{reason}: {count}" for reason, count in sorted(rejected.items()))
+                   or "нет"),
+                flush=True,
+            )
+            for signal in accepted:
+                print(
+                    f"{signal['base']:<14} {signal['exchange']:<8} {signal['market']:<5} "
+                    f"{signal['current_price_source']}={signal['entry']:.8g} "
+                    f"L={signal['pump_start']:.8g} A={signal['a_price']:.8g} "
+                    f"C={signal['c_price']:.8g} B={signal['b_price']:.8g} "
+                    f"stop={signal['stop']:.8g} RR={signal['rr']:.2f}:1 "
+                    f"Tape={signal['trades_per_min']:.1f}/min "
+                    f"Depth=${signal['depth_usd']:,.0f} "
+                    f"Spread={signal['spread_atr_pct']:.1f}% 7dMin=${signal['min_7d_volume_usd']:,.0f} "
+                    f"[{signal['database']}.{signal['table']}]",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"❌ Watch-проход завершился ошибкой: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+
+        wait = max(0.0, interval - (time.monotonic() - cycle_started))
+        if wait > 0:
+            print(f"Следующий проход через {wait / 60:.1f} мин.\n", flush=True)
+            await asyncio.sleep(wait)
+        else:
+            print("Проход занял не меньше интервала; следующий начинается сразу.\n", flush=True)
 
 
 async def _init_results_db() -> asyncpg.Pool:
@@ -452,6 +815,16 @@ async def _save_setups_to_db(events: list[dict[str, Any]], args: argparse.Namesp
         "pivot_width": args.pivot_bars, "setup_days": args.setup_days,
         "active_hours": args.active_hours,
     }
+    if args.watch:
+        config.update({
+            "watch_mode": True,
+            "watch_interval_minutes": args.interval_minutes,
+            "watch_atr_period": args.watch_atr_period,
+            "watch_min_tape": args.watch_min_tape,
+            "watch_min_depth_usd": args.watch_min_depth_usd,
+            "watch_max_spread_atr_pct": args.watch_max_spread_atr_pct,
+            "watch_min_7d_volume_usd": args.watch_min_7d_volume_usd,
+        })
     event_columns = [
         "run_id", "event_no", "status", "invalidated", "base", "exchange", "market",
         "ticker", "source_db", "source_table", "timeframe", "start_ts", "a_ts", "c_ts",
@@ -522,6 +895,13 @@ def _read_setups_csv(path: str) -> list[dict[str, Any]]:
 
 def main() -> int:
     args = _args()
+    if args.watch:
+        try:
+            asyncio.run(_watch(args))
+        except KeyboardInterrupt:
+            print("Watch остановлен пользователем.", flush=True)
+        return 0
+
     imported = bool(args.import_csv)
     if imported:
         if args.no_save_to_db:

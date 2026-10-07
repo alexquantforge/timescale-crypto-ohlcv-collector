@@ -221,7 +221,7 @@ timescale-crypto-ohlcv-collector/
    ```bash
    poetry run python short_setup_scanner.py
    ```
-   Defaults: 15-minute candles, a rise of at least 50% in at most 3 days, an
+   Defaults: 15-minute candles, a rise greater than 50% in at most 3 days, an
    A-to-C correction no deeper than 30% of the preceding rise, then a lower
    high B with no intervening wick retesting A, followed by a confirmed 1% decline.
    The proposed stop is 0.5% above
@@ -234,6 +234,20 @@ timescale-crypto-ohlcv-collector/
    `--exchanges bybit,okx`. This is a screening tool; it does not place trades.
    To migrate an existing CSV without rescanning, run
    `poetry run python short_setup_scanner.py --import-csv short_setups.csv`.
+
+   To continuously print and save the **currently actionable** setups once an hour:
+   ```bash
+   poetry run python short_setup_scanner.py --watch --interval-minutes 60 --days 1
+   ```
+   Watch mode evaluates the latest live ticker (falling back to the last 15m DB close),
+   uses inclusive `C ≤ price ≤ B` bounds and recalculates reward/risk from that price
+   with the stop above B. It excludes red Dashboard health chips: tape below 3 trades/min
+   or barcode, depth at or below $1,000 within ±1%, spread at or above 15% of 1D ATR,
+   and minimum 7d dollar volume at or below $100,000. Each completed pass prints the
+   full matching list and stores that run in `pump_scanner_results`; later passes never
+   overlap an unfinished one. No CSV is used in watch mode. The `--days 1` option limits
+   the L→A pump duration to one day, not the amount of historical data scanned.
+
    The dashboard's **🎯 Short Setups** tab reads the stored DB run, filters the results,
    and opens event-centred 15m and 1D charts with A/C/B, entry, stop and target
    markers. Choose a setup and explicitly load its charts; the current quote

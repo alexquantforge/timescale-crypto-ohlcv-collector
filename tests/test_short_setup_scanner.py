@@ -1,8 +1,12 @@
 import csv
+from types import SimpleNamespace
 
 import numpy as np
 
-from short_setup_scanner import _fmt_duration, _read_setups_csv, _ticker_from_table, find_setups
+from short_setup_scanner import (
+    _IDENT, _fmt_duration, _read_setups_csv, _screen_current_signal,
+    _ticker_from_table, find_setups,
+)
 
 
 def test_formats_eta_duration():
@@ -43,9 +47,9 @@ def test_reads_existing_csv_for_one_time_database_migration(tmp_path):
 
 
 def candles(c_low=136.0):
-    # L=100 -> A=150 (+50%); C=136 is a 28% retracement of the 50-point
-    # impulse; B=147 is a lower high. The close at index 11 confirms a drop.
-    highs = np.array([110, 112, 120, 140, 150, 143, 140, 141, 142, 143, 147, 146, 145], dtype=float)
+    # L=100 -> A=151 (>50%); C=136 retraces less than 30% of the impulse;
+    # B=147 is a lower high. The close at index 11 confirms a drop.
+    highs = np.array([110, 112, 120, 140, 151, 143, 140, 141, 142, 143, 147, 146, 145], dtype=float)
     lows = np.array([108, 100, 110, 130, 140, 137, c_low, 137, 139, 140, 143, 145.5, 144], dtype=float)
     closes = np.array([109, 110, 115, 135, 145, 140, 138, 139, 140, 142, 145, 145.8, 144.5], dtype=float)
     ts = np.arange(len(highs), dtype=np.int64) * 900
@@ -63,6 +67,13 @@ def test_finds_lower_high_setup_with_two_to_one_rr():
     assert event["rr"] >= 2
     assert event["target"] == event["c_price"]
     assert event["stop"] > event["b_price"]
+
+
+def test_pump_must_be_strictly_greater_than_50_percent():
+    ts, lows, highs, closes = candles()
+    highs[4] = 150.0  # Exactly +50% from L=100 is not a qualifying pump.
+    found = find_setups(ts, lows, highs, closes, bar_seconds=900, pivot_width=1)
+    assert found == []
 
 
 def test_rejects_lower_local_a_if_prior_high_in_pump_leg_is_higher():
@@ -90,3 +101,69 @@ def test_rejects_setup_when_reward_risk_is_not_met():
     found = find_setups(ts, lows, highs, closes, bar_seconds=900,
                         pivot_width=1, stop_buffer_pct=15.0)
     assert found == []
+
+
+def test_perpetual_table_names_with_colon_are_scannable():
+    assert _IDENT.fullmatch("btc_usdt:usdt_on_bybit")
+
+
+def test_current_watch_keeps_live_setup_inside_c_b_with_good_health():
+    args = SimpleNamespace(
+        stop_buffer=0.5, rr=2.0, watch_min_tape=3.0,
+        watch_min_depth_usd=1000.0, watch_max_spread_atr_pct=15.0,
+        watch_min_7d_volume_usd=100_000.0,
+    )
+    event = {
+        "invalidated": False, "a_price": 150.0, "c_price": 136.0,
+        "b_price": 147.0, "entry": 143.0, "rr": 2.0,
+    }
+    snapshot = {
+        "price": 146.0, "price_source": "LIVE", "trades_per_min": 4.0,
+        "is_barcode": False, "depth_usd": 50_000.0,
+        "spread_atr_pct": 8.0, "min_7d_volume_usd": 250_000.0,
+    }
+    signal, reason = _screen_current_signal(event, snapshot, args, now_ts=123)
+    assert reason is None
+    assert signal["status"] == "CURRENT"
+    assert signal["entry"] == 146.0
+    assert signal["entry_ts"] == 123
+    assert signal["rr"] >= 2.0
+
+
+def test_current_watch_excludes_dead_tape_or_price_outside_c_b():
+    args = SimpleNamespace(
+        stop_buffer=0.5, rr=2.0, watch_min_tape=3.0,
+        watch_min_depth_usd=1000.0, watch_max_spread_atr_pct=15.0,
+        watch_min_7d_volume_usd=100_000.0,
+    )
+    event = {"invalidated": False, "a_price": 150.0, "c_price": 136.0, "b_price": 147.0}
+    healthy = {
+        "price": 146.0, "price_source": "LIVE", "trades_per_min": 4.0,
+        "is_barcode": False, "depth_usd": 50_000.0,
+        "spread_atr_pct": 8.0, "min_7d_volume_usd": 250_000.0,
+    }
+    dead = dict(healthy, trades_per_min=0.0)
+    assert _screen_current_signal(event, dead, args, now_ts=123)[0] is None
+    assert _screen_current_signal(event, dict(healthy, price=150.0), args, now_ts=123)[0] is None
+
+
+def test_current_watch_applies_each_red_health_threshold():
+    args = SimpleNamespace(
+        stop_buffer=0.5, rr=2.0, watch_min_tape=3.0,
+        watch_min_depth_usd=1000.0, watch_max_spread_atr_pct=15.0,
+        watch_min_7d_volume_usd=100_000.0,
+    )
+    event = {"invalidated": False, "a_price": 150.0, "c_price": 136.0, "b_price": 147.0}
+    healthy = {
+        "price": 146.0, "price_source": "LIVE", "trades_per_min": 4.0,
+        "is_barcode": False, "depth_usd": 50_000.0,
+        "spread_atr_pct": 8.0, "min_7d_volume_usd": 250_000.0,
+    }
+    red_snapshots = (
+        dict(healthy, is_barcode=True),
+        dict(healthy, depth_usd=1000.0),
+        dict(healthy, spread_atr_pct=15.0),
+        dict(healthy, min_7d_volume_usd=100_000.0),
+    )
+    for snapshot in red_snapshots:
+        assert _screen_current_signal(event, snapshot, args, now_ts=123)[0] is None
