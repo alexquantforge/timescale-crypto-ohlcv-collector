@@ -237,11 +237,12 @@ timescale-crypto-ohlcv-collector/
 
    To continuously print and save the **currently actionable** setups once an hour:
    ```bash
-   poetry run python short_setup_scanner.py --watch --interval-minutes 60 --days 1
+   poetry run python short_setup_scanner.py --watch --interval-minutes 60 --days 1 --pump-pct 50
    ```
    Watch mode evaluates the latest live ticker (falling back to the last 15m DB close),
-   uses inclusive `C ≤ price ≤ B` bounds and recalculates reward/risk from that price
-   with the stop above B. It excludes red Dashboard health chips: tape below 3 trades/min
+   uses inclusive `C ≤ price ≤ B` bounds and recalculates the current RR for information,
+   but does not filter the setup by that live RR; the scanner's existing `--rr` threshold
+   still applies to the original signal. It excludes red Dashboard health chips: tape below 3 trades/min
    or barcode, depth at or below $1,000 within ±1%, spread at or above 15% of 1D ATR,
    and minimum 7d dollar volume at or below $100,000. Each completed pass prints the
    full matching list and stores that run in `pump_scanner_results`; later passes never

@@ -526,11 +526,12 @@ def _screen_current_signal(event: dict, snapshot: dict, args: argparse.Namespace
 
     stop = b_price * (1.0 + args.stop_buffer / 100.0)
     risk, reward = stop - price, price - c_price
-    if risk <= 0 or reward <= 0:
-        return None, "non-positive reward/risk"
+    if risk <= 0:
+        return None, "non-positive risk"
+    # Keep the current RR as an informational value on the saved snapshot, but
+    # do not invalidate a live setup when price movement has reduced it below
+    # the historical signal's --rr threshold.
     current_rr = reward / risk
-    if current_rr < args.rr:
-        return None, "current RR below minimum"
 
     tape = snapshot.get("trades_per_min")
     if tape is None or tape < args.watch_min_tape or snapshot.get("is_barcode"):
@@ -672,7 +673,7 @@ async def _watch(args: argparse.Namespace) -> None:
     interval = args.interval_minutes * 60.0
     print(
         f"Текущий сканер запущен: проход раз в {args.interval_minutes:g} мин; "
-        f"цена в диапазоне C-B, RR ≥{args.rr:g}:1, ликвидность по красным порогам Dashboard. "
+        f"цена в диапазоне C-B, исходный RR ≥{args.rr:g}:1, ликвидность по красным порогам Dashboard. "
         "Остановка: Ctrl+C.", flush=True,
     )
     while True:
@@ -708,7 +709,7 @@ async def _watch(args: argparse.Namespace) -> None:
                     f"{signal['current_price_source']}={signal['entry']:.8g} "
                     f"L={signal['pump_start']:.8g} A={signal['a_price']:.8g} "
                     f"C={signal['c_price']:.8g} B={signal['b_price']:.8g} "
-                    f"stop={signal['stop']:.8g} RR={signal['rr']:.2f}:1 "
+                    f"stop={signal['stop']:.8g} RR-now={signal['rr']:.2f}:1 "
                     f"Tape={signal['trades_per_min']:.1f}/min "
                     f"Depth=${signal['depth_usd']:,.0f} "
                     f"Spread={signal['spread_atr_pct']:.1f}% 7dMin=${signal['min_7d_volume_usd']:,.0f} "

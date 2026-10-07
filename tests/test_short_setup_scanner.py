@@ -118,16 +118,34 @@ def test_current_watch_keeps_live_setup_inside_c_b_with_good_health():
         "b_price": 147.0, "entry": 143.0, "rr": 2.0,
     }
     snapshot = {
-        "price": 146.0, "price_source": "LIVE", "trades_per_min": 4.0,
+        "price": 137.0, "price_source": "LIVE", "trades_per_min": 4.0,
         "is_barcode": False, "depth_usd": 50_000.0,
         "spread_atr_pct": 8.0, "min_7d_volume_usd": 250_000.0,
     }
     signal, reason = _screen_current_signal(event, snapshot, args, now_ts=123)
     assert reason is None
     assert signal["status"] == "CURRENT"
-    assert signal["entry"] == 146.0
+    assert signal["entry"] == 137.0
     assert signal["entry_ts"] == 123
-    assert signal["rr"] >= 2.0
+    assert signal["rr"] < 2.0  # Current RR is informational, not a watch filter.
+
+
+def test_current_watch_keeps_inclusive_c_boundary_without_live_rr_filter():
+    args = SimpleNamespace(
+        stop_buffer=0.5, rr=2.0, watch_min_tape=3.0,
+        watch_min_depth_usd=1000.0, watch_max_spread_atr_pct=15.0,
+        watch_min_7d_volume_usd=100_000.0,
+    )
+    event = {"invalidated": False, "a_price": 150.0, "c_price": 136.0, "b_price": 147.0}
+    snapshot = {
+        "price": 136.0, "price_source": "LIVE", "trades_per_min": 4.0,
+        "is_barcode": False, "depth_usd": 50_000.0,
+        "spread_atr_pct": 8.0, "min_7d_volume_usd": 250_000.0,
+    }
+    signal, reason = _screen_current_signal(event, snapshot, args, now_ts=123)
+    assert reason is None
+    assert signal["entry"] == event["c_price"]
+    assert signal["rr"] == 0.0
 
 
 def test_current_watch_excludes_dead_tape_or_price_outside_c_b():
