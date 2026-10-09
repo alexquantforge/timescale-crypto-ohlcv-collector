@@ -253,7 +253,17 @@ timescale-crypto-ohlcv-collector/
    To print the pair, first-touch time, stop/C levels, and first-touch candle high/low for each
    resolved pattern, add `--watch-show-invalidated-details`. Same-candle touches cannot
    be ordered from OHLC data alone. No CSV is used in watch mode. The `--days 1` option limits
-   the L→A pump duration to one day, not the amount of historical data scanned.
+   the L→A pump duration to one day, not the amount of historical data scanned. `--symbols`
+   can narrow a scan to comma-separated base tickers, CCXT symbols, or compact pairs. Use
+   `--watch-once` with `--watch` to run exactly one pass without waiting for the next hourly cycle.
+
+   To check only JCT perpetuals on Bybit with a 40% A→C retrace allowance, without changing
+   the default 30% threshold, run this targeted one-pass watch:
+   ```bash
+   poetry run python short_setup_scanner.py --watch --watch-once --symbols JCT --exchanges bybit --no-spot --days 1 --pump-pct 50 --max-retrace 40 --watch-show-invalidated-details
+   ```
+   This still applies the configured original-signal `--rr` threshold and all watch health/price
+   filters; `--days 1` only limits the L→A pump duration.
 
    The dashboard's **🎯 Short Setups** tab reads the stored DB run, filters the results,
    and opens event-centred 15m and 1D charts with A/C/B, entry, stop and target

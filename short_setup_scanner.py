@@ -56,6 +56,32 @@ def _parse_table(table: str) -> tuple[str, str, str]:
     return base, exchange, market_type
 
 
+def _matches_requested_symbol(table: str, requested_symbols: set[str]) -> bool:
+    """Match a table by base (JCT), CCXT symbol, or compact pair (JCTUSDT)."""
+    requested_symbols = {
+        symbol.strip().upper() for symbol in requested_symbols if symbol.strip()
+    }
+    if not requested_symbols:
+        return True
+    base, _, _ = _parse_table(table)
+    ticker = _ticker_from_table(table)
+    spot_symbol = ticker.split(":", 1)[0]
+    compact_symbols = {
+        symbol.replace("/", "").replace(":", "")
+        for symbol in requested_symbols
+    }
+    table_compact = {
+        ticker.replace("/", "").replace(":", ""),
+        spot_symbol.replace("/", "").replace(":", ""),
+    }
+    return (
+        base.upper() in requested_symbols
+        or ticker.upper() in requested_symbols
+        or spot_symbol.upper() in requested_symbols
+        or bool(table_compact & compact_symbols)
+    )
+
+
 def _pivots(values: np.ndarray, width: int, high: bool) -> np.ndarray:
     """Return strict local extrema, confirmed only after `width` later bars."""
     n = len(values)
@@ -312,6 +338,8 @@ def _args() -> argparse.Namespace:
     p.add_argument("--active-hours", type=float, default=6.0,
                    help="Считать сигнал текущим, если он моложе N часов")
     p.add_argument("--exchanges", default="", help="Список бирж через запятую, пусто = все")
+    p.add_argument("--symbols", default="",
+                   help="Ограничить тикерами/базами через запятую, например JCT или JCT/USDT:USDT")
     p.add_argument("--no-spot", action="store_true", help="Не сканировать spot")
     p.add_argument("--no-swap", action="store_true", help="Не сканировать perpetual swaps")
     p.add_argument("--concurrency", type=int, default=4)
@@ -323,6 +351,8 @@ def _args() -> argparse.Namespace:
                    help="Импортировать уже готовый CSV в базу без повторного сканирования")
     p.add_argument("--watch", action="store_true",
                    help="Непрерывно искать только текущие сетапы и печатать их каждый цикл")
+    p.add_argument("--watch-once", action="store_true",
+                   help="С --watch выполнить один проход и завершить (для быстрой проверки)")
     p.add_argument("--interval-minutes", type=float, default=60.0,
                    help="Интервал между стартами watch-проходов, минут")
     p.add_argument("--watch-atr-period", type=int, default=5,
@@ -344,6 +374,11 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
     dbs = _db_names(args.timeframe)
     bar_sec = 900 if args.timeframe == "15m" else 86400
     pools: dict[str, asyncpg.Pool] = {}
+    requested_symbols = {
+        symbol.strip().upper()
+        for symbol in args.symbols.split(",")
+        if symbol.strip()
+    }
     sem = asyncio.Semaphore(max(1, args.concurrency))
     try:
         for db in dbs:
@@ -365,6 +400,8 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
                 base, exchange, kind = _parse_table(table)
                 if args.exchanges and exchange not in {x.strip().lower() for x in args.exchanges.split(",")}:
                     continue
+                if not _matches_requested_symbol(table, requested_symbols):
+                    continue
                 if (kind == "spot" and args.no_spot) or (kind == "swap" and args.no_swap):
                     continue
                 if not _IDENT.fullmatch(table):
@@ -373,7 +410,11 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
         if args.limit_tables:
             tasks = tasks[:args.limit_tables]
         total_tables = len(tasks)
-        print(f"Сканирую {total_tables} таблиц, timeframe={args.timeframe}; критерии: "
+        symbol_scope = (
+            f"; тикеры: {','.join(sorted(requested_symbols))}"
+            if requested_symbols else ""
+        )
+        print(f"Сканирую {total_tables} таблиц, timeframe={args.timeframe}{symbol_scope}; критерии: "
               f"памп >{args.pump_pct:g}% за ≤{args.days:g} дн, A→C ≤{args.max_retrace:g}% роста, "
               f"RR ≥{args.rr:g}:1")
         scan_started = time.monotonic()
@@ -737,8 +778,12 @@ async def _watch(args: argparse.Namespace) -> None:
         raise SystemExit("--watch-atr-period должен быть не меньше 1")
 
     interval = args.interval_minutes * 60.0
+    schedule = (
+        "один проход"
+        if args.watch_once else f"проход раз в {args.interval_minutes:g} мин"
+    )
     print(
-        f"Текущий сканер запущен: проход раз в {args.interval_minutes:g} мин; "
+        f"Текущий сканер запущен: {schedule}; "
         f"цена в диапазоне C-B, исходный RR ≥{args.rr:g}:1, ликвидность по красным порогам Dashboard. "
         "Остановка: Ctrl+C.", flush=True,
     )
@@ -841,6 +886,9 @@ async def _watch(args: argparse.Namespace) -> None:
         except Exception as exc:
             print(f"❌ Watch-проход завершился ошибкой: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
 
+        if args.watch_once:
+            break
+
         wait = max(0.0, interval - (time.monotonic() - cycle_started))
         if wait > 0:
             print(f"Следующий проход через {wait / 60:.1f} мин.\n", flush=True)
@@ -930,6 +978,9 @@ async def _save_setups_to_db(events: list[dict[str, Any]], args: argparse.Namesp
     pool = await _init_results_db()
     config = {
         "source": source, "timeframe": args.timeframe,
+        "symbols": sorted({
+            symbol.strip().upper() for symbol in args.symbols.split(",") if symbol.strip()
+        }),
         "pump_pct": args.pump_pct, "pump_days": args.days,
         "max_retrace_pct": args.max_retrace, "min_ac_drop_pct": args.min_ac_drop,
         "min_cb_bounce_pct": args.min_cb_bounce,
@@ -944,6 +995,7 @@ async def _save_setups_to_db(events: list[dict[str, Any]], args: argparse.Namesp
     if args.watch:
         config.update({
             "watch_mode": True,
+            "watch_once": args.watch_once,
             "watch_interval_minutes": args.interval_minutes,
             "watch_atr_period": args.watch_atr_period,
             "watch_min_tape": args.watch_min_tape,
@@ -1021,6 +1073,8 @@ def _read_setups_csv(path: str) -> list[dict[str, Any]]:
 
 def main() -> int:
     args = _args()
+    if args.watch_once and not args.watch:
+        raise SystemExit("--watch-once можно использовать только вместе с --watch")
     if args.watch:
         try:
             asyncio.run(_watch(args))

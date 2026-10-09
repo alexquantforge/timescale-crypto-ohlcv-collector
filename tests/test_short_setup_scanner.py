@@ -1,11 +1,14 @@
+import asyncio
 import csv
+import sys
 from types import SimpleNamespace
 
 import numpy as np
 
 from short_setup_scanner import (
-    _IDENT, _classify_post_entry_resolution, _fmt_duration, _read_setups_csv,
-    _screen_current_signal, _ticker_from_table, find_setups,
+    _IDENT, _args, _classify_post_entry_resolution, _fmt_duration,
+    _matches_requested_symbol, _read_setups_csv, _screen_current_signal,
+    _ticker_from_table, _watch, find_setups,
 )
 
 
@@ -61,6 +64,54 @@ def test_leaves_setup_unresolved_when_neither_level_was_touched():
 
 def test_converts_database_table_name_to_exchange_symbol():
     assert _ticker_from_table("btc_usdt:usdt_on_bybit") == "BTC/USDT:USDT"
+
+
+def test_symbol_filter_matches_base_ccxt_and_compact_pair():
+    table = "jct_usdt:usdt_on_bybit"
+    assert _matches_requested_symbol(table, {"JCT"})
+    assert _matches_requested_symbol(table, {"JCT/USDT:USDT"})
+    assert _matches_requested_symbol(table, {"JCTUSDT"})
+    assert _matches_requested_symbol(table, set())
+    assert not _matches_requested_symbol(table, {"BTC"})
+
+
+def test_scanner_cli_accepts_targeted_retrace_and_one_shot_watch(monkeypatch):
+    monkeypatch.setattr(
+        sys, "argv",
+        ["short_setup_scanner.py", "--watch", "--watch-once", "--symbols", "JCT",
+         "--exchanges", "bybit", "--max-retrace", "40"],
+    )
+    args = _args()
+    assert args.watch is True
+    assert args.watch_once is True
+    assert args.symbols == "JCT"
+    assert args.max_retrace == 40.0
+
+
+def test_watch_once_runs_exactly_one_cycle(monkeypatch):
+    scan_calls = 0
+
+    async def fake_scan(_args):
+        nonlocal scan_calls
+        scan_calls += 1
+        return []
+
+    async def fake_snapshots(*_args):
+        return {}
+
+    async def fake_save(*_args, **_kwargs):
+        return 1
+
+    monkeypatch.setattr("short_setup_scanner._scan", fake_scan)
+    monkeypatch.setattr("short_setup_scanner._collect_watch_snapshots", fake_snapshots)
+    monkeypatch.setattr("short_setup_scanner._save_setups_to_db", fake_save)
+    args = SimpleNamespace(
+        no_save_to_db=False, import_csv="", interval_minutes=60.0,
+        timeframe="15m", watch_atr_period=5, watch_once=True,
+        rr=2.0, watch_show_invalidated_details=False,
+    )
+    asyncio.run(_watch(args))
+    assert scan_calls == 1
 
 
 def test_reads_existing_csv_for_one_time_database_migration(tmp_path):
