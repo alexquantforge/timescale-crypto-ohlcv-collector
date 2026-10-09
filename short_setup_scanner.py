@@ -209,6 +209,67 @@ def find_setups(
     return result
 
 
+_INVALIDATION_REASON_LABELS = {
+    "stop_first": "stop сработал раньше цели",
+    "target_first": "цель C достигнута раньше stop",
+    "both_same_candle": "stop и C задеты в одной свече; порядок внутри неё неизвестен",
+}
+
+
+def _classify_post_entry_resolution(
+    timestamps: np.ndarray,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    *,
+    stop: float,
+    target: float,
+) -> dict[str, Any]:
+    """Explain whether a setup's stop or target was first touched after entry.
+
+    With OHLC candles, if both thresholds occur in the same candle their
+    intrabar order cannot be recovered; that case is reported as ambiguous.
+    """
+    timestamps = np.asarray(timestamps)
+    highs = np.asarray(highs, dtype=float)
+    lows = np.asarray(lows, dtype=float)
+    n = min(len(timestamps), len(highs), len(lows))
+    timestamps, highs, lows = timestamps[:n], highs[:n], lows[:n]
+
+    stop_hits = np.flatnonzero(np.isfinite(highs) & (highs >= stop))
+    target_hits = np.flatnonzero(np.isfinite(lows) & (lows <= target))
+    first_stop = int(stop_hits[0]) if len(stop_hits) else None
+    first_target = int(target_hits[0]) if len(target_hits) else None
+
+    if first_stop is None and first_target is None:
+        reason = None
+        resolution_index = None
+    elif first_target is None or (first_stop is not None and first_stop < first_target):
+        reason = "stop_first"
+        resolution_index = first_stop
+    elif first_stop is None or first_target < first_stop:
+        reason = "target_first"
+        resolution_index = first_target
+    else:
+        reason = "both_same_candle"
+        resolution_index = first_stop
+
+    return {
+        "invalidated": reason is not None,
+        "invalidation_reason": reason,
+        "invalidation_ts": (
+            int(timestamps[resolution_index]) if resolution_index is not None else None
+        ),
+        "invalidation_high": (
+            float(highs[resolution_index]) if resolution_index is not None else None
+        ),
+        "invalidation_low": (
+            float(lows[resolution_index]) if resolution_index is not None else None
+        ),
+        "stop_hit_ts": int(timestamps[first_stop]) if first_stop is not None else None,
+        "target_hit_ts": int(timestamps[first_target]) if first_target is not None else None,
+    }
+
+
 def _fmt_duration(seconds: float) -> str:
     seconds = max(0, int(seconds))
     hours, remainder = divmod(seconds, 3600)
@@ -274,6 +335,8 @@ def _args() -> argparse.Namespace:
                    help="Максимальный спред как %% 1D ATR")
     p.add_argument("--watch-min-7d-volume-usd", type=float, default=100000.0,
                    help="Минимальный min(volume × low) за 7 закрытых дневных свечей")
+    p.add_argument("--watch-show-invalidated-details", action="store_true",
+                   help="В watch-режиме печатать пары и первую свечу касания stop/цели для уже завершённых сигналов")
     return p.parse_args()
 
 
@@ -340,12 +403,11 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
                         event["last_close"] = float(arr[-1, 3])
                         event["last_bar_ts"] = int(arr[-1, 0])
                         entry_i = int(np.searchsorted(arr[:, 0], event["entry_ts"], side="left"))
-                        later_highs = arr[entry_i + 1:, 2]
-                        later_lows = arr[entry_i + 1:, 1]
-                        event["invalidated"] = bool(
-                            np.any(later_highs >= event["stop"])
-                            or np.any(later_lows <= event["target"])
-                        )
+                        later_bars = arr[entry_i + 1:]
+                        event.update(_classify_post_entry_resolution(
+                            later_bars[:, 0], later_bars[:, 2], later_bars[:, 1],
+                            stop=float(event["stop"]), target=float(event["target"]),
+                        ))
                         event.update({"database": db, "table": table, "base": base,
                                       "exchange": exchange, "market": kind})
                     return found
@@ -514,7 +576,11 @@ def _screen_current_signal(event: dict, snapshot: dict, args: argparse.Namespace
                            now_ts: int) -> tuple[dict | None, str | None]:
     """Apply current-price, RR and the dashboard's red-chip exclusion rules."""
     if event.get("invalidated"):
-        return None, "already invalidated"
+        reason = event.get("invalidation_reason")
+        label = _INVALIDATION_REASON_LABELS.get(
+            reason, f"причина не записана ({reason or 'unknown'})"
+        )
+        return None, f"already invalidated: {label}"
     price = _finite_positive(snapshot.get("price"))
     c_price = _finite_positive(event.get("c_price"))
     b_price = _finite_positive(event.get("b_price"))
@@ -682,6 +748,51 @@ async def _watch(args: argparse.Namespace) -> None:
         print(f"\n=== Watch-проход {_fmt_time(now_ts)} ===", flush=True)
         try:
             events = await _scan(args)
+            resolution_counts: dict[str, int] = {}
+            for event in events:
+                if event.get("invalidated"):
+                    reason = event.get("invalidation_reason") or "unknown"
+                    resolution_counts[reason] = resolution_counts.get(reason, 0) + 1
+            resolved_count = sum(resolution_counts.values())
+            stop_touched_count = sum(event.get("stop_hit_ts") is not None for event in events)
+            target_touched_count = sum(event.get("target_hit_ts") is not None for event in events)
+            both_touched_count = sum(
+                event.get("stop_hit_ts") is not None and event.get("target_hit_ts") is not None
+                for event in events
+            )
+            resolution_summary = ", ".join(
+                f"{_INVALIDATION_REASON_LABELS.get(reason, reason)}: {count}"
+                for reason, count in sorted(resolution_counts.items())
+            ) or "нет"
+            print(
+                f"Кандидатов по паттерну: {len(events)}; уже разрешены после entry: "
+                f"{resolved_count}; ещё без касания уровней: {len(events) - resolved_count}.\n"
+                f"  Касались после entry: stop (high ≥ stop) — {stop_touched_count}; "
+                f"цель C (low ≤ C) — {target_touched_count}; оба уровня — {both_touched_count}.\n"
+                f"  Первое событие: {resolution_summary}.",
+                flush=True,
+            )
+            if args.watch_show_invalidated_details:
+                for event in events:
+                    if not event.get("invalidated"):
+                        continue
+                    reason = event.get("invalidation_reason") or "unknown"
+                    label = _INVALIDATION_REASON_LABELS.get(reason, reason)
+                    stop_ts = event.get("stop_hit_ts")
+                    target_ts = event.get("target_hit_ts")
+                    print(
+                        f"  RESOLVED {event['base']}/{event['exchange']} {event['market']} "
+                        f"{label}; first={_fmt_time(event['invalidation_ts'])}; "
+                        f"stop={event['stop']:.8g} first_stop_touch="
+                        f"{_fmt_time(stop_ts) if stop_ts is not None else 'нет'}; "
+                        f"C={event['target']:.8g} first_C_touch="
+                        f"{_fmt_time(target_ts) if target_ts is not None else 'нет'}; "
+                        f"first_candle_H/L={event['invalidation_high']:.8g}/"
+                        f"{event['invalidation_low']:.8g} "
+                        f"[{event['database']}.{event['table']}]",
+                        flush=True,
+                    )
+
             snapshots = await _collect_watch_snapshots(events, args, now_ts)
             accepted: list[dict[str, Any]] = []
             rejected: dict[str, int] = {}
@@ -692,13 +803,24 @@ async def _watch(args: argparse.Namespace) -> None:
                 )
                 if signal:
                     accepted.append(signal)
-                elif reason:
+                elif reason and not event.get("invalidated"):
                     rejected[reason] = rejected.get(reason, 0) + 1
             accepted.sort(key=lambda item: (item["exchange"], item["base"], item["entry_ts"]))
-            run_id = await _save_setups_to_db(accepted, args, source="current_watch")
+            diagnostics = {
+                "candidate_count": len(events),
+                "resolved_count": resolved_count,
+                "unresolved_count": len(events) - resolved_count,
+                "stop_touched_count": stop_touched_count,
+                "target_c_touched_count": target_touched_count,
+                "both_levels_touched_count": both_touched_count,
+                "first_touch_reason_counts": resolution_counts,
+            }
+            run_id = await _save_setups_to_db(
+                accepted, args, source="current_watch", diagnostics=diagnostics
+            )
             print(
                 f"Текущих сетапов: {len(accepted)}; прогон #{run_id} сохранён "
-                f"в {RESULTS_DB}. Отфильтровано: "
+                f"в {RESULTS_DB}. Отсеяно live-фильтрами (цена/ликвидность): "
                 + (", ".join(f"{reason}: {count}" for reason, count in sorted(rejected.items()))
                    or "нет"),
                 flush=True,
@@ -802,7 +924,8 @@ async def _init_results_db() -> asyncpg.Pool:
 
 
 async def _save_setups_to_db(events: list[dict[str, Any]], args: argparse.Namespace,
-                             source: str = "scan") -> int:
+                             source: str = "scan",
+                             diagnostics: dict[str, Any] | None = None) -> int:
     """Atomically save run metadata and all setup rows in pump_scanner_results."""
     pool = await _init_results_db()
     config = {
@@ -816,6 +939,8 @@ async def _save_setups_to_db(events: list[dict[str, Any]], args: argparse.Namesp
         "pivot_width": args.pivot_bars, "setup_days": args.setup_days,
         "active_hours": args.active_hours,
     }
+    if diagnostics is not None:
+        config["watch_resolution_diagnostics"] = diagnostics
     if args.watch:
         config.update({
             "watch_mode": True,

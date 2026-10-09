@@ -246,7 +246,13 @@ timescale-crypto-ohlcv-collector/
    or barcode, depth at or below $1,000 within ±1%, spread at or above 15% of 1D ATR,
    and minimum 7d dollar volume at or below $100,000. Each completed pass prints the
    full matching list and stores that run in `pump_scanner_results`; later passes never
-   overlap an unfinished one. No CSV is used in watch mode. The `--days 1` option limits
+   overlap an unfinished one. Each pass also reports the number of detected patterns already
+   resolved after entry, split into stop-first, target-C-first, and same-15m-candle ambiguous
+   outcomes; aggregate counts are also kept in the run's `config` JSON in `short_setup_runs`
+   (query with `SELECT run_id, config->'watch_resolution_diagnostics' FROM short_setup_runs ORDER BY run_id DESC LIMIT 10;`).
+   To print the pair, first-touch time, stop/C levels, and first-touch candle high/low for each
+   resolved pattern, add `--watch-show-invalidated-details`. Same-candle touches cannot
+   be ordered from OHLC data alone. No CSV is used in watch mode. The `--days 1` option limits
    the L→A pump duration to one day, not the amount of historical data scanned.
 
    The dashboard's **🎯 Short Setups** tab reads the stored DB run, filters the results,

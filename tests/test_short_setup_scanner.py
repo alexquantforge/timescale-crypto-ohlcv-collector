@@ -4,14 +4,59 @@ from types import SimpleNamespace
 import numpy as np
 
 from short_setup_scanner import (
-    _IDENT, _fmt_duration, _read_setups_csv, _screen_current_signal,
-    _ticker_from_table, find_setups,
+    _IDENT, _classify_post_entry_resolution, _fmt_duration, _read_setups_csv,
+    _screen_current_signal, _ticker_from_table, find_setups,
 )
 
 
 def test_formats_eta_duration():
     assert _fmt_duration(65) == "1м 05с"
     assert _fmt_duration(3661) == "1ч 01м"
+
+
+def test_classifies_stop_as_first_resolution():
+    result = _classify_post_entry_resolution(
+        np.array([900, 1800, 2700]),
+        np.array([111.0, 108.0, 109.0]),
+        np.array([95.0, 89.0, 95.0]),
+        stop=110.0, target=90.0,
+    )
+    assert result["invalidated"] is True
+    assert result["invalidation_reason"] == "stop_first"
+    assert result["invalidation_ts"] == 900
+    assert result["stop_hit_ts"] == 900
+    assert result["target_hit_ts"] == 1800
+
+
+def test_classifies_target_as_first_resolution():
+    result = _classify_post_entry_resolution(
+        np.array([900, 1800]),
+        np.array([108.0, 111.0]),
+        np.array([89.0, 95.0]),
+        stop=110.0, target=90.0,
+    )
+    assert result["invalidation_reason"] == "target_first"
+    assert result["invalidation_ts"] == 900
+    assert result["target_hit_ts"] == 900
+    assert result["stop_hit_ts"] == 1800
+
+
+def test_marks_same_candle_stop_and_target_touch_as_ambiguous():
+    result = _classify_post_entry_resolution(
+        np.array([900]), np.array([111.0]), np.array([89.0]),
+        stop=110.0, target=90.0,
+    )
+    assert result["invalidation_reason"] == "both_same_candle"
+    assert result["invalidation_ts"] == 900
+
+
+def test_leaves_setup_unresolved_when_neither_level_was_touched():
+    result = _classify_post_entry_resolution(
+        np.array([900, 1800]), np.array([108.0, 109.0]), np.array([95.0, 94.0]),
+        stop=110.0, target=90.0,
+    )
+    assert result["invalidated"] is False
+    assert result["invalidation_reason"] is None
 
 
 def test_converts_database_table_name_to_exchange_symbol():
@@ -105,6 +150,18 @@ def test_rejects_setup_when_reward_risk_is_not_met():
 
 def test_perpetual_table_names_with_colon_are_scannable():
     assert _IDENT.fullmatch("btc_usdt:usdt_on_bybit")
+
+
+def test_current_watch_reports_why_a_pattern_was_already_invalidated():
+    args = SimpleNamespace(
+        stop_buffer=0.5, rr=2.0, watch_min_tape=3.0,
+        watch_min_depth_usd=1000.0, watch_max_spread_atr_pct=15.0,
+        watch_min_7d_volume_usd=100_000.0,
+    )
+    event = {"invalidated": True, "invalidation_reason": "stop_first"}
+    signal, reason = _screen_current_signal(event, {}, args, now_ts=123)
+    assert signal is None
+    assert reason == "already invalidated: stop сработал раньше цели"
 
 
 def test_current_watch_keeps_live_setup_inside_c_b_with_good_health():
