@@ -7,8 +7,9 @@ import numpy as np
 
 from short_setup_scanner import (
     _IDENT, _args, _classify_post_entry_resolution, _fmt_duration,
-    _matches_requested_symbol, _read_setups_csv, _screen_current_signal,
-    _ticker_from_table, _watch, find_setups,
+    _matches_requested_symbol, _print_symbol_scan_diagnostics,
+    _print_watch_filter_diagnostics, _read_setups_csv,
+    _screen_current_signal, _ticker_from_table, _watch, find_setups,
 )
 
 
@@ -192,6 +193,37 @@ def test_rejects_a_to_c_retracement_over_30_percent_of_impulse():
     assert found == []
 
 
+def test_symbol_diagnostics_explain_retrace_rejection(capsys):
+    ts, lows, highs, closes = candles(c_low=130.0)
+    diagnostics = {}
+    found = find_setups(
+        ts, lows, highs, closes, bar_seconds=900, pump_pct=50,
+        pump_days=1, max_retrace=40, pivot_width=1, diagnostics=diagnostics,
+        diagnostic_since_ts=0,
+    )
+    assert found == []
+    assert diagnostics["pump_passes_in_window"] == 1
+    assert diagnostics["rejection_counts"]["a_to_c_filter_failed"] == 1
+    record = diagnostics["records"][0]
+    assert record["pump_retrace_pct"] > 40
+    assert record["failed_checks"] == ["max_retrace"]
+
+    _print_symbol_scan_diagnostics(
+        "ohlcv_15m", "test_usdt_on_bybit", diagnostics,
+        SimpleNamespace(
+            max_retrace=40, pump_pct=50, days=1, min_ac_drop=5,
+            lower_high_pct=0, min_cb_bounce=2, confirm_drop=1, stop_buffer=0.5,
+            rr=2, setup_days=10, pivot_bars=1,
+        ),
+        found,
+    )
+    output = capsys.readouterr().out
+    assert "L→A = 51.00%" in output
+    assert "A→C откат от L→A импульса = 41.18%" in output
+    assert "Первый блокер" in output
+    assert "max_retrace" in output
+
+
 def test_rejects_setup_when_reward_risk_is_not_met():
     ts, lows, highs, closes = candles()
     found = find_setups(ts, lows, highs, closes, bar_seconds=900,
@@ -201,6 +233,29 @@ def test_rejects_setup_when_reward_risk_is_not_met():
 
 def test_perpetual_table_names_with_colon_are_scannable():
     assert _IDENT.fullmatch("btc_usdt:usdt_on_bybit")
+
+
+def test_targeted_watch_prints_live_filter_values_and_thresholds(capsys):
+    args = SimpleNamespace(
+        watch_min_tape=3.0, watch_min_depth_usd=1000.0,
+        watch_max_spread_atr_pct=15.0, watch_min_7d_volume_usd=100_000.0,
+    )
+    event = {
+        "base": "LUMIA", "exchange": "bybit", "market": "swap",
+        "c_price": 0.104, "b_price": 0.116,
+    }
+    snapshot = {
+        "price": 0.112, "price_source": "LIVE", "trades_per_min": 2.0,
+        "is_barcode": False, "depth_usd": 500.0,
+        "spread_atr_pct": 20.0, "min_7d_volume_usd": 50_000.0,
+    }
+    _print_watch_filter_diagnostics(event, snapshot, args, "dead/insufficient tape")
+    output = capsys.readouterr().out
+    assert "Tape=2/мин (нужно ≥3/мин)" in output
+    assert "Depth ±1%=$500" in output
+    assert "Spread/1D ATR=20%" in output
+    assert "Минимальный 7d $volume=$50,000" in output
+    assert output.count("НЕ ПРОЙДЕНО") == 4
 
 
 def test_current_watch_reports_why_a_pattern_was_already_invalidated():

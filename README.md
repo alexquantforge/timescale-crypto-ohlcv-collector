@@ -254,8 +254,12 @@ timescale-crypto-ohlcv-collector/
    resolved pattern, add `--watch-show-invalidated-details`. Same-candle touches cannot
    be ordered from OHLC data alone. No CSV is used in watch mode. The `--days 1` option limits
    the L→A pump duration to one day, not the amount of historical data scanned. `--symbols`
-   can narrow a scan to comma-separated base tickers, CCXT symbols, or compact pairs. Use
-   `--watch-once` with `--watch` to run exactly one pass without waiting for the next hourly cycle.
+   can narrow a scan to comma-separated base tickers, CCXT symbols, or compact pairs. When a symbol
+   filter is supplied, the scanner also prints a per-table diagnostic for recent A candidates:
+   measured L→A pump, A→C retracement formula/value, subsequent B/entry/RR checks, and the first
+   rejection reason. The diagnostic details the latest 30 days (or the configured setup window if
+   longer); setup discovery still scans the full table history. Use `--watch-once` with `--watch`
+   to run exactly one pass without waiting for the next hourly cycle.
 
    To check only JCT perpetuals on Bybit with a 40% A→C retrace allowance, without changing
    the default 30% threshold, run this targeted one-pass watch:

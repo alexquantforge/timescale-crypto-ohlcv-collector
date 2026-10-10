@@ -117,14 +117,41 @@ def find_setups(
     min_rr: float = 2.0,
     pivot_width: int = 2,
     setup_days: float = 10.0,
+    diagnostics: dict[str, Any] | None = None,
+    diagnostic_since_ts: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Pure pattern detector; values are OHLC candle prices, timestamps in seconds.
+    """Detect setups and optionally explain recent candidate rejections.
 
-    max_retrace is the fraction of the *preceding L-to-A pump leg* allowed to
-    be given back at C. Example: L=100, A=150, max_retrace=30 -> C >= 135.
+    Timestamps are seconds. ``max_retrace`` is the fraction of the preceding
+    L-to-A pump leg allowed to be given back at C: L=100, A=150, max=30 means
+    C must be at least 135. Diagnostics do not change the detector's decisions.
     """
     n = min(len(ts), len(lows), len(highs), len(closes))
+    if diagnostics is not None:
+        diagnostics.clear()
+        diagnostics.update({
+            "bar_count": n,
+            "first_ts": int(ts[0]) if n else None,
+            "last_ts": int(ts[n - 1]) if n else None,
+            "window_start_ts": diagnostic_since_ts,
+            "high_pivots_total": 0,
+            "low_pivots_total": 0,
+            "latest_high_pivot_ts": None,
+            "latest_high_pivot_price": None,
+            "a_pivots_in_window": 0,
+            "pump_passes_in_window": 0,
+            "rejection_counts": {},
+            "records": [],
+            "records_truncated": False,
+            "early_reason": None,
+            "setups_found": 0,
+        })
     if n < max(2 * pivot_width + 3, 4):
+        if diagnostics is not None:
+            diagnostics["early_reason"] = (
+                f"Недостаточно свечей: {n}, требуется не менее "
+                f"{max(2 * pivot_width + 3, 4)} для pivot-bars={pivot_width}."
+            )
         return []
     ts, lows, highs, closes = ts[:n], lows[:n], highs[:n], closes[:n]
     if not (np.all(np.isfinite(lows)) and np.all(np.isfinite(highs))
@@ -132,11 +159,78 @@ def find_setups(
         valid = np.isfinite(lows) & np.isfinite(highs) & np.isfinite(closes)
         ts, lows, highs, closes = ts[valid], lows[valid], highs[valid], closes[valid]
         n = len(ts)
+        if diagnostics is not None:
+            diagnostics.update({
+                "bar_count": n,
+                "first_ts": int(ts[0]) if n else None,
+                "last_ts": int(ts[n - 1]) if n else None,
+            })
 
     high_pivots = _pivots(highs, pivot_width, True)
     low_pivots = _pivots(lows, pivot_width, False)
+    if diagnostics is not None:
+        diagnostics["high_pivots_total"] = len(high_pivots)
+        diagnostics["low_pivots_total"] = len(low_pivots)
+        if len(high_pivots):
+            latest_high_i = int(high_pivots[-1])
+            diagnostics["latest_high_pivot_ts"] = int(ts[latest_high_i])
+            diagnostics["latest_high_pivot_price"] = float(highs[latest_high_i])
+        diagnostics["a_pivots_in_window"] = sum(
+            diagnostic_since_ts is None or ts[int(i)] >= diagnostic_since_ts
+            for i in high_pivots
+        )
     if not len(high_pivots) or not len(low_pivots):
+        if diagnostics is not None:
+            missing = []
+            if not len(high_pivots):
+                missing.append("локальных максимумов A")
+            if not len(low_pivots):
+                missing.append("локальных минимумов C")
+            diagnostics["early_reason"] = (
+                "Не найдено подтверждённых pivot-точек: " + " и ".join(missing)
+                + f" (pivot-bars={pivot_width}; экстремуму нужны свечи с обеих сторон)."
+            )
         return []
+
+    def record_rejection(
+        ai: int,
+        reason: str,
+        stage_rank: int,
+        checks: list[str],
+        *,
+        li: int | None = None,
+        ci: int | None = None,
+        bi: int | None = None,
+        ei: int | None = None,
+        **extra: Any,
+    ) -> None:
+        if diagnostics is None:
+            return
+        if diagnostic_since_ts is not None and ts[int(ai)] < diagnostic_since_ts:
+            return
+        item: dict[str, Any] = {
+            "reason": reason,
+            "stage_rank": stage_rank,
+            "a_ts": int(ts[int(ai)]),
+            "a_price": float(highs[int(ai)]),
+            "checks": list(checks),
+        }
+        if li is not None:
+            item.update({"l_ts": int(ts[int(li)]), "l_price": float(lows[int(li)])})
+        if ci is not None:
+            item.update({"c_ts": int(ts[int(ci)]), "c_price": float(lows[int(ci)])})
+        if bi is not None:
+            item.update({"b_ts": int(ts[int(bi)]), "b_price": float(highs[int(bi)])})
+        if ei is not None:
+            item.update({"entry_ts": int(ts[int(ei)]), "entry": float(closes[int(ei)])})
+        item.update(extra)
+        counts = diagnostics["rejection_counts"]
+        counts[reason] = counts.get(reason, 0) + 1
+        records = diagnostics["records"]
+        if len(records) == 500:
+            records.pop(0)
+            diagnostics["records_truncated"] = True
+        records.append(item)
 
     pump_bars = max(1, int(pump_days * 86400 / bar_seconds))
     setup_bars = max(3, int(setup_days * 86400 / bar_seconds))
@@ -144,95 +238,522 @@ def find_setups(
     used_entry_indices: set[int] = set()
     low_pivot_set = set(map(int, low_pivots))
 
-    for ai in high_pivots:
+    for ai_value in high_pivots:
+        ai = int(ai_value)
+
         # L is the lowest observed price in the allowed pump lookback.
-        left = max(0, int(ai) - pump_bars)
+        left = max(0, ai - pump_bars)
         if left >= ai:
+            if diagnostics is not None:
+                record_rejection(
+                    ai, "insufficient_pre_a_history", 0,
+                    [f"Для A={highs[ai]:.8g} недостаточно свечей слева, чтобы выбрать L."],
+                )
             continue
         li = left + int(np.argmin(lows[left:ai]))
-        # A is the peak of the complete L→A impulse, not just a local high.
-        # Reject a later, lower pivot if an earlier wick after L reached higher.
-        if np.max(highs[li:int(ai) + 1]) > highs[ai]:
-            continue
         leg = highs[ai] - lows[li]
-        if lows[li] <= 0 or leg / lows[li] * 100.0 <= pump_pct:
+        if np.max(highs[li:ai + 1]) > highs[ai]:
+            if diagnostics is not None:
+                prior_i = li + int(np.argmax(highs[li:ai + 1]))
+                record_rejection(
+                    ai, "higher_wick_before_a", 0,
+                    [f"L={lows[li]:.8g} → A={highs[ai]:.8g}; до A был high "
+                     f"{highs[prior_i]:.8g} в {_fmt_time(int(ts[prior_i]))}, выше выбранного A."],
+                    li=li, prior_high=float(highs[prior_i]), prior_high_ts=int(ts[prior_i]),
+                )
             continue
-        if ts[ai] - ts[li] > pump_days * 86400:
+        if lows[li] <= 0 or leg <= 0:
+            if diagnostics is not None:
+                record_rejection(
+                    ai, "non_positive_pump_leg", 0,
+                    [f"Некорректная импульсная нога: L={lows[li]:.8g}, A={highs[ai]:.8g}."],
+                    li=li,
+                )
             continue
+        actual_pump_pct = leg / lows[li] * 100.0
+        if actual_pump_pct <= pump_pct:
+            if diagnostics is not None:
+                record_rejection(
+                    ai, "pump_below_strict_threshold", 0,
+                    [f"L→A = {actual_pump_pct:.2f}%: требуется строго больше {pump_pct:g}% — НЕ ПРОЙДЕНО."],
+                    li=li, pump_pct=actual_pump_pct,
+                )
+            continue
+        pump_elapsed = int(ts[ai] - ts[li])
+        if pump_elapsed > pump_days * 86400:
+            if diagnostics is not None:
+                record_rejection(
+                    ai, "pump_took_too_long", 0,
+                    [f"L→A = {actual_pump_pct:.2f}% — проходит по росту, но занял "
+                     f"{pump_elapsed / 3600:.2f} ч; лимит {pump_days:g} дн — НЕ ПРОЙДЕНО."],
+                    li=li, pump_pct=actual_pump_pct, pump_elapsed_seconds=pump_elapsed,
+                )
+            continue
+        if diagnostics is not None and (
+            diagnostic_since_ts is None or ts[ai] >= diagnostic_since_ts
+        ):
+            diagnostics["pump_passes_in_window"] += 1
+        pump_checks = []
+        if diagnostics is not None:
+            pump_checks = [
+                f"L→A = {actual_pump_pct:.2f}% (нужно строго >{pump_pct:g}%) — ПРОЙДЕНО.",
+                f"Длительность L→A = {pump_elapsed / 3600:.2f} ч "
+                f"(лимит {pump_days:g} дн) — ПРОЙДЕНО.",
+            ]
 
         # Walk B pivots chronologically, maintaining the lowest low since A.
         # That running minimum is C; it invalidates an earlier trough if price
         # makes a new low before B. This is linear in the number of bars, rather
         # than testing every possible C/B pair.
         b_candidates = high_pivots[(high_pivots > ai) & (high_pivots <= ai + setup_bars)]
-        running_low_i = int(ai) + 1
+        if not len(b_candidates):
+            if diagnostics is not None:
+                record_rejection(
+                    ai, "no_confirmed_b_pivot", 1,
+                    pump_checks + [
+                        f"В следующие ≤{setup_days:g} дн нет подтверждённого локального high B "
+                        f"после A (pivot-bars={pivot_width})."
+                    ],
+                    li=li, pump_pct=actual_pump_pct,
+                )
+            continue
+        running_low_i = ai + 1
         ci = running_low_i
         high_crossed_a = False
+        retest_i: int | None = None
         found_for_a = False
-        for bi in b_candidates:
+        for bi_value in b_candidates:
+            bi = int(bi_value)
             while running_low_i <= bi:
                 if highs[running_low_i] >= highs[ai]:
                     high_crossed_a = True
+                    if retest_i is None:
+                        retest_i = running_low_i
                 if lows[running_low_i] < lows[ci]:
                     ci = running_low_i
                 running_low_i += 1
             # A is invalidated by ANY later wick touching/crossing A before B,
             # even when the eventual rebound pivot B itself is a lower high.
             if high_crossed_a:
+                if diagnostics is not None:
+                    checks = pump_checks + [
+                        f"После A high={highs[retest_i]:.8g} в {_fmt_time(int(ts[retest_i]))} "
+                        f"достиг/пересёк A={highs[ai]:.8g}: нижний пик A нарушен — НЕ ПРОЙДЕНО."
+                    ]
+                    record_rejection(
+                        ai, "a_retested_after_peak", 1, checks,
+                        li=li, ci=ci, bi=bi, pump_pct=actual_pump_pct,
+                        retest_ts=int(ts[retest_i]), retest_high=float(highs[retest_i]),
+                    )
                 break
             if ci not in low_pivot_set:
+                if diagnostics is not None:
+                    tentative = ""
+                    if highs[ai] > lows[ci] and leg > 0:
+                        tentative_retrace = (highs[ai] - lows[ci]) / leg * 100.0
+                        tentative = (
+                            f"; предварительный A→C откат={tentative_retrace:.2f}% импульса "
+                            f"(C пока не подтверждён)"
+                        )
+                    record_rejection(
+                        ai, "c_not_confirmed_local_low", 1,
+                        pump_checks + [
+                            f"Минимум после A до B: C?={lows[ci]:.8g} "
+                            f"({_fmt_time(int(ts[ci]))}), но он не подтверждён как локальный low "
+                            f"при pivot-bars={pivot_width}{tentative}."
+                        ],
+                        li=li, ci=ci, bi=bi, pump_pct=actual_pump_pct,
+                    )
                 continue
             if ts[bi] - ts[ai] > setup_days * 86400:
+                if diagnostics is not None:
+                    record_rejection(
+                        ai, "a_to_b_window_exceeded", 1,
+                        pump_checks + [
+                            f"A→B занял {(ts[bi] - ts[ai]) / 86400:.2f} дн; "
+                            f"лимит {setup_days:g} дн — НЕ ПРОЙДЕНО."
+                        ],
+                        li=li, ci=ci, bi=bi, pump_pct=actual_pump_pct,
+                    )
                 continue
             if highs[ai] <= lows[ci] or leg <= 0:
+                if diagnostics is not None:
+                    record_rejection(
+                        ai, "no_a_to_c_drop", 1,
+                        pump_checks + [
+                            f"C={lows[ci]:.8g} не ниже A={highs[ai]:.8g}; "
+                            "коррекция A→C отсутствует."
+                        ],
+                        li=li, ci=ci, bi=bi, pump_pct=actual_pump_pct,
+                    )
                 continue
             drop_pct = (highs[ai] - lows[ci]) / highs[ai] * 100.0
             retrace_pct = (highs[ai] - lows[ci]) / leg * 100.0
-            if drop_pct < min_ac_drop_pct or retrace_pct > max_retrace:
+            ac_checks = []
+            if diagnostics is not None:
+                ac_checks = pump_checks + [
+                    f"A→C падение от цены A = {drop_pct:.2f}% "
+                    f"(минимум {min_ac_drop_pct:g}%) — "
+                    f"{'ПРОЙДЕНО' if drop_pct >= min_ac_drop_pct else 'НЕ ПРОЙДЕНО'}.",
+                    f"A→C откат от L→A импульса = {retrace_pct:.2f}% "
+                    f"((A−C)/(A−L)); лимит ≤{max_retrace:g}% — "
+                    f"{'ПРОЙДЕНО' if retrace_pct <= max_retrace else 'НЕ ПРОЙДЕНО'}.",
+                ]
+            ac_failed = []
+            if drop_pct < min_ac_drop_pct:
+                ac_failed.append("min_ac_drop")
+            if retrace_pct > max_retrace:
+                ac_failed.append("max_retrace")
+            if ac_failed:
+                if diagnostics is not None:
+                    record_rejection(
+                        ai, "a_to_c_filter_failed", 2, ac_checks,
+                        li=li, ci=ci, bi=bi, pump_pct=actual_pump_pct,
+                        ac_drop_pct=drop_pct, pump_retrace_pct=retrace_pct,
+                        failed_checks=ac_failed,
+                    )
                 continue
-            if highs[bi] >= highs[ai] * (1.0 - lower_high_pct / 100.0):
+
+            required_b_high = highs[ai] * (1.0 - lower_high_pct / 100.0)
+            if highs[bi] >= required_b_high:
+                if diagnostics is not None:
+                    record_rejection(
+                        ai, "b_not_lower_high", 3,
+                        ac_checks + [
+                            f"B={highs[bi]:.8g}; требуется B < {required_b_high:.8g} "
+                            f"(A={highs[ai]:.8g}, lower-high ≥{lower_high_pct:g}%) — НЕ ПРОЙДЕНО."
+                        ],
+                        li=li, ci=ci, bi=bi, pump_pct=actual_pump_pct,
+                        ac_drop_pct=drop_pct, pump_retrace_pct=retrace_pct,
+                    )
                 continue
             bounce_pct = (highs[bi] - lows[ci]) / lows[ci] * 100.0
+            b_checks = []
+            if diagnostics is not None:
+                b_checks = ac_checks + [
+                    f"B={highs[bi]:.8g} < A={highs[ai]:.8g} — ПРОЙДЕНО.",
+                    f"C→B отскок = {bounce_pct:.2f}% (минимум {min_cb_bounce_pct:g}%) — "
+                    f"{'ПРОЙДЕНО' if bounce_pct >= min_cb_bounce_pct else 'НЕ ПРОЙДЕНО'}.",
+                ]
             if bounce_pct < min_cb_bounce_pct:
+                if diagnostics is not None:
+                    record_rejection(
+                        ai, "c_to_b_bounce_too_small", 3, b_checks,
+                        li=li, ci=ci, bi=bi, pump_pct=actual_pump_pct,
+                        ac_drop_pct=drop_pct, pump_retrace_pct=retrace_pct,
+                        cb_bounce_pct=bounce_pct,
+                    )
                 continue
 
             stop = highs[bi] * (1.0 + stop_buffer_pct / 100.0)
             # The first confirmed close-down after B is the reproducible
             # historical entry proxy. Ignore entries after target C traded.
-            end = min(n, int(bi) + setup_bars + 1)
-            # Do not backdate the entry into the bars needed to confirm B.
-            for ei in range(int(bi) + pivot_width + 1, end):
+            end = min(n, bi + setup_bars + 1)
+            confirm_start = bi + pivot_width + 1
+            confirm_threshold = highs[bi] * (1.0 - confirm_drop_pct / 100.0)
+            confirmed_entry = False
+            for ei in range(confirm_start, end):
                 entry = closes[ei]
-                if entry <= highs[bi] * (1.0 - confirm_drop_pct / 100.0):
-                    if np.min(lows[bi + 1:ei + 1]) <= lows[ci] or entry <= lows[ci]:
+                if entry <= confirm_threshold:
+                    confirmed_entry = True
+                    entry_checks = []
+                    if diagnostics is not None:
+                        entry_checks = b_checks + [
+                            f"Подтверждение: close={entry:.8g} ≤ {confirm_threshold:.8g} "
+                            f"(B−{confirm_drop_pct:g}%) — ПРОЙДЕНО."
+                        ]
+                    target_touches = np.flatnonzero(lows[bi + 1:ei + 1] <= lows[ci])
+                    if len(target_touches) or entry <= lows[ci]:
+                        if diagnostics is not None:
+                            target_i = bi + 1 + int(target_touches[0]) if len(target_touches) else ei
+                            record_rejection(
+                                ai, "target_touched_before_entry", 4,
+                                entry_checks + [
+                                    f"C={lows[ci]:.8g} был затронут до/на свече entry "
+                                    f"({_fmt_time(int(ts[target_i]))}); сигнал после entry не подтверждается."
+                                ],
+                                li=li, ci=ci, bi=bi, ei=ei, pump_pct=actual_pump_pct,
+                                ac_drop_pct=drop_pct, pump_retrace_pct=retrace_pct,
+                                cb_bounce_pct=bounce_pct,
+                                target_touch_ts=int(ts[target_i]),
+                            )
                         break
                     risk = stop - entry
                     reward = entry - lows[ci]
                     if risk <= 0 or reward <= 0:
+                        if diagnostics is not None:
+                            record_rejection(
+                                ai, "non_positive_risk_or_reward", 4,
+                                entry_checks + [
+                                    f"Risk=stop-entry={risk:.8g}, reward=entry-C={reward:.8g}; "
+                                    "оба должны быть положительными — НЕ ПРОЙДЕНО."
+                                ],
+                                li=li, ci=ci, bi=bi, ei=ei, pump_pct=actual_pump_pct,
+                                ac_drop_pct=drop_pct, pump_retrace_pct=retrace_pct,
+                                cb_bounce_pct=bounce_pct,
+                            )
                         break
                     rr = reward / risk
-                    if rr >= min_rr and ei not in used_entry_indices:
-                        used_entry_indices.add(ei)
-                        result.append({
-                            "start_ts": int(ts[li]), "a_ts": int(ts[ai]),
-                            "c_ts": int(ts[ci]), "b_ts": int(ts[bi]),
-                            "entry_ts": int(ts[ei]), "pump_start": float(lows[li]),
-                            "a_price": float(highs[ai]), "c_price": float(lows[ci]),
-                            "b_price": float(highs[bi]), "entry": float(entry),
-                            "stop": float(stop), "target": float(lows[ci]),
-                            "pump_pct": (highs[ai] / lows[li] - 1) * 100,
-                            "ac_drop_pct": drop_pct,
-                            "pump_retrace_pct": retrace_pct,
-                            "cb_bounce_pct": bounce_pct,
-                            "rr": rr,
-                        })
-                        found_for_a = True
+                    if rr < min_rr:
+                        if diagnostics is not None:
+                            record_rejection(
+                                ai, "original_rr_below_minimum", 5,
+                                entry_checks + [
+                                    f"Исходный RR={rr:.2f}:1; требуется ≥{min_rr:g}:1 — НЕ ПРОЙДЕНО."
+                                ],
+                                li=li, ci=ci, bi=bi, ei=ei, pump_pct=actual_pump_pct,
+                                ac_drop_pct=drop_pct, pump_retrace_pct=retrace_pct,
+                                cb_bounce_pct=bounce_pct, rr=rr,
+                            )
+                        break
+                    if ei in used_entry_indices:
+                        if diagnostics is not None:
+                            record_rejection(
+                                ai, "entry_already_used", 5,
+                                entry_checks + [
+                                    f"Свеча entry {_fmt_time(int(ts[ei]))} уже использована другим A-кандидатом."
+                                ],
+                                li=li, ci=ci, bi=bi, ei=ei, pump_pct=actual_pump_pct,
+                                ac_drop_pct=drop_pct, pump_retrace_pct=retrace_pct,
+                                cb_bounce_pct=bounce_pct, rr=rr,
+                            )
+                        break
+                    used_entry_indices.add(ei)
+                    result.append({
+                        "start_ts": int(ts[li]), "a_ts": int(ts[ai]),
+                        "c_ts": int(ts[ci]), "b_ts": int(ts[bi]),
+                        "entry_ts": int(ts[ei]), "pump_start": float(lows[li]),
+                        "a_price": float(highs[ai]), "c_price": float(lows[ci]),
+                        "b_price": float(highs[bi]), "entry": float(entry),
+                        "stop": float(stop), "target": float(lows[ci]),
+                        "pump_pct": (highs[ai] / lows[li] - 1) * 100,
+                        "ac_drop_pct": drop_pct,
+                        "pump_retrace_pct": retrace_pct,
+                        "cb_bounce_pct": bounce_pct,
+                        "rr": rr,
+                    })
+                    found_for_a = True
                     break
+            if not confirmed_entry and diagnostics is not None:
+                available_start = min(confirm_start, n)
+                available_end = min(end, n)
+                if available_end > available_start:
+                    window_closes = closes[available_start:available_end]
+                    min_close_offset = int(np.argmin(window_closes))
+                    min_close_i = available_start + min_close_offset
+                    close_detail = (
+                        f"минимальный close после подтверждения pivot B="
+                        f"{closes[min_close_i]:.8g} в {_fmt_time(int(ts[min_close_i]))}"
+                    )
+                else:
+                    min_close_i = None
+                    close_detail = "после B пока недостаточно свечей для проверки close"
+                record_rejection(
+                    ai, "no_confirmed_drop_close", 4,
+                    b_checks + [
+                        f"Нужен close ≤{confirm_threshold:.8g} (B−{confirm_drop_pct:g}%) "
+                        f"после {pivot_width} свечей подтверждения B; {close_detail}."
+                    ],
+                    li=li, ci=ci, bi=bi, pump_pct=actual_pump_pct,
+                    ac_drop_pct=drop_pct, pump_retrace_pct=retrace_pct,
+                    cb_bounce_pct=bounce_pct,
+                    lowest_post_b_close_i=min_close_i,
+                )
             if found_for_a:
                 break
 
     result.sort(key=lambda r: (r["entry_ts"], r["a_ts"]))
+    if diagnostics is not None:
+        diagnostics["setups_found"] = len(result)
     return result
+
+
+_DIAGNOSTIC_REASON_LABELS = {
+    "insufficient_pre_a_history": "недостаточно свечей до A для выбора L",
+    "higher_wick_before_a": "между L и A был high выше выбранного A",
+    "non_positive_pump_leg": "некорректная или неположительная нога L→A",
+    "pump_below_strict_threshold": "рост L→A не превысил порог",
+    "pump_took_too_long": "нога L→A длилась дольше заданного срока",
+    "no_confirmed_b_pivot": "после A нет подтверждённого локального high B",
+    "a_retested_after_peak": "после A был high, достигший или превысивший A",
+    "c_not_confirmed_local_low": "минимум C пока не подтверждён как локальный low",
+    "a_to_b_window_exceeded": "A→B вышло за лимит setup-days",
+    "no_a_to_c_drop": "нет снижения от A к C",
+    "a_to_c_filter_failed": "не пройден фильтр A→C (min-drop и/или max-retrace)",
+    "b_not_lower_high": "B не является достаточно низким lower high",
+    "c_to_b_bounce_too_small": "отскок C→B меньше заданного минимума",
+    "target_touched_before_entry": "цель C достигнута до/на подтверждении entry",
+    "non_positive_risk_or_reward": "риск или потенциальная награда неположительны",
+    "original_rr_below_minimum": "исходный RR ниже порога --rr",
+    "entry_already_used": "свеча entry уже использована другим A-кандидатом",
+    "no_confirmed_drop_close": "нет подтверждённого close ниже B на заданный процент",
+}
+
+
+def _print_symbol_scan_diagnostics(
+    database: str,
+    table: str,
+    diagnostics: dict[str, Any],
+    args: argparse.Namespace,
+    found: list[dict[str, Any]],
+) -> None:
+    """Print the closest recent pattern attempts and the first rule that rejected each."""
+    base, exchange, market = _parse_table(table)
+    print(
+        f"\nДиагностика {base}/{exchange} {market} [{database}.{table}]:",
+        flush=True,
+    )
+    first_ts, last_ts = diagnostics.get("first_ts"), diagnostics.get("last_ts")
+    window_start = diagnostics.get("window_start_ts")
+    if last_ts is not None:
+        window_label = (
+            f"с {_fmt_time(int(window_start))}"
+            if window_start is not None else "за всю историю"
+        )
+        print(
+            f"  OHLC-свечей: {diagnostics.get('bar_count', 0)}; данные "
+            f"{_fmt_time(int(first_ts)) if first_ts is not None else '?'} — "
+            f"{_fmt_time(int(last_ts))}; подробный разбор A-кандидатов {window_label}.",
+            flush=True,
+        )
+    if diagnostics.get("early_reason"):
+        print(f"  Разбор остановлен: {diagnostics['early_reason']}", flush=True)
+        return
+
+    print(
+        f"  Подтверждённых локальных high/low: "
+        f"{diagnostics.get('high_pivots_total', 0)}/"
+        f"{diagnostics.get('low_pivots_total', 0)}; high-кандидатов A в окне: "
+        f"{diagnostics.get('a_pivots_in_window', 0)}; L→A прошло все pump-проверки: "
+        f"{diagnostics.get('pump_passes_in_window', 0)}; полных паттернов: {len(found)}.",
+        flush=True,
+    )
+    print(
+        f"  Настройки: pump >{args.pump_pct:g}% за ≤{args.days:g} дн; "
+        f"A→C retrace ≤{args.max_retrace:g}% от ноги L→A; "
+        f"падение A→C ≥{args.min_ac_drop:g}% от A; B ниже A минимум на "
+        f"{args.lower_high_pct:g}%; отскок C→B ≥{args.min_cb_bounce:g}%; "
+        f"подтверждение close ниже B на {args.confirm_drop:g}%; "
+        f"stop=B+{args.stop_buffer:g}%; исходный RR ≥{args.rr:g}:1; "
+        f"B ищется до {args.setup_days:g} дн от A, "
+        f"entry-close — до {args.setup_days:g} дн после B; "
+        f"pivot-bars={max(1, args.pivot_bars)}.",
+        flush=True,
+    )
+    rejection_counts = diagnostics.get("rejection_counts", {})
+    if rejection_counts:
+        summary = "; ".join(
+            f"{_DIAGNOSTIC_REASON_LABELS.get(reason, reason)}: {count}"
+            for reason, count in sorted(
+                rejection_counts.items(), key=lambda item: (-item[1], item[0])
+            )
+        )
+        print(f"  Причины отсева в окне: {summary}.", flush=True)
+
+    records = diagnostics.get("records", [])
+    grouped: dict[tuple[int, float], dict[str, Any]] = {}
+    for record in records:
+        key = (int(record["a_ts"]), float(record["a_price"]))
+        prior = grouped.get(key)
+        record_rank = (
+            int(record.get("stage_rank", 0)), int(record.get("b_ts", -1) or -1)
+        )
+        prior_rank = (
+            int(prior.get("stage_rank", 0)), int(prior.get("b_ts", -1) or -1)
+        ) if prior else (-1, -1)
+        if prior is None or record_rank > prior_rank:
+            grouped[key] = record
+
+    attempts = list(grouped.values())
+    pump_passed = [
+        record for record in attempts
+        if int(record.get("stage_rank", 0)) >= 1 and record.get("l_price") is not None
+    ]
+    selected = pump_passed or attempts
+    selected.sort(
+        key=lambda record: (
+            int(record.get("a_ts", 0)),
+            int(record.get("stage_rank", 0)),
+        ),
+        reverse=True,
+    )
+    if selected:
+        print("  Ближайшие варианты (до 5 последних A, для каждого показан самый дальний этап проверки):", flush=True)
+        for number, record in enumerate(selected[:5], start=1):
+            a_stamp = _fmt_time(int(record["a_ts"]))
+            print(
+                f"    Вариант {number}: A={record['a_price']:.8g} ({a_stamp})",
+                flush=True,
+            )
+            if record.get("l_price") is not None:
+                print(
+                    f"      L={record['l_price']:.8g} "
+                    f"({_fmt_time(int(record['l_ts']))}); "
+                    f"C={record['c_price']:.8g} "
+                    f"({_fmt_time(int(record['c_ts']))})" if record.get("c_price") is not None
+                    else f"      L={record['l_price']:.8g} ({_fmt_time(int(record['l_ts']))})",
+                    flush=True,
+                )
+            if record.get("b_price") is not None:
+                print(
+                    f"      B={record['b_price']:.8g} "
+                    f"({_fmt_time(int(record['b_ts']))})",
+                    flush=True,
+                )
+            for check in record.get("checks", []):
+                print(f"      {check}", flush=True)
+            if record.get("reason"):
+                label = _DIAGNOSTIC_REASON_LABELS.get(
+                    record["reason"], record["reason"]
+                )
+                print(f"      Первый блокер по этой ветке: {label}.", flush=True)
+                if int(record.get("stage_rank", 0)) < 4:
+                    print(
+                        "      Следующие этапы для этой ветки не проверялись, "
+                        "так как она уже не прошла указанное условие.",
+                        flush=True,
+                    )
+            if record.get("failed_checks"):
+                print(
+                    "      Непройденные проверки: "
+                    + ", ".join(record["failed_checks"]) + ".",
+                    flush=True,
+                )
+    elif not found:
+        if diagnostics.get("a_pivots_in_window", 0) == 0:
+            latest_a_ts = diagnostics.get("latest_high_pivot_ts")
+            if latest_a_ts is not None:
+                print(
+                    f"  В окне нет подтверждённого A-пика; последний найденный "
+                    f"high-pivot был {diagnostics['latest_high_pivot_price']:.8g} "
+                    f"({_fmt_time(int(latest_a_ts))}), вне окна подробного разбора.",
+                    flush=True,
+                )
+            else:
+                print("  В данных нет подтверждённых локальных high-пивотов A.", flush=True)
+        else:
+            print(
+                "  Для последних A-кандидатов дальнейшие ветки не прошли "
+                "проверки, перечисленные выше.",
+                flush=True,
+            )
+
+    for event in sorted(found, key=lambda item: item["entry_ts"], reverse=True)[:5]:
+        print(
+            f"  Паттерн ПРОШЁЛ структурные проверки: "
+            f"L={event['pump_start']:.8g} → A={event['a_price']:.8g} → "
+            f"C={event['c_price']:.8g} → B={event['b_price']:.8g}; "
+            f"pump={event['pump_pct']:.2f}%, "
+            f"A→C retrace={event['pump_retrace_pct']:.2f}% "
+            f"(лимит {args.max_retrace:g}%), исходный RR={event['rr']:.2f}:1.",
+            flush=True,
+        )
+    if diagnostics.get("records_truncated"):
+        print(
+            "  Примечание: список отсеянных вариантов ограничен 500 записями; "
+            "сводные счётчики учитывают все варианты в окне.",
+            flush=True,
+        )
 
 
 _INVALIDATION_REASON_LABELS = {
@@ -316,20 +837,20 @@ def _args() -> argparse.Namespace:
     )
     p.add_argument("--timeframe", choices=("15m", "1d"), default="15m")
     p.add_argument("--pump-pct", type=float, default=50.0,
-                   help="Требуемый строгий минимум роста L→A, % (по умолчанию >50%)")
+                   help="Требуемый строгий минимум роста L→A, %% (по умолчанию >50%%)")
     p.add_argument("--days", type=float, default=3.0, help="Максимальная длительность L→A, дни")
     p.add_argument("--max-retrace", type=float, default=30.0,
                    help="Максимальный откат A→C как %% от роста L→A")
     p.add_argument("--min-ac-drop", type=float, default=5.0,
-                   help="Минимальное падение A→C от цены A, % (отсечь мелкий шум)")
+                   help="Минимальное падение A→C от цены A, %% (отсечь мелкий шум)")
     p.add_argument("--min-cb-bounce", type=float, default=2.0,
-                   help="Минимальный отскок C→B, %")
+                   help="Минимальный отскок C→B, %%")
     p.add_argument("--lower-high-pct", type=float, default=0.0,
                    help="На сколько %% B должен быть ниже A; 0 = любое lower high")
     p.add_argument("--confirm-drop", type=float, default=1.0,
                    help="Подтвердить разворот закрытием на N%% ниже B")
     p.add_argument("--stop-buffer", type=float, default=0.5,
-                   help="Буфер стопа выше B, %")
+                   help="Буфер стопа выше B, %%")
     p.add_argument("--rr", type=float, default=2.0, help="Минимум reward/risk до цели C")
     p.add_argument("--pivot-bars", type=int, default=2,
                    help="Свечей слева/справа для подтверждения локального пика/дна")
@@ -339,7 +860,7 @@ def _args() -> argparse.Namespace:
                    help="Считать сигнал текущим, если он моложе N часов")
     p.add_argument("--exchanges", default="", help="Список бирж через запятую, пусто = все")
     p.add_argument("--symbols", default="",
-                   help="Ограничить тикерами/базами через запятую, например JCT или JCT/USDT:USDT")
+                   help="Фильтр тикеров; при указании печатать подробную диагностику отсева")
     p.add_argument("--no-spot", action="store_true", help="Не сканировать spot")
     p.add_argument("--no-swap", action="store_true", help="Не сканировать perpetual swaps")
     p.add_argument("--concurrency", type=int, default=4)
@@ -360,7 +881,7 @@ def _args() -> argparse.Namespace:
     p.add_argument("--watch-min-tape", type=float, default=3.0,
                    help="Минимум сделок/мин за последние 5 минут")
     p.add_argument("--watch-min-depth-usd", type=float, default=1000.0,
-                   help="Минимальная глубина стакана ±1%, USD")
+                   help="Минимальная глубина стакана ±1%%, USD")
     p.add_argument("--watch-max-spread-atr-pct", type=float, default=15.0,
                    help="Максимальный спред как %% 1D ATR")
     p.add_argument("--watch-min-7d-volume-usd", type=float, default=100000.0,
@@ -410,6 +931,16 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
         if args.limit_tables:
             tasks = tasks[:args.limit_tables]
         total_tables = len(tasks)
+        table_diagnostics: dict[tuple[str, str], dict[str, Any]] = {}
+        if requested_symbols and not tasks:
+            exchange_scope = args.exchanges or "все биржи"
+            market_scope = "без spot" if args.no_spot else "spot и swap"
+            print(
+                f"Подробная диагностика: не найдено OHLCV-таблиц для "
+                f"{','.join(sorted(requested_symbols))} при фильтрах "
+                f"биржи={exchange_scope}, рынок={market_scope}.",
+                flush=True,
+            )
         symbol_scope = (
             f"; тикеры: {','.join(sorted(requested_symbols))}"
             if requested_symbols else ""
@@ -427,8 +958,22 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
                             f'SELECT "Timestamp", low, high, close FROM "{table}" ORDER BY "Timestamp" ASC'
                         )
                     if len(rows) < 8:
+                        if requested_symbols:
+                            table_diagnostics[(db, table)] = {
+                                "bar_count": len(rows),
+                                "early_reason": (
+                                    f"В таблице только {len(rows)} свечей; для анализа pivot "
+                                    "нужно минимум 8."
+                                ),
+                            }
                         return []
                     arr = np.asarray([tuple(r) for r in rows], dtype=np.float64)
+                    pattern_diagnostics: dict[str, Any] | None = (
+                        {} if requested_symbols else None
+                    )
+                    diagnostic_window_days = max(
+                        30.0, args.setup_days + args.days + 1.0
+                    )
                     found = find_setups(
                         arr[:, 0].astype(np.int64), arr[:, 1], arr[:, 2], arr[:, 3],
                         bar_seconds=bar_sec, pump_pct=args.pump_pct, pump_days=args.days,
@@ -436,7 +981,14 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
                         min_cb_bounce_pct=args.min_cb_bounce, lower_high_pct=args.lower_high_pct,
                         confirm_drop_pct=args.confirm_drop, stop_buffer_pct=args.stop_buffer,
                         min_rr=args.rr, pivot_width=max(1, args.pivot_bars), setup_days=args.setup_days,
+                        diagnostics=pattern_diagnostics,
+                        diagnostic_since_ts=(
+                            int(arr[-1, 0] - diagnostic_window_days * 86400)
+                            if pattern_diagnostics is not None else None
+                        ),
                     )
+                    if pattern_diagnostics is not None:
+                        table_diagnostics[(db, table)] = pattern_diagnostics
                     base, exchange, kind = _parse_table(table)
                     for event in found:
                         # Save the last database close for the live watcher's
@@ -453,6 +1005,10 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
                                       "exchange": exchange, "market": kind})
                     return found
                 except Exception as exc:
+                    if requested_symbols:
+                        table_diagnostics[(db, table)] = {
+                            "early_reason": f"Ошибка чтения/анализа таблицы: {type(exc).__name__}: {exc}"
+                        }
                     print(f"⚠️ [{db}.{table}] {exc}", file=sys.stderr)
                     return []
 
@@ -481,6 +1037,16 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
                 event[f"{key}_time"] = dt.datetime.fromtimestamp(
                     event[f"{key}_ts"], dt.timezone.utc
                 ).isoformat(timespec="minutes")
+        if requested_symbols and tasks:
+            for db, _, table in sorted(tasks, key=lambda task: (task[0], task[2])):
+                table_events = [
+                    event for event in results
+                    if event["database"] == db and event["table"] == table
+                ]
+                _print_symbol_scan_diagnostics(
+                    db, table, table_diagnostics.get((db, table), {}),
+                    args, table_events,
+                )
         return results
     finally:
         for pool in pools.values():
@@ -667,6 +1233,76 @@ def _screen_current_signal(event: dict, snapshot: dict, args: argparse.Namespace
     return signal, None
 
 
+def _print_watch_filter_diagnostics(
+    event: dict[str, Any], snapshot: dict[str, Any], args: argparse.Namespace,
+    reason: str,
+) -> None:
+    """Explain every live watch check when the user explicitly targeted symbols."""
+    price = _finite_positive(snapshot.get("price"))
+    c_price = _finite_positive(event.get("c_price"))
+    b_price = _finite_positive(event.get("b_price"))
+    tape = snapshot.get("trades_per_min")
+    depth = snapshot.get("depth_usd")
+    spread = snapshot.get("spread_atr_pct")
+    min_volume = snapshot.get("min_7d_volume_usd")
+    barcode = bool(snapshot.get("is_barcode"))
+
+    def value(number: Any, suffix: str = "", number_format: str = ".4g") -> str:
+        if number is None:
+            return "н/д"
+        try:
+            number_value = float(number)
+            if not math.isfinite(number_value):
+                return "н/д"
+            return f"{number_value:{number_format}}{suffix}"
+        except (TypeError, ValueError):
+            return "н/д"
+
+    price_ok = (
+        price is not None and c_price is not None and b_price is not None
+        and c_price <= price <= b_price
+    )
+    tape_ok = tape is not None and tape >= args.watch_min_tape and not barcode
+    depth_ok = depth is not None and depth > args.watch_min_depth_usd
+    spread_ok = spread is not None and spread < args.watch_max_spread_atr_pct
+    volume_ok = min_volume is not None and min_volume > args.watch_min_7d_volume_usd
+    print(
+        f"  Подробно по live-фильтрам {event['base']}/{event['exchange']} "
+        f"{event['market']}: отказ='{reason}'.",
+        flush=True,
+    )
+    print(
+        f"    Цена {value(price, number_format='.8g')} ({snapshot.get('price_source', '?')}) в "
+        f"[C={value(c_price)}, B={value(b_price)}]: "
+        f"{'ПРОЙДЕНО' if price_ok else 'НЕ ПРОЙДЕНО'}.",
+        flush=True,
+    )
+    print(
+        f"    Tape={value(tape, '/мин')} (нужно ≥{args.watch_min_tape:g}/мин) "
+        f"; barcode={'да' if barcode else 'нет'}: "
+        f"{'ПРОЙДЕНО' if tape_ok else 'НЕ ПРОЙДЕНО'}.",
+        flush=True,
+    )
+    print(
+        f"    Depth ±1%=${value(depth, number_format=',.0f')} "
+        f"(нужно >${args.watch_min_depth_usd:,.0f}): "
+        f"{'ПРОЙДЕНО' if depth_ok else 'НЕ ПРОЙДЕНО'}.",
+        flush=True,
+    )
+    print(
+        f"    Spread/1D ATR={value(spread, '%')} "
+        f"(нужно <{args.watch_max_spread_atr_pct:g}%): "
+        f"{'ПРОЙДЕНО' if spread_ok else 'НЕ ПРОЙДЕНО'}.",
+        flush=True,
+    )
+    print(
+        f"    Минимальный 7d $volume=${value(min_volume, number_format=',.0f')} "
+        f"(нужно >${args.watch_min_7d_volume_usd:,.0f}): "
+        f"{'ПРОЙДЕНО' if volume_ok else 'НЕ ПРОЙДЕНО'}.",
+        flush=True,
+    )
+
+
 async def _collect_watch_snapshots(events: list[dict], args: argparse.Namespace,
                                    now_ts: int) -> dict[tuple[str, str], dict]:
     """Fetch one live market snapshot per structurally uninvalidated pair."""
@@ -850,6 +1486,10 @@ async def _watch(args: argparse.Namespace) -> None:
                     accepted.append(signal)
                 elif reason and not event.get("invalidated"):
                     rejected[reason] = rejected.get(reason, 0) + 1
+                    if args.symbols.strip():
+                        _print_watch_filter_diagnostics(
+                            event, snapshots.get(key, {}), args, reason
+                        )
             accepted.sort(key=lambda item: (item["exchange"], item["base"], item["entry_ts"]))
             diagnostics = {
                 "candidate_count": len(events),
