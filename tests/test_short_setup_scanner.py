@@ -4,12 +4,13 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from short_setup_scanner import (
     _IDENT, _args, _classify_post_entry_resolution, _fmt_duration,
     _matches_requested_symbol, _print_symbol_scan_diagnostics,
     _print_watch_filter_diagnostics, _read_setups_csv,
-    _screen_current_signal, _ticker_from_table, _watch, find_setups,
+    _screen_current_signal, _ticker_from_table, _watch, find_setups, main,
 )
 
 
@@ -87,6 +88,16 @@ def test_scanner_cli_accepts_targeted_retrace_and_one_shot_watch(monkeypatch):
     assert args.watch_once is True
     assert args.symbols == "JCT"
     assert args.max_retrace == 40.0
+    assert args.rr is None  # RR has no default threshold.
+
+
+def test_legacy_rr_flag_is_ignored_and_warns(capsys, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["short_setup_scanner.py", "--rr", "1.0", "--watch-once"])
+    with pytest.raises(SystemExit, match="--watch-once"):
+        main()
+    warning = capsys.readouterr().err
+    assert "--rr" in warning
+    assert "игнорируется" in warning
 
 
 def test_watch_once_runs_exactly_one_cycle(monkeypatch):
@@ -109,7 +120,7 @@ def test_watch_once_runs_exactly_one_cycle(monkeypatch):
     args = SimpleNamespace(
         no_save_to_db=False, import_csv="", interval_minutes=60.0,
         timeframe="15m", watch_atr_period=5, watch_once=True,
-        rr=2.0, watch_show_invalidated_details=False,
+        watch_show_invalidated_details=False,
     )
     asyncio.run(_watch(args))
     assert scan_calls == 1
@@ -153,7 +164,7 @@ def candles(c_low=136.0):
     return ts, lows, highs, closes
 
 
-def test_finds_lower_high_setup_with_two_to_one_rr():
+def test_finds_lower_high_setup_and_reports_reward_risk():
     ts, lows, highs, closes = candles()
     found = find_setups(ts, lows, highs, closes, bar_seconds=900, pivot_width=1)
     assert len(found) == 1
@@ -213,7 +224,7 @@ def test_symbol_diagnostics_explain_retrace_rejection(capsys):
         SimpleNamespace(
             max_retrace=40, pump_pct=50, days=1, min_ac_drop=5,
             lower_high_pct=0, min_cb_bounce=2, confirm_drop=1, stop_buffer=0.5,
-            rr=2, setup_days=10, pivot_bars=1,
+            setup_days=10, pivot_bars=1,
         ),
         found,
     )
@@ -224,11 +235,15 @@ def test_symbol_diagnostics_explain_retrace_rejection(capsys):
     assert "max_retrace" in output
 
 
-def test_rejects_setup_when_reward_risk_is_not_met():
+def test_keeps_setup_when_reward_risk_is_below_two_and_reports_it():
     ts, lows, highs, closes = candles()
-    found = find_setups(ts, lows, highs, closes, bar_seconds=900,
-                        pivot_width=1, stop_buffer_pct=15.0)
-    assert found == []
+    found = find_setups(
+        ts, lows, highs, closes, bar_seconds=900,
+        pivot_width=1, stop_buffer_pct=15.0,
+    )
+    assert len(found) == 1
+    assert 0 < found[0]["rr"] < 2
+    assert found[0]["stop"] > found[0]["b_price"]
 
 
 def test_perpetual_table_names_with_colon_are_scannable():
@@ -260,7 +275,7 @@ def test_targeted_watch_prints_live_filter_values_and_thresholds(capsys):
 
 def test_current_watch_reports_why_a_pattern_was_already_invalidated():
     args = SimpleNamespace(
-        stop_buffer=0.5, rr=2.0, watch_min_tape=3.0,
+        stop_buffer=0.5, watch_min_tape=3.0,
         watch_min_depth_usd=1000.0, watch_max_spread_atr_pct=15.0,
         watch_min_7d_volume_usd=100_000.0,
     )
@@ -272,7 +287,7 @@ def test_current_watch_reports_why_a_pattern_was_already_invalidated():
 
 def test_current_watch_keeps_live_setup_inside_c_b_with_good_health():
     args = SimpleNamespace(
-        stop_buffer=0.5, rr=2.0, watch_min_tape=3.0,
+        stop_buffer=0.5, watch_min_tape=3.0,
         watch_min_depth_usd=1000.0, watch_max_spread_atr_pct=15.0,
         watch_min_7d_volume_usd=100_000.0,
     )
@@ -295,7 +310,7 @@ def test_current_watch_keeps_live_setup_inside_c_b_with_good_health():
 
 def test_current_watch_keeps_inclusive_c_boundary_without_live_rr_filter():
     args = SimpleNamespace(
-        stop_buffer=0.5, rr=2.0, watch_min_tape=3.0,
+        stop_buffer=0.5, watch_min_tape=3.0,
         watch_min_depth_usd=1000.0, watch_max_spread_atr_pct=15.0,
         watch_min_7d_volume_usd=100_000.0,
     )
@@ -313,7 +328,7 @@ def test_current_watch_keeps_inclusive_c_boundary_without_live_rr_filter():
 
 def test_current_watch_excludes_dead_tape_or_price_outside_c_b():
     args = SimpleNamespace(
-        stop_buffer=0.5, rr=2.0, watch_min_tape=3.0,
+        stop_buffer=0.5, watch_min_tape=3.0,
         watch_min_depth_usd=1000.0, watch_max_spread_atr_pct=15.0,
         watch_min_7d_volume_usd=100_000.0,
     )
@@ -330,7 +345,7 @@ def test_current_watch_excludes_dead_tape_or_price_outside_c_b():
 
 def test_current_watch_applies_each_red_health_threshold():
     args = SimpleNamespace(
-        stop_buffer=0.5, rr=2.0, watch_min_tape=3.0,
+        stop_buffer=0.5, watch_min_tape=3.0,
         watch_min_depth_usd=1000.0, watch_max_spread_atr_pct=15.0,
         watch_min_7d_volume_usd=100_000.0,
     )

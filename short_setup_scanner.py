@@ -4,8 +4,8 @@
 
 Pattern: a >=N% pump within M days, A-to-C correction no deeper than a given
 fraction of the preceding pump leg, a lower rebound high B, then a confirmed
-move down from B. The proposed target is C and the stop is just above B; only
-setups with the requested reward/risk ratio are reported.
+move down from B. The proposed target is C and the stop is just above B.
+Reward/risk is reported as information and does not filter setups.
 
 This is a screening tool, not an execution engine or investment advice. It
 uses stored candles only and does not place orders.
@@ -114,7 +114,6 @@ def find_setups(
     lower_high_pct: float = 0.0,
     confirm_drop_pct: float = 1.0,
     stop_buffer_pct: float = 0.5,
-    min_rr: float = 2.0,
     pivot_width: int = 2,
     setup_days: float = 10.0,
     diagnostics: dict[str, Any] | None = None,
@@ -494,18 +493,6 @@ def find_setups(
                             )
                         break
                     rr = reward / risk
-                    if rr < min_rr:
-                        if diagnostics is not None:
-                            record_rejection(
-                                ai, "original_rr_below_minimum", 5,
-                                entry_checks + [
-                                    f"Исходный RR={rr:.2f}:1; требуется ≥{min_rr:g}:1 — НЕ ПРОЙДЕНО."
-                                ],
-                                li=li, ci=ci, bi=bi, ei=ei, pump_pct=actual_pump_pct,
-                                ac_drop_pct=drop_pct, pump_retrace_pct=retrace_pct,
-                                cb_bounce_pct=bounce_pct, rr=rr,
-                            )
-                        break
                     if ei in used_entry_indices:
                         if diagnostics is not None:
                             record_rejection(
@@ -584,7 +571,6 @@ _DIAGNOSTIC_REASON_LABELS = {
     "c_to_b_bounce_too_small": "отскок C→B меньше заданного минимума",
     "target_touched_before_entry": "цель C достигнута до/на подтверждении entry",
     "non_positive_risk_or_reward": "риск или потенциальная награда неположительны",
-    "original_rr_below_minimum": "исходный RR ниже порога --rr",
     "entry_already_used": "свеча entry уже использована другим A-кандидатом",
     "no_confirmed_drop_close": "нет подтверждённого close ниже B на заданный процент",
 }
@@ -634,7 +620,7 @@ def _print_symbol_scan_diagnostics(
         f"падение A→C ≥{args.min_ac_drop:g}% от A; B ниже A минимум на "
         f"{args.lower_high_pct:g}%; отскок C→B ≥{args.min_cb_bounce:g}%; "
         f"подтверждение close ниже B на {args.confirm_drop:g}%; "
-        f"stop=B+{args.stop_buffer:g}%; исходный RR ≥{args.rr:g}:1; "
+        f"stop=B+{args.stop_buffer:g}%; RR рассчитывается справочно и не фильтрует; "
         f"B ищется до {args.setup_days:g} дн от A, "
         f"entry-close — до {args.setup_days:g} дн после B; "
         f"pivot-bars={max(1, args.pivot_bars)}.",
@@ -745,7 +731,7 @@ def _print_symbol_scan_diagnostics(
             f"C={event['c_price']:.8g} → B={event['b_price']:.8g}; "
             f"pump={event['pump_pct']:.2f}%, "
             f"A→C retrace={event['pump_retrace_pct']:.2f}% "
-            f"(лимит {args.max_retrace:g}%), исходный RR={event['rr']:.2f}:1.",
+            f"(лимит {args.max_retrace:g}%), RR (справочно)={event['rr']:.2f}:1.",
             flush=True,
         )
     if diagnostics.get("records_truncated"):
@@ -851,7 +837,9 @@ def _args() -> argparse.Namespace:
                    help="Подтвердить разворот закрытием на N%% ниже B")
     p.add_argument("--stop-buffer", type=float, default=0.5,
                    help="Буфер стопа выше B, %%")
-    p.add_argument("--rr", type=float, default=2.0, help="Минимум reward/risk до цели C")
+    p.add_argument(
+        "--rr", type=float, default=None, help=argparse.SUPPRESS
+    )  # accepted only for backward compatibility; the RR filter is disabled
     p.add_argument("--pivot-bars", type=int, default=2,
                    help="Свечей слева/справа для подтверждения локального пика/дна")
     p.add_argument("--setup-days", type=float, default=10.0,
@@ -946,8 +934,8 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
             if requested_symbols else ""
         )
         print(f"Сканирую {total_tables} таблиц, timeframe={args.timeframe}{symbol_scope}; критерии: "
-              f"памп >{args.pump_pct:g}% за ≤{args.days:g} дн, A→C ≤{args.max_retrace:g}% роста, "
-              f"RR ≥{args.rr:g}:1")
+              f"памп >{args.pump_pct:g}% за ≤{args.days:g} дн, A→C ≤{args.max_retrace:g}% роста; "
+              "RR — только справочная метрика, фильтр отключён.")
         scan_started = time.monotonic()
 
         async def one(db: str, pool: asyncpg.Pool, table: str) -> list[dict[str, Any]]:
@@ -980,7 +968,7 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
                         max_retrace=args.max_retrace, min_ac_drop_pct=args.min_ac_drop,
                         min_cb_bounce_pct=args.min_cb_bounce, lower_high_pct=args.lower_high_pct,
                         confirm_drop_pct=args.confirm_drop, stop_buffer_pct=args.stop_buffer,
-                        min_rr=args.rr, pivot_width=max(1, args.pivot_bars), setup_days=args.setup_days,
+                        pivot_width=max(1, args.pivot_bars), setup_days=args.setup_days,
                         diagnostics=pattern_diagnostics,
                         diagnostic_since_ts=(
                             int(arr[-1, 0] - diagnostic_window_days * 86400)
@@ -1181,7 +1169,7 @@ async def _fetch_watch_market_snapshot(client, symbol: str, last_close: float,
 
 def _screen_current_signal(event: dict, snapshot: dict, args: argparse.Namespace,
                            now_ts: int) -> tuple[dict | None, str | None]:
-    """Apply current-price, RR and the dashboard's red-chip exclusion rules."""
+    """Apply current-price and dashboard health rules; RR is informational only."""
     if event.get("invalidated"):
         reason = event.get("invalidation_reason")
         label = _INVALIDATION_REASON_LABELS.get(
@@ -1201,9 +1189,7 @@ def _screen_current_signal(event: dict, snapshot: dict, args: argparse.Namespace
     risk, reward = stop - price, price - c_price
     if risk <= 0:
         return None, "non-positive risk"
-    # Keep the current RR as an informational value on the saved snapshot, but
-    # do not invalidate a live setup when price movement has reduced it below
-    # the historical signal's --rr threshold.
+    # Keep current RR as an informational value only; it is never a watch filter.
     current_rr = reward / risk
 
     tape = snapshot.get("trades_per_min")
@@ -1420,7 +1406,7 @@ async def _watch(args: argparse.Namespace) -> None:
     )
     print(
         f"Текущий сканер запущен: {schedule}; "
-        f"цена в диапазоне C-B, исходный RR ≥{args.rr:g}:1, ликвидность по красным порогам Dashboard. "
+        "цена в диапазоне C-B, RR только справочно, ликвидность по красным порогам Dashboard. "
         "Остановка: Ctrl+C.", flush=True,
     )
     while True:
@@ -1516,7 +1502,7 @@ async def _watch(args: argparse.Namespace) -> None:
                     f"{signal['current_price_source']}={signal['entry']:.8g} "
                     f"L={signal['pump_start']:.8g} A={signal['a_price']:.8g} "
                     f"C={signal['c_price']:.8g} B={signal['b_price']:.8g} "
-                    f"stop={signal['stop']:.8g} RR-now={signal['rr']:.2f}:1 "
+                    f"stop={signal['stop']:.8g} RR-now(info)={signal['rr']:.2f}:1 "
                     f"Tape={signal['trades_per_min']:.1f}/min "
                     f"Depth=${signal['depth_usd']:,.0f} "
                     f"Spread={signal['spread_atr_pct']:.1f}% 7dMin=${signal['min_7d_volume_usd']:,.0f} "
@@ -1626,7 +1612,9 @@ async def _save_setups_to_db(events: list[dict[str, Any]], args: argparse.Namesp
         "min_cb_bounce_pct": args.min_cb_bounce,
         "lower_high_pct": args.lower_high_pct,
         "confirm_drop_pct": args.confirm_drop,
-        "stop_buffer_pct": args.stop_buffer, "min_rr": args.rr,
+        "stop_buffer_pct": args.stop_buffer,
+        "rr_filter_enabled": False, "rr_role": "informational",
+        "legacy_rr_arg_ignored": args.rr is not None,
         "pivot_width": args.pivot_bars, "setup_days": args.setup_days,
         "active_hours": args.active_hours,
     }
@@ -1713,6 +1701,11 @@ def _read_setups_csv(path: str) -> list[dict[str, Any]]:
 
 def main() -> int:
     args = _args()
+    if args.rr is not None:
+        print(
+            "⚠️ --rr оставлен для совместимости, но игнорируется: RR не фильтрует сетапы.",
+            file=sys.stderr,
+        )
     if args.watch_once and not args.watch:
         raise SystemExit("--watch-once можно использовать только вместе с --watch")
     if args.watch:
@@ -1762,7 +1755,7 @@ def main() -> int:
             print(f"{e['status']:7} {e['base']:<12} {e['exchange']:<8} {e['market']:<5} "
                   f"entry {_fmt_time(e['entry_ts'])}  A={e['a_price']:.8g} C={e['c_price']:.8g} "
                   f"B={e['b_price']:.8g} entry={e['entry']:.8g} stop={e['stop']:.8g} "
-                  f"target={e['target']:.8g} RR={e['rr']:.2f}:1")
+                  f"target={e['target']:.8g} RR-info={e['rr']:.2f}:1")
     return 0
 
 

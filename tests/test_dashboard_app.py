@@ -98,6 +98,23 @@ def test_stacked_layout_toggle_and_nav(app_test):
     assert after == expected
 
 
+def test_short_setup_dashboard_filter_does_not_use_rr():
+    """Low or missing RR is informational and cannot hide a saved setup."""
+    import pandas as pd
+
+    from dashboard.app import _filter_short_setup_events
+
+    setups = pd.DataFrame([
+        {"event_no": 1, "status": "CURRENT", "exchange": "bybit", "base": "LUMIA", "rr": 0.4},
+        {"event_no": 2, "status": "CURRENT", "exchange": "bybit", "base": "LUMIA", "rr": float("nan")},
+        {"event_no": 3, "status": "HISTORY", "exchange": "bybit", "base": "LUMIA", "rr": 3.0},
+    ])
+
+    filtered = _filter_short_setup_events(setups, ["CURRENT"], ["bybit"])
+
+    assert filtered["event_no"].tolist() == [1, 2]
+
+
 def test_only_with_15m_toggle_defaults_off_and_is_safe(app_test):
     """Chart options checkbox 'Only pairs with 15m data': OFF by default;
     toggling it must not break rendering (demo pairs exist on both TFs,

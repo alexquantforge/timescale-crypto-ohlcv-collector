@@ -4528,6 +4528,23 @@ def _unique_sorted(values):
     return sorted(set(v for v in values if v))
 
 
+def _filter_short_setup_events(
+    setups_df: pd.DataFrame,
+    status_filter: list[str],
+    exchange_filter: list[str],
+    search: str = "",
+) -> pd.DataFrame:
+    """Filter the setup list by status, exchange and symbol — never by RR."""
+    filtered = setups_df[
+        setups_df["status"].isin(status_filter)
+        & setups_df["exchange"].isin(exchange_filter)
+    ]
+    search = str(search or "").strip().upper()
+    if search:
+        filtered = filtered[filtered["base"].str.contains(re.escape(search), na=False)]
+    return filtered.reset_index(drop=True)
+
+
 # ---------------------------------------------------------------------------
 # Growth filter (off by default). "Show only pairs whose price is up more than
 # X% from the lowest LOW of the last N days to the current CLOSE" — i.e. the
@@ -5746,7 +5763,7 @@ with tab_setups:
             setups_df["exchange"] = setups_df["exchange"].fillna("").astype(str).str.lower()
             setups_df["entry_ts"] = pd.to_numeric(setups_df["entry_ts"], errors="coerce")
             setups_df["rr"] = pd.to_numeric(setups_df["rr"], errors="coerce")
-            setups_df = setups_df.dropna(subset=["entry_ts", "rr"])
+            setups_df = setups_df.dropna(subset=["entry_ts"])
             # Keep a deterministic order when multiple setups share an entry time.
             # The selector below uses event_no rather than a positional index, so
             # background app reruns cannot silently switch the selected chart.
@@ -5756,26 +5773,18 @@ with tab_setups:
             status_options = [x for x in ("CURRENT", "HISTORY", "RESOLVED")
                               if x in set(setups_df["status"])]
             ex_options = sorted(setups_df["exchange"].dropna().unique().tolist())
-            fc1, fc2, fc3 = st.columns([2, 2, 1])
+            fc1, fc2 = st.columns([2, 2])
             status_filter = fc1.multiselect(
                 "Статус", status_options, default=status_options, key="setup_status_filter"
             )
             exchange_filter = fc2.multiselect(
                 "Биржа", ex_options, default=ex_options, key="setup_exchange_filter"
             )
-            rr_filter = fc3.number_input(
-                "Мин. RR", min_value=0.0, max_value=100.0, value=0.0, step=0.25,
-                key="setup_rr_filter",
-            )
+            st.caption("RR в таблице — только справочное значение; фильтр по RR отключён.")
             search = st.text_input("Поиск монеты", key="setup_base_search").strip().upper()
-            filtered = setups_df[
-                setups_df["status"].isin(status_filter)
-                & setups_df["exchange"].isin(exchange_filter)
-                & (setups_df["rr"] >= float(rr_filter))
-            ]
-            if search:
-                filtered = filtered[filtered["base"].str.contains(re.escape(search), na=False)]
-            filtered = filtered.reset_index(drop=True)
+            filtered = _filter_short_setup_events(
+                setups_df, status_filter, exchange_filter, search
+            )
             st.caption(f"По фильтрам: **{len(filtered):,}** сетапов")
 
             show_cols = [c for c in (
@@ -5783,7 +5792,8 @@ with tab_setups:
                 "pump_retrace_pct", "a_price", "c_price", "b_price", "entry",
                 "stop", "target", "rr",
             ) if c in filtered.columns]
-            st.dataframe(filtered[show_cols], width="stretch", height=260, hide_index=True)
+            display_df = filtered[show_cols].rename(columns={"rr": "rr (справочно)"})
+            st.dataframe(display_df, width="stretch", height=260, hide_index=True)
 
             if filtered.empty:
                 st.info("Нет сетапов, подходящих под фильтры.")
@@ -5792,15 +5802,18 @@ with tab_setups:
                     int(row["event_no"]): row.to_dict()
                     for _, row in filtered.iterrows()
                 }
+                def _setup_event_option_label(event_no: int) -> str:
+                    selected = events_by_no[event_no]
+                    rr_value = pd.to_numeric(selected.get("rr"), errors="coerce")
+                    rr_label = f"RR info {rr_value:.2f}:1" if pd.notna(rr_value) else "RR info n/a"
+                    return (
+                        f"{selected['status']} · {selected['base']} · "
+                        f"{selected['exchange']} · {selected['entry_time']} · {rr_label}"
+                    )
+
                 selected_event_no = st.selectbox(
                     "Открыть сетап", options=list(events_by_no),
-                    format_func=lambda event_no: (
-                        f"{events_by_no[event_no]['status']} · "
-                        f"{events_by_no[event_no]['base']} · "
-                        f"{events_by_no[event_no]['exchange']} · "
-                        f"{events_by_no[event_no]['entry_time']} · "
-                        f"RR {events_by_no[event_no]['rr']:.2f}:1"
-                    ),
+                    format_func=_setup_event_option_label,
                     key="short_setup_selection_event_no",
                 )
                 ev = events_by_no[int(selected_event_no)]
@@ -5854,7 +5867,7 @@ with tab_setups:
                 m1.metric("Сетап", ev["status"])
                 m2.metric("Памп L→A", f"{float(ev.get('pump_pct', 0)):.1f}%")
                 m3.metric("Откат A→C", f"{float(ev.get('pump_retrace_pct', 0)):.1f}% роста")
-                m4.metric("Потенциал / риск", f"{float(ev['rr']):.2f}:1")
+                m4.metric("Потенциал / риск (справочно)", f"{float(ev['rr']):.2f}:1")
                 st.markdown(build_pair_links_html(ticker, exchange,
                     find_perp_ticker([df_15m, df_1d], ev["base"], exchange)), unsafe_allow_html=True)
                 live_interval = 0.0 if live_refresh == "Off" else float(live_refresh[:-1])

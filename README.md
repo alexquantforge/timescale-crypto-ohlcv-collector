@@ -224,9 +224,10 @@ timescale-crypto-ohlcv-collector/
    Defaults: 15-minute candles, a rise greater than 50% in at most 3 days, an
    A-to-C correction no deeper than 30% of the preceding rise, then a lower
    high B with no intervening wick retesting A, followed by a confirmed 1% decline.
-   The proposed stop is 0.5% above
-   B, the target is C, and only setups with reward/risk of at least 2:1 are
-   reported. Results are printed, saved to `pump_scanner_results` in TimescaleDB,
+   The proposed stop is 0.5% above B and the target is C. Reward/risk is calculated
+   and stored for information only; it is not a setup filter. The legacy `--rr` argument
+   is accepted for compatibility but ignored. Results are printed,
+   saved to `pump_scanner_results` in TimescaleDB,
    and exported to `short_setups.csv`; `CURRENT` means the signal appeared within
    the last 6 hours and neither stop nor target
    has since been touched; `RESOLVED` means one was hit, and older untriggered
@@ -240,9 +241,9 @@ timescale-crypto-ohlcv-collector/
    poetry run python short_setup_scanner.py --watch --interval-minutes 60 --days 1 --pump-pct 50
    ```
    Watch mode evaluates the latest live ticker (falling back to the last 15m DB close),
-   uses inclusive `C ≤ price ≤ B` bounds and recalculates the current RR for information,
-   but does not filter the setup by that live RR; the scanner's existing `--rr` threshold
-   still applies to the original signal. It excludes red Dashboard health chips: tape below 3 trades/min
+   uses inclusive `C ≤ price ≤ B` bounds, and reports current RR for information only;
+   neither original nor live RR filters a setup. It excludes red Dashboard health chips:
+   tape below 3 trades/min
    or barcode, depth at or below $1,000 within ±1%, spread at or above 15% of 1D ATR,
    and minimum 7d dollar volume at or below $100,000. Each completed pass prints the
    full matching list and stores that run in `pump_scanner_results`; later passes never
@@ -256,9 +257,9 @@ timescale-crypto-ohlcv-collector/
    the L→A pump duration to one day, not the amount of historical data scanned. `--symbols`
    can narrow a scan to comma-separated base tickers, CCXT symbols, or compact pairs. When a symbol
    filter is supplied, the scanner also prints a per-table diagnostic for recent A candidates:
-   measured L→A pump, A→C retracement formula/value, subsequent B/entry/RR checks, and the first
-   rejection reason. The diagnostic details the latest 30 days (or the configured setup window if
-   longer); setup discovery still scans the full table history. Use `--watch-once` with `--watch`
+   measured L→A pump, A→C retracement formula/value, subsequent B/entry checks, RR for information,
+   and the first rejection reason. The diagnostic covers the latest 30 days (or the configured setup
+   window if longer); setup discovery still scans the full table history. Use `--watch-once` with `--watch`
    to run exactly one pass without waiting for the next hourly cycle.
 
    To check only JCT perpetuals on Bybit with a 40% A→C retrace allowance, without changing
@@ -266,11 +267,11 @@ timescale-crypto-ohlcv-collector/
    ```bash
    poetry run python short_setup_scanner.py --watch --watch-once --symbols JCT --exchanges bybit --no-spot --days 1 --pump-pct 50 --max-retrace 40 --watch-show-invalidated-details
    ```
-   This still applies the configured original-signal `--rr` threshold and all watch health/price
-   filters; `--days 1` only limits the L→A pump duration.
+   RR does not filter the setup; watch health and price filters still apply.
+   `--days 1` only limits the L→A pump duration.
 
-   The dashboard's **🎯 Short Setups** tab reads the stored DB run, filters the results,
-   and opens event-centred 15m and 1D charts with A/C/B, entry, stop and target
+   The dashboard's **🎯 Short Setups** tab reads the stored DB run, filters by status/exchange
+   (never by RR), and opens event-centred 15m and 1D charts with A/C/B, entry, stop and target
    markers. Choose a setup and explicitly load its charts; the current quote
    stays live, while a CURRENT setup also updates both chart tails.
 
