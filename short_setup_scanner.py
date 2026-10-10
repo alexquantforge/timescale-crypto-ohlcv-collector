@@ -118,12 +118,15 @@ def find_setups(
     setup_days: float = 10.0,
     diagnostics: dict[str, Any] | None = None,
     diagnostic_since_ts: int | None = None,
+    reentry_since_ts: int | None = None,
 ) -> list[dict[str, Any]]:
     """Detect setups and optionally explain recent candidate rejections.
 
     Timestamps are seconds. ``max_retrace`` is the fraction of the preceding
     L-to-A pump leg allowed to be given back at C: L=100, A=150, max=30 means
     C must be at least 135. Diagnostics do not change the detector's decisions.
+    When ``reentry_since_ts`` is set, after the first confirmed B/entry for an A,
+    later B pivots at or after that timestamp are evaluated as fresh attempts.
     """
     n = min(len(ts), len(lows), len(highs), len(closes))
     if diagnostics is not None:
@@ -345,6 +348,13 @@ def find_setups(
                         retest_ts=int(ts[retest_i]), retest_high=float(highs[retest_i]),
                     )
                 break
+            # In watch mode, only inspect follow-up B attempts inside the
+            # recent re-entry window. Older history keeps the original single
+            # setup per A behavior, avoiding a flood of duplicate backtest rows.
+            if found_for_a and (
+                reentry_since_ts is None or ts[bi] < reentry_since_ts
+            ):
+                continue
             if ci not in low_pivot_set:
                 if diagnostics is not None:
                     tentative = ""
@@ -546,7 +556,7 @@ def find_setups(
                     cb_bounce_pct=bounce_pct,
                     lowest_post_b_close_i=min_close_i,
                 )
-            if found_for_a:
+            if found_for_a and reentry_since_ts is None:
                 break
 
     result.sort(key=lambda r: (r["entry_ts"], r["a_ts"]))
@@ -803,6 +813,41 @@ def _classify_post_entry_resolution(
     }
 
 
+def _filter_reentries_after_resolution(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep a later B only after the preceding attempt was stopped first.
+
+    A new B may form on the same candle that stopped the previous entry; that
+    pivot is usable only after its own right-side bars and entry confirmation.
+    """
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for event in events:
+        key = (event.get("database"), event.get("table"), event.get("a_ts"))
+        grouped.setdefault(key, []).append(event)
+
+    kept: list[dict[str, Any]] = []
+    for attempts in grouped.values():
+        attempts.sort(key=lambda event: (int(event["b_ts"]), int(event["entry_ts"])))
+        if not attempts:
+            continue
+        previous = attempts[0]
+        kept.append(previous)
+        for attempt in attempts[1:]:
+            if (
+                not previous.get("invalidated")
+                or previous.get("invalidation_reason") != "stop_first"
+            ):
+                break
+            resolved_ts = previous.get("invalidation_ts")
+            if resolved_ts is None or int(attempt["b_ts"]) < int(resolved_ts):
+                continue
+            kept.append(attempt)
+            previous = attempt
+            if not previous.get("invalidated"):
+                break
+
+    return sorted(kept, key=lambda event: (int(event["entry_ts"]), int(event["a_ts"])))
+
+
 def _fmt_duration(seconds: float) -> str:
     seconds = max(0, int(seconds))
     hours, remainder = divmod(seconds, 3600)
@@ -962,6 +1007,14 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
                     diagnostic_window_days = max(
                         30.0, args.setup_days + args.days + 1.0
                     )
+                    reentry_since_ts = None
+                    if args.watch:
+                        reentry_lookback_hours = max(
+                            args.active_hours, args.interval_minutes / 60.0
+                        )
+                        reentry_since_ts = int(
+                            arr[-1, 0] - reentry_lookback_hours * 3600
+                        )
                     found = find_setups(
                         arr[:, 0].astype(np.int64), arr[:, 1], arr[:, 2], arr[:, 3],
                         bar_seconds=bar_sec, pump_pct=args.pump_pct, pump_days=args.days,
@@ -974,6 +1027,7 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
                             int(arr[-1, 0] - diagnostic_window_days * 86400)
                             if pattern_diagnostics is not None else None
                         ),
+                        reentry_since_ts=reentry_since_ts,
                     )
                     if pattern_diagnostics is not None:
                         table_diagnostics[(db, table)] = pattern_diagnostics
@@ -991,6 +1045,8 @@ async def _scan(args: argparse.Namespace) -> list[dict[str, Any]]:
                         ))
                         event.update({"database": db, "table": table, "base": base,
                                       "exchange": exchange, "market": kind})
+                    if args.watch:
+                        found = _filter_reentries_after_resolution(found)
                     return found
                 except Exception as exc:
                     if requested_symbols:

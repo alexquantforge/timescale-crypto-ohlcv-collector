@@ -7,7 +7,8 @@ import numpy as np
 import pytest
 
 from short_setup_scanner import (
-    _IDENT, _args, _classify_post_entry_resolution, _fmt_duration,
+    _IDENT, _args, _classify_post_entry_resolution, _filter_reentries_after_resolution,
+    _fmt_duration,
     _matches_requested_symbol, _print_symbol_scan_diagnostics,
     _print_watch_filter_diagnostics, _read_setups_csv,
     _screen_current_signal, _ticker_from_table, _watch, find_setups, main,
@@ -162,6 +163,71 @@ def candles(c_low=136.0):
     closes = np.array([109, 110, 115, 135, 145, 140, 138, 139, 140, 142, 145, 145.8, 144.5], dtype=float)
     ts = np.arange(len(highs), dtype=np.int64) * 900
     return ts, lows, highs, closes
+
+
+def test_watch_finds_fresh_b_after_previous_attempt_hits_stop():
+    # One A/C formation produces B1=145. Its confirmed entry is stopped by
+    # the next candle's 146 high. That same candle can become a fresh lower
+    # high B2=146; after pivot confirmation, a new entry at index 8 is valid.
+    ts = np.arange(11, dtype=np.int64) * 900
+    highs = np.array([101, 160, 135, 145, 141, 142, 146, 140, 139, 138, 137], dtype=float)
+    lows = np.array([100, 150, 120, 130, 132, 128, 125, 130, 128, 126, 125], dtype=float)
+    closes = np.array([100, 155, 130, 143, 138, 140, 134, 138, 137, 135, 133], dtype=float)
+
+    attempts = find_setups(
+        ts, lows, highs, closes, bar_seconds=900, pump_pct=50,
+        pump_days=1, max_retrace=70, pivot_width=1, setup_days=10,
+        reentry_since_ts=int(ts[6]),
+    )
+    historical_attempts = find_setups(
+        ts, lows, highs, closes, bar_seconds=900, pump_pct=50,
+        pump_days=1, max_retrace=70, pivot_width=1, setup_days=10,
+    )
+
+    assert len(attempts) == 2
+    assert len(historical_attempts) == 1  # ordinary scans retain their prior behavior
+    assert [event["b_price"] for event in attempts] == [145, 146]
+    assert attempts[0]["stop"] == pytest.approx(145 * 1.005)
+    assert attempts[1]["stop"] == pytest.approx(146 * 1.005)
+    for event in attempts:
+        entry_i = int(np.searchsorted(ts, event["entry_ts"], side="left"))
+        event.update(_classify_post_entry_resolution(
+            ts[entry_i + 1:], highs[entry_i + 1:], lows[entry_i + 1:],
+            stop=event["stop"], target=event["target"],
+        ))
+        event.update({"database": "test_db", "table": "lumia_usdt_on_bybit"})
+
+    assert attempts[0]["invalidation_reason"] == "stop_first"
+    assert attempts[0]["invalidation_ts"] == ts[6]
+    assert attempts[1]["invalidated"] is False
+    assert attempts[1]["b_ts"] == ts[6]
+    assert attempts[1]["entry_ts"] == ts[8]
+
+    retained = _filter_reentries_after_resolution(attempts)
+    assert retained == attempts  # retain the stopped attempt and its fresh successor
+
+
+def test_watch_does_not_accept_reentry_formed_before_prior_stop():
+    attempts = [
+        {"database": "db", "table": "lumia", "a_ts": 1, "b_ts": 2,
+         "entry_ts": 3, "invalidated": True, "invalidation_reason": "stop_first",
+         "invalidation_ts": 10},
+        {"database": "db", "table": "lumia", "a_ts": 1, "b_ts": 9,
+         "entry_ts": 11, "invalidated": False},
+        {"database": "db", "table": "lumia", "a_ts": 1, "b_ts": 10,
+         "entry_ts": 12, "invalidated": False},
+        {"database": "db", "table": "lumia", "a_ts": 2, "b_ts": 2,
+         "entry_ts": 20, "invalidated": True, "invalidation_reason": "target_first",
+         "invalidation_ts": 10},
+        {"database": "db", "table": "lumia", "a_ts": 2, "b_ts": 10,
+         "entry_ts": 21, "invalidated": False},
+    ]
+
+    retained = _filter_reentries_after_resolution(attempts)
+
+    assert [(event["a_ts"], event["b_ts"]) for event in retained] == [
+        (1, 2), (1, 10), (2, 2),
+    ]
 
 
 def test_finds_lower_high_setup_and_reports_reward_risk():
