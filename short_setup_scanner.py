@@ -814,10 +814,11 @@ def _classify_post_entry_resolution(
 
 
 def _filter_reentries_after_resolution(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep a later B only after the preceding attempt was stopped first.
+    """Keep a later B only after the preceding attempt has a definite resolution.
 
-    A new B may form on the same candle that stopped the previous entry; that
-    pivot is usable only after its own right-side bars and entry confirmation.
+    A new B may form on the same candle that stopped the previous entry, or
+    after the prior target was reached; it still needs its own pivot and entry
+    confirmation.
     """
     grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
     for event in events:
@@ -834,7 +835,9 @@ def _filter_reentries_after_resolution(events: list[dict[str, Any]]) -> list[dic
         for attempt in attempts[1:]:
             if (
                 not previous.get("invalidated")
-                or previous.get("invalidation_reason") != "stop_first"
+                or previous.get("invalidation_reason") not in {
+                    "stop_first", "target_first",
+                }
             ):
                 break
             resolved_ts = previous.get("invalidation_ts")

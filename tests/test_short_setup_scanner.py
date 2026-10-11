@@ -207,7 +207,46 @@ def test_watch_finds_fresh_b_after_previous_attempt_hits_stop():
     assert retained == attempts  # retain the stopped attempt and its fresh successor
 
 
-def test_watch_does_not_accept_reentry_formed_before_prior_stop():
+def test_watch_finds_fresh_b_after_prior_target_and_updates_c():
+    ts = np.arange(17, dtype=np.int64) * 900
+    highs = np.array(
+        [101, 160, 135, 145, 141, 142, 146, 140, 139, 135, 134, 134, 140, 137, 136, 135, 134],
+        dtype=float,
+    )
+    lows = np.array(
+        [100, 150, 130, 134, 133, 132, 132, 133, 132, 131, 125, 130, 132, 130, 129, 128, 127],
+        dtype=float,
+    )
+    closes = np.array(
+        [100, 155, 132, 143, 138, 140, 134, 139, 138, 134, 130, 134, 138, 135, 135, 133, 132],
+        dtype=float,
+    )
+
+    attempts = find_setups(
+        ts, lows, highs, closes, bar_seconds=900, pump_pct=50,
+        pump_days=1, max_retrace=60, pivot_width=1, setup_days=10,
+        reentry_since_ts=int(ts[6]),
+    )
+
+    assert [event["b_price"] for event in attempts] == [145, 146, 140]
+    for event in attempts:
+        entry_i = int(np.searchsorted(ts, event["entry_ts"], side="left"))
+        event.update(_classify_post_entry_resolution(
+            ts[entry_i + 1:], highs[entry_i + 1:], lows[entry_i + 1:],
+            stop=event["stop"], target=event["target"],
+        ))
+        event.update({"database": "test_db", "table": "lumia_usdt_on_bybit"})
+
+    assert [event["invalidation_reason"] for event in attempts] == [
+        "stop_first", "target_first", None,
+    ]
+    assert attempts[2]["c_price"] == 125
+    assert attempts[2]["stop"] == pytest.approx(140 * 1.005)
+    assert attempts[2]["entry_ts"] == ts[14]
+    assert _filter_reentries_after_resolution(attempts) == attempts
+
+
+def test_watch_reentry_must_follow_resolution_and_accepts_target_close():
     attempts = [
         {"database": "db", "table": "lumia", "a_ts": 1, "b_ts": 2,
          "entry_ts": 3, "invalidated": True, "invalidation_reason": "stop_first",
@@ -221,12 +260,17 @@ def test_watch_does_not_accept_reentry_formed_before_prior_stop():
          "invalidation_ts": 10},
         {"database": "db", "table": "lumia", "a_ts": 2, "b_ts": 10,
          "entry_ts": 21, "invalidated": False},
+        {"database": "db", "table": "lumia", "a_ts": 3, "b_ts": 2,
+         "entry_ts": 30, "invalidated": True, "invalidation_reason": "both_same_candle",
+         "invalidation_ts": 10},
+        {"database": "db", "table": "lumia", "a_ts": 3, "b_ts": 10,
+         "entry_ts": 31, "invalidated": False},
     ]
 
     retained = _filter_reentries_after_resolution(attempts)
 
     assert [(event["a_ts"], event["b_ts"]) for event in retained] == [
-        (1, 2), (1, 10), (2, 2),
+        (1, 2), (1, 10), (2, 2), (2, 10), (3, 2),
     ]
 
 
