@@ -305,7 +305,7 @@ class _FakePool:
         return _Acquire(self.conn)
 
 
-def test_15m_truncated_table_is_filled_toward_180d_floor(monkeypatch, caplog):
+def test_15m_truncated_table_is_filled_back_to_retention_floor(monkeypatch, caplog):
     from src.core import updater_15m as u15
 
     table_start = NOW - 5 * DAY
@@ -323,6 +323,7 @@ def test_15m_truncated_table_is_filled_toward_180d_floor(monkeypatch, caplog):
     monkeypatch.setattr(u15, "COLLECT_ORDERBOOK", False)
     monkeypatch.setattr(u15.settings, "history_prefill_retry_sec", 4 * 3600, raising=False)
     u15._PREFILL_DONE.pop(("bybit", "BTC/USDT:USDT"), None)
+    retention_floor = u15.get_download_min_timestamp()
 
     exchange = FakeExchange(M15 * 1000)
     with caplog.at_level(logging.INFO, logger="updater_15m"):
@@ -330,10 +331,10 @@ def test_15m_truncated_table_is_filled_toward_180d_floor(monkeypatch, caplog):
 
     assert res[0] > 0
     assert conn.saved, "prefilled candles must reach the table"
-    # rows are written with Timestamp in SECONDS in the first column
+    # Rows use epoch seconds and history repair must stop at the configured
+    # retention floor, rather than downloading beyond the 50-day window.
     min_ts = min(int(r[0]) for r in conn.saved)
-    ten_pages_cover = u15.PREFILL_MAX_PAGES * u15.FETCH_LIMIT * M15  # 10*1000 bars
-    assert min_ts <= table_start - ten_pages_cover + 2 * M15
+    assert retention_floor <= min_ts <= retention_floor + 2 * M15
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "📜" in text and "history repair" in text
 

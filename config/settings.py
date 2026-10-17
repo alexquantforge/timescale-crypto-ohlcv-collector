@@ -63,12 +63,13 @@ class Settings(BaseSettings):
 
     # Timeframe & Data Retention
     timeframe: str = Field(default="1d", alias="TIMEFRAME")  # "1d" or "15m"
-    data_retention_days: int = Field(default=180, alias="DATA_RETENTION_DAYS")  # 180 days retention for 15m
+    data_retention_days: int = Field(
+        default=50, alias="DATA_RETENTION_DAYS"
+    )  # rolling 50-day window for 15m OHLCV tables
     update_days: int = Field(default=10, alias="UPDATE_DAYS")  # how many days back to fetch per update
-    # 15m retention cleanup cadence: a full-database VACUUM after every 5-minute
-    # cycle kept the disk saturated 24/7 — maintenance now runs at most this
-    # often, and VACUUM touches only tables that actually had rows deleted.
-    maintenance_interval_hours: int = Field(default=24, alias="MAINTENANCE_INTERVAL_HOURS")
+    # 15m retention runs after a completed collection cycle, at most once per
+    # six hours. VACUUM touches only tables that actually lost rows.
+    maintenance_interval_hours: int = Field(default=6, alias="MAINTENANCE_INTERVAL_HOURS")
 
     # 15m engine: on startup, DROP tables of exchanges that are not in
     # ALLOWED_EXCHANGES. Destructive — set to false to keep such tables.

@@ -511,7 +511,8 @@ async def test_15m_lane_refetches_the_last_stored_bar(monkeypatch):
     replaces it even where `since` is exclusive."""
     import src.core.updater_15m as u
 
-    last_ts = 1_790_000_100  # inside the 1_790_000_100 // 900 bucket
+    # Keep the fixture inside the lane's bounded catch-up window on any date.
+    last_ts = (int(time.time()) // 900) * 900 - 900
     seen = {}
 
     class _Ex:

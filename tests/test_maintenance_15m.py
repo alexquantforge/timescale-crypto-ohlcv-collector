@@ -3,8 +3,8 @@
 Regression: run_maintenance() used to execute a whole-database `VACUUM;`
 after EVERY 5-minute cycle — a single postgres backend was observed at
 4.3 GB RSS in state D (uninterruptible disk sleep), saturating the laptop's
-disk 24/7. Maintenance must be dayly-gated and VACUUM must touch only tables
-that actually lost rows.
+disk 24/7. Maintenance is cadence-gated, drops old Timescale chunks, applies
+an exact row cutoff, and VACUUM touches only tables with residual row deletes.
 """
 import asyncio
 import logging
@@ -13,16 +13,26 @@ from src.core import updater_15m
 
 
 class FakeConn:
-    def __init__(self, tables, delete_counts):
+    def __init__(self, tables, delete_counts, chunk_counts=None):
         self._tables = list(tables)
         self._delete_counts = dict(delete_counts)  # table -> rows deleted
+        self._chunk_counts = dict(chunk_counts or {})  # table -> chunks dropped
         self.executed = []  # every statement seen
+        self.fetchval_calls = []
+        self.execute_calls = []
 
     async def fetch(self, sql, *args):
         return [{"table_name": t} for t in self._tables]
 
+    async def fetchval(self, sql, *args):
+        self.fetchval_calls.append((sql, args))
+        if "drop_chunks" in sql:
+            return self._chunk_counts.get(args[0], 0)
+        return None
+
     async def execute(self, sql, *args):
         self.executed.append(sql)
+        self.execute_calls.append((sql, args))
         if sql.startswith("DELETE"):
             for t, cnt in self._delete_counts.items():
                 if f'"{t}"' in sql:
@@ -50,11 +60,13 @@ class FakePool:
         return _Acquire(self.conn)
 
 
-def _setup(monkeypatch, db_map, interval_hours=24):
-    """db_map: {db_name: (tables, delete_counts)} -> wires module state."""
+def _setup(monkeypatch, db_map, interval_hours=6):
+    """db_map: {db_name: (tables, delete_counts[, chunk_counts])}."""
     pools, conns = {}, {}
-    for db_name, (tables, delete_counts) in db_map.items():
-        conn = FakeConn(tables, delete_counts)
+    for db_name, spec in db_map.items():
+        tables, delete_counts = spec[:2]
+        chunk_counts = spec[2] if len(spec) > 2 else None
+        conn = FakeConn(tables, delete_counts, chunk_counts)
         pools[db_name] = FakePool(conn)
         conns[db_name] = conn
     monkeypatch.setattr(updater_15m, "db_pools", pools, raising=True)
@@ -95,12 +107,36 @@ def test_maintenance_gated_to_interval_and_vacuums_only_affected(monkeypatch):
     assert all(c.executed == [] for c in conns.values())
 
 
+def test_retention_drops_bigint_chunks_and_prunes_exact_boundary(monkeypatch):
+    table = "lumia_usdt_on_bybit"
+    cutoff_ts = 1_800_000_000
+    conns = _setup(monkeypatch, {
+        "low": ([table], {table: 4}, {table: 2}),
+    })
+    monkeypatch.setattr(updater_15m, "get_cutoff_timestamp", lambda: cutoff_ts)
+
+    rows_deleted, chunks_dropped, vacuum_tables = _run(
+        updater_15m.delete_old_data_from_db(updater_15m.db_pools["low"], "low")
+    )
+
+    assert rows_deleted == 4  # partial boundary rows removed after whole chunks
+    assert chunks_dropped == 2
+    assert vacuum_tables == [table]
+    conn = conns["low"]
+    drop_sql, drop_args = conn.fetchval_calls[0]
+    assert "older_than => $2::bigint" in drop_sql
+    assert drop_args == (table, cutoff_ts)
+    assert conn.execute_calls == [(
+        f'DELETE FROM "{table}" WHERE "Timestamp" < $1', (cutoff_ts,),
+    )]
+
+
 def test_no_deletions_means_no_vacuum(monkeypatch, caplog):
     conns = _setup(monkeypatch, {"low": (["a_on_bybit"], {})})
     with caplog.at_level(logging.INFO, logger="updater_15m"):
         _run(updater_15m.run_maintenance())
     assert not any(s.startswith("VACUUM") for s in conns["low"].executed)
-    assert any("VACUUM skipped — no old rows deleted" in r.message for r in caplog.records)
+    assert any("VACUUM skipped — no residual rows deleted" in r.message for r in caplog.records)
 
 
 def test_zero_interval_restores_every_cycle_behavior(monkeypatch):

@@ -12,7 +12,7 @@ def test_gate_since_clamped_into_window():
     from src.core.updater_15m import clamp_ohlcv_since_ms, EXCHANGE_MAX_LOOKBACK_CANDLES_15M
 
     now_ms = int(time.time() * 1000)
-    far_back = now_ms - 200 * 86400 * 1000  # engine asks for 180 days of 15m history
+    far_back = now_ms - 200 * 86400 * 1000  # older than both retention and exchange limits
 
     for name in ("gateio", "gate"):
         out = clamp_ohlcv_since_ms(name, far_back)

@@ -380,26 +380,31 @@ async def move_table(table_name, from_db, to_db):
         await fc2.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')
 
 
-async def delete_old_data_from_db(pool: asyncpg.Pool, db_name: str) -> Tuple[int, List[str]]:
-    """Drops data older than the retention window; returns (rows_deleted,
-    names of tables that actually lost data).
+async def delete_old_data_from_db(
+    pool: asyncpg.Pool, db_name: str
+) -> Tuple[int, int, List[str]]:
+    """Prune bars before the retention cutoff.
 
-    Fast path: TimescaleDB drop_chunks() removes whole chunks instantly with
-    almost no WAL and leaves nothing for VACUUM to clean. Falls back to a
-    row-by-row DELETE for tables that are not hypertables (e.g. no
-    timescaledb extension installed)."""
+    Returns (residual_rows_deleted, chunks_dropped, tables_needing_vacuum).
+    Timestamp is stored as epoch seconds in BIGINT columns, so drop_chunks()
+    receives the same BIGINT cutoff. It drops complete hypertable chunks quickly;
+    the following DELETE removes any older rows left in a boundary chunk and
+    provides a fallback for ordinary tables.
+    """
     cutoff_ts = get_cutoff_timestamp()
-    cutoff_date = datetime.datetime.now(
-        datetime.timezone.utc
-    ) - datetime.timedelta(days=DATA_RETENTION_DAYS)
-    cutoff_str = cutoff_date.strftime("%Y-%m-%d")
+    cutoff_date = datetime.datetime.fromtimestamp(
+        cutoff_ts, datetime.timezone.utc
+    )
+    cutoff_str = cutoff_date.strftime("%Y-%m-%d %H:%M:%S")
 
     logger.info(
-        f"🗑️  [{db_name}] Deleting data older than {DATA_RETENTION_DAYS} days (before {cutoff_str} UTC)..."
+        f"🗑️  [{db_name}] Pruning bars older than {DATA_RETENTION_DAYS} days "
+        f"(before {cutoff_str} UTC)..."
     )
 
-    total_deleted = 0
-    affected: List[str] = []
+    total_rows_deleted = 0
+    total_chunks_dropped = 0
+    vacuum_tables: List[str] = []
     async with pool.acquire() as conn:
         tables = await conn.fetch(
             "SELECT table_name FROM information_schema.tables "
@@ -410,33 +415,40 @@ async def delete_old_data_from_db(pool: asyncpg.Pool, db_name: str) -> Tuple[int
             tbl = r["table_name"]
             try:
                 chunks = await conn.fetchval(
-                    "SELECT count(*) FROM drop_chunks($1::regclass, older_than => $2::interval)",
+                    "SELECT count(*) FROM drop_chunks($1::regclass, older_than => $2::bigint)",
                     tbl,
-                    f"{DATA_RETENTION_DAYS} days",
+                    cutoff_ts,
                 )
                 if chunks:
-                    total_deleted += int(chunks)
-                    affected.append(tbl)
+                    total_chunks_dropped += int(chunks)
             except Exception:
-                # Not a hypertable (or timescaledb missing) → row-by-row DELETE.
-                try:
-                    deleted = await conn.execute(
-                        f'DELETE FROM "{tbl}" WHERE "Timestamp" < $1',
-                        cutoff_ts,
-                    )
-                    if deleted and deleted != "DELETE 0":
-                        try:
-                            deleted_count = int(deleted.split()[1])
-                            if deleted_count > 0:
-                                total_deleted += deleted_count
-                                affected.append(tbl)
-                        except (IndexError, ValueError):
-                            pass
-                except asyncpg.PostgresError as e:
-                    logger.warning(f"  ⚠️  [{db_name}] {tbl}: error during delete — {e}")
+                # Not a hypertable (or TimescaleDB is unavailable); the exact
+                # cutoff DELETE below is the safe fallback.
+                pass
 
-    logger.info(f"  ✅ [{db_name}] Deletion finished: {total_deleted} old records removed")
-    return total_deleted, affected
+            # Also prune the part of the oldest chunk that overlaps the cutoff,
+            # so each maintenance run applies the exact DATA_RETENTION_DAYS boundary.
+            try:
+                deleted = await conn.execute(
+                    f'DELETE FROM "{tbl}" WHERE "Timestamp" < $1',
+                    cutoff_ts,
+                )
+                if deleted and deleted != "DELETE 0":
+                    try:
+                        deleted_count = int(deleted.split()[1])
+                        if deleted_count > 0:
+                            total_rows_deleted += deleted_count
+                            vacuum_tables.append(tbl)
+                    except (IndexError, ValueError):
+                        pass
+            except asyncpg.PostgresError as e:
+                logger.warning(f"  ⚠️  [{db_name}] {tbl}: error during delete — {e}")
+
+    logger.info(
+        f"  ✅ [{db_name}] Pruned {total_chunks_dropped} chunks and deleted "
+        f"{total_rows_deleted} residual/legacy rows"
+    )
+    return total_rows_deleted, total_chunks_dropped, vacuum_tables
 
 
 # Wall-clock latch limiting retention maintenance to the configured cadence.
@@ -454,8 +466,8 @@ async def run_maintenance() -> None:
             f"(< {settings.maintenance_interval_hours}h)"
         )
         return
-    # Latch BEFORE the work: an interrupted/killed maintenance retries next
-    # day instead of re-running full scans in a hot every-cycle loop.
+    # Latch BEFORE the work: an interrupted/killed maintenance retries after
+    # the configured interval instead of re-running cleanup in a hot cycle loop.
     _LAST_MAINTENANCE_AT = now
 
     logger.info("=" * 60)
@@ -465,36 +477,42 @@ async def run_maintenance() -> None:
     )
     logger.info("=" * 60)
 
-    total_deleted = 0
-    affected_per_db: Dict[str, List[str]] = {}
+    total_rows_deleted = 0
+    total_chunks_dropped = 0
+    vacuum_tables_per_db: Dict[str, List[str]] = {}
     for db_name, pool in db_pools.items():
         try:
-            deleted, affected = await delete_old_data_from_db(pool, db_name)
-            total_deleted += deleted
-            affected_per_db[db_name] = affected
+            rows_deleted, chunks_dropped, vacuum_tables = await delete_old_data_from_db(
+                pool, db_name
+            )
+            total_rows_deleted += rows_deleted
+            total_chunks_dropped += chunks_dropped
+            vacuum_tables_per_db[db_name] = vacuum_tables
         except Exception as e:
-            logger.warning(f"  ⚠️  [{db_name}] Error deleting old data: {e}")
-            affected_per_db[db_name] = []
+            logger.warning(f"  ⚠️  [{db_name}] Error pruning old data: {e}")
+            vacuum_tables_per_db[db_name] = []
 
     for db_name, pool in db_pools.items():
-        affected = affected_per_db.get(db_name) or []
-        if not affected:
-            # Steady state deletes nothing → no manual VACUUM at all; the
-            # stock autovacuum daemon owns routine cleanup. A whole-database
-            # `VACUUM;` here ran after EVERY 5-minute cycle, scanned all
-            # hypertables and saturated disk 24/7 (single backend observed at
-            # 4.3 GB RSS, state D — that was the laptop stutter).
-            logger.info(f"  ⏭️  [{db_name}] VACUUM skipped — no old rows deleted")
+        vacuum_tables = vacuum_tables_per_db.get(db_name) or []
+        if not vacuum_tables:
+            # drop_chunks() frees whole chunk files immediately; no manual
+            # VACUUM is needed unless the exact-cutoff DELETE left dead tuples.
+            logger.info(f"  ⏭️  [{db_name}] VACUUM skipped — no residual rows deleted")
             continue
         try:
             async with pool.acquire() as conn:
-                for tbl in affected:
+                for tbl in vacuum_tables:
                     await conn.execute(f'VACUUM "{tbl}";')
-            logger.info(f"  ✅ [{db_name}] VACUUM completed ({len(affected)} tables)")
+            logger.info(
+                f"  ✅ [{db_name}] VACUUM completed ({len(vacuum_tables)} tables)"
+            )
         except Exception as e:
             logger.warning(f"  ⚠️  [{db_name}] VACUUM skipped: {e}")
 
-    logger.info(f"✅ Maintenance finished: total deleted {total_deleted} records")
+    logger.info(
+        f"✅ Maintenance finished: {total_chunks_dropped} old chunks dropped, "
+        f"{total_rows_deleted} residual/legacy rows deleted"
+    )
     logger.info("=" * 60)
 
 
@@ -1079,8 +1097,8 @@ async def save_candles_to_table(current_db, tbl: str, symbol: str, ccxt_id: str,
             )
 
             # Dedup window is scoped to the freshly written range: the
-            # un-scoped variant scanned the whole 180-day table per pair
-            # per cycle.
+            # un-scoped variant scanned the whole retention-window table per
+            # pair per cycle.
             await conn.execute(
                 f"""
                 WITH dups AS (
@@ -1220,8 +1238,8 @@ async def process_pair(exchange, symbol, ccxt_id):
                 )
 
         # --- Backward history prefill (repair of truncated table starts) ----
-        # A table whose first candle sits notably LATER than the 180d floor is
-        # missing its old history (e.g. perp initial imports that never
+        # A table whose first candle sits notably LATER than the configured
+        # retention floor is missing its old history (e.g. perp initial imports that never
         # paginated). Resumable: each cycle pages further left until the floor.
         if current_db and prefill_needed(min_ts, target_floor_ts, GAP_TOLERANCE_SEC):
             key = (ccxt_id, symbol)

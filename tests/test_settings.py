@@ -4,6 +4,16 @@ Settings parsing tests: ALLOWED_EXCHANGES accepts comma-separated and JSON forma
 from config.settings import Settings
 
 
+def test_15m_retention_defaults_to_50_days_with_6_hour_cleanup(monkeypatch):
+    monkeypatch.delenv("DATA_RETENTION_DAYS", raising=False)
+    monkeypatch.delenv("MAINTENANCE_INTERVAL_HOURS", raising=False)
+
+    st = Settings(_env_file=None)
+
+    assert st.data_retention_days == 50
+    assert st.maintenance_interval_hours == 6
+
+
 def test_allowed_exchanges_comma_separated():
     st = Settings(ALLOWED_EXCHANGES="bybit, okx , bitget")
     assert st.allowed_exchanges == ["bybit", "okx", "bitget"]

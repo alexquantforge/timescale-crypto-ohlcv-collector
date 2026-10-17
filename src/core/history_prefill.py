@@ -137,8 +137,8 @@ def should_attempt_prefill(
 
 
 def prefill_needed(min_ts_sec: Optional[int], target_floor_sec: int, slack_sec: int = 1800) -> bool:
-    """True when the table starts noticeably LATER than the floor we want
-    (15m: now-180d; 1D: backfill_start_date), i.e. older candles are missing."""
+    """True when the table starts noticeably LATER than the configured floor
+    (15m: now-retention_days; 1D: backfill_start_date), i.e. older candles are missing."""
     if not min_ts_sec:
         return False
     return int(min_ts_sec) > int(target_floor_sec) + int(slack_sec)

@@ -143,7 +143,8 @@ SUMMARY_COLUMNS = """
 # column list): tables whose orderbook snapshot never landed simply LACK the
 # ob_* columns, and a fixed SELECT used to raise UndefinedColumn -> the row
 # was silently dropped -> "No 15m table for X" while the engine was happily
-# storing 180 days of candles into that very table (PIXEL/USDT:USDT @bybit).
+# storing the full configured retention window of candles into that table
+# (PIXEL/USDT:USDT @bybit).
 _EXPECTED_SUMMARY_KEYS = [
     "ticker", "exchange", "asset_type", "close", "volume",
     "ob_vitality_score", "ob_vitality_grade",
