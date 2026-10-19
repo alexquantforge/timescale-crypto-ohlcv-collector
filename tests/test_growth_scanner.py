@@ -114,12 +114,26 @@ def test_cli_defaults_and_volume_threshold_override():
     parser = build_parser()
     defaults = parser.parse_args(["--hours", "6", "--pct", "25"])
     custom = parser.parse_args([
-        "--hours", "12", "--pct", "40", "--min-7d-volume-usd", "250000"
+        "--hours", "12", "--pct", "40", "--min-7d-volume-usd", "250000",
+        "--interval-hours", "0.5", "--once",
     ])
 
     assert defaults.min_7d_volume_usd == DEFAULT_MIN_7D_VOLUME_USD
     assert defaults.max_spread_atr_pct == DEFAULT_MAX_SPREAD_ATR_PCT
+    assert defaults.interval_hours == 1.0
+    assert defaults.once is False
     assert custom.min_7d_volume_usd == 250_000
+    assert custom.interval_hours == 0.5
+    assert custom.once is True
+
+
+def test_hourly_schedule_keeps_interval_and_skips_overdue_slots():
+    assert scanner._next_hourly_start(100.0, 1_000.0, 3_600.0) == (3_700.0, 0)
+    # A scan that ends after two scheduled starts skips both; it never overlaps
+    # or starts a catch-up burst.
+    assert scanner._next_hourly_start(100.0, 8_000.0, 3_600.0) == (10_900.0, 2)
+    # Finishing exactly on a scheduled start permits the next pass immediately.
+    assert scanner._next_hourly_start(100.0, 3_700.0, 3_600.0) == (3_700.0, 0)
 
 
 def test_exchange_links_are_built_for_spot_and_perpetual_from_contract_symbol():

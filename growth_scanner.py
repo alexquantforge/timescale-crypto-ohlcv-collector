@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""One-shot scanner for strong recent rises with live liquidity checks.
+"""Hourly scanner for strong recent rises with live liquidity checks.
 
 Growth is measured as the largest chronological 15m OHLCV low-to-high move
 inside the requested lookback window. The active/forming 15m candle is included;
@@ -16,9 +16,14 @@ A candidate must also have:
 The program only reads the OHLCV databases and public exchange endpoints. It
 writes no results to the database and does not modify any existing scanner.
 
+By default the first scan starts immediately and subsequent scans start every
+hour, without overlapping. Use ``--once`` for a single scan or change the cadence
+with ``--interval-hours``.
+
 Example:
     python growth_scanner.py --hours 6 --pct 25
     python growth_scanner.py --hours 12 --pct 40 --min-7d-volume-usd 250000
+    python growth_scanner.py --once --hours 12 --pct 40
 """
 from __future__ import annotations
 
@@ -922,6 +927,63 @@ async def run_scan(args: argparse.Namespace) -> int:
         )
 
 
+def _next_hourly_start(
+    previous_start: float,
+    now: float,
+    interval_seconds: float,
+) -> tuple[float, int]:
+    """Advance a fixed cadence, skipping missed slots rather than overlapping."""
+    next_start = previous_start + interval_seconds
+    skipped = 0
+    if next_start < now:
+        skipped = math.floor((now - next_start) / interval_seconds) + 1
+        next_start += skipped * interval_seconds
+    return next_start, skipped
+
+
+async def run_hourly(args: argparse.Namespace) -> int:
+    """Run immediately, then on a fixed hourly cadence until interrupted."""
+    interval_seconds = float(args.interval_hours) * 3600.0
+    loop = asyncio.get_running_loop()
+    scheduled_start = loop.time()
+    scan_number = 0
+
+    while True:
+        scan_number += 1
+        LOGGER.info("Начинаю сканирование #%d.", scan_number)
+        try:
+            exit_code = await run_scan(args)
+            if exit_code:
+                LOGGER.warning(
+                    "Сканирование #%d завершилось с кодом %d; следующий запуск по расписанию.",
+                    scan_number,
+                    exit_code,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception(
+                "Ошибка сканирования #%d; процесс останется запущен и повторит попытку по расписанию.",
+                scan_number,
+            )
+
+        now = loop.time()
+        scheduled_start, skipped = _next_hourly_start(
+            scheduled_start,
+            now,
+            interval_seconds,
+        )
+        if skipped:
+            LOGGER.warning(
+                "Проход превысил интервал; пропускаю %d просроченных запуск(а), "
+                "чтобы не запускать проходы параллельно.",
+                skipped,
+            )
+        delay = max(0.0, scheduled_start - loop.time())
+        LOGGER.info("Следующий запуск через %.1f мин.", delay / 60.0)
+        await asyncio.sleep(delay)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -956,6 +1018,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Максимум одновременных live-проверок стакана")
     parser.add_argument("--request-timeout-sec", type=float, default=8.0,
                         help="Timeout каждого live-запроса стакана/ленты, секунд")
+    parser.add_argument(
+        "--interval-hours", type=float, default=1.0,
+        help="Интервал между стартами сканирования в непрерывном режиме",
+    )
+    parser.add_argument(
+        "--once", action="store_true",
+        help="Выполнить один проход и завершиться (по умолчанию сканер работает непрерывно)",
+    )
     parser.add_argument("--verbose", action="store_true", help="Подробные логи в stderr")
     return parser
 
@@ -977,15 +1047,18 @@ def main() -> int:
         parser.error("--db-concurrency и --live-concurrency должны быть не меньше 1")
     if args.request_timeout_sec <= 0:
         parser.error("--request-timeout-sec должен быть больше 0")
+    if args.interval_hours <= 0:
+        parser.error("--interval-hours должен быть больше 0")
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
     try:
-        return asyncio.run(run_scan(args))
+        runner = run_scan(args) if args.once else run_hourly(args)
+        return asyncio.run(runner)
     except KeyboardInterrupt:
-        LOGGER.warning("Сканирование прервано пользователем.")
+        LOGGER.warning("Сканирование остановлено пользователем.")
         return 130
 
 
