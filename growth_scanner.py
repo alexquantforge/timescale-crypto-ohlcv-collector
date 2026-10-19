@@ -66,6 +66,13 @@ class GrowthMove:
     pct: float
 
 
+@dataclass(frozen=True)
+class GrowthWindowScan:
+    move: Optional[GrowthMove]
+    bars_in_window: int
+    usable_bars: int
+
+
 @dataclass
 class Candidate:
     pair: PairTable
@@ -134,7 +141,8 @@ def find_max_low_to_high_move(
             high = float(raw_high)
         except (TypeError, ValueError, OverflowError):
             continue
-        if not (math.isfinite(low) and math.isfinite(high)) or low <= 0 or high <= 0:
+        if (not (math.isfinite(low) and math.isfinite(high))
+                or low <= 0 or high <= 0 or high < low):
             continue
         if low < min_low:
             min_low = low
@@ -286,7 +294,7 @@ async def fetch_growth_move(
     *,
     window_start_ts: int,
     now_ts: int,
-) -> Optional[GrowthMove]:
+) -> GrowthWindowScan:
     sql = (
         f'SELECT "Timestamp", "low", "high" FROM {_quote_ident(table)} '
         'WHERE "Timestamp" >= $1 AND "Timestamp" <= $2 '
@@ -294,8 +302,24 @@ async def fetch_growth_move(
     )
     async with pool.acquire() as conn:
         rows = await conn.fetch(sql, int(window_start_ts), int(now_ts))
-    return find_max_low_to_high_move(
+
+    usable_bars = 0
+    for row in rows:
+        try:
+            low, high = float(row["low"]), float(row["high"])
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if (math.isfinite(low) and math.isfinite(high)
+                and low > 0 and high >= low):
+            usable_bars += 1
+
+    move = find_max_low_to_high_move(
         (row["Timestamp"], row["low"], row["high"]) for row in rows
+    )
+    return GrowthWindowScan(
+        move=move,
+        bars_in_window=len(rows),
+        usable_bars=usable_bars,
     )
 
 
@@ -418,7 +442,7 @@ async def _collect_move_candidates(
             return None
         async with semaphore:
             try:
-                move = await fetch_growth_move(
+                window_scan = await fetch_growth_move(
                     pool,
                     pair.table,
                     window_start_ts=window_start_ts,
@@ -428,9 +452,18 @@ async def _collect_move_candidates(
                 stats["ohlcv_read_error"] += 1
                 LOGGER.debug("Ошибка чтения %s.%s: %r", pair.db_name, pair.table, exc)
                 return None
-        if move is None:
-            stats["no_usable_15m_bars"] += 1
+        if window_scan.bars_in_window == 0:
+            stats["no_15m_bars_in_window"] += 1
             return None
+        stats["15m_bars_in_window"] += window_scan.bars_in_window
+        stats["invalid_15m_ohlc_rows"] += (
+            window_scan.bars_in_window - window_scan.usable_bars
+        )
+        if window_scan.usable_bars == 0 or window_scan.move is None:
+            stats["no_usable_ohlc_in_15m_window"] += 1
+            return None
+        stats["tables_with_usable_15m_bars"] += 1
+        move = window_scan.move
         if move.pct <= min_growth_pct:
             stats["growth_below_threshold"] += 1
             return None
@@ -586,14 +619,27 @@ async def _apply_live_filters(
             stats["invalid_live_orderbook"] += 1
             return None
 
+        stats["live_book_valid"] += 1
         grade = str(snapshot.get("ob_vitality_grade") or "").strip().upper()
-        if grade not in {"A", "B"}:
+        grade_pass = grade in {"A", "B"}
+        if grade_pass:
+            stats["vitality_a_or_b_pass"] += 1
+        else:
             stats["vitality_not_a_or_b"] += 1
-            return None
 
         spread_atr_pct = _finite_nonnegative(snapshot.get("ob_spread_atr_pct"))
-        if spread_atr_pct is None or spread_atr_pct > max_spread_atr_pct:
-            stats["spread_over_atr_limit"] += 1
+        if spread_atr_pct is None:
+            stats["spread_unavailable"] += 1
+            spread_pass = False
+        else:
+            stats["spread_tested"] += 1
+            spread_pass = spread_atr_pct <= max_spread_atr_pct
+            if spread_pass:
+                stats["spread_pass"] += 1
+            else:
+                stats["spread_over_atr_limit"] += 1
+
+        if not grade_pass or not spread_pass:
             return None
 
         candidate.live_snapshot = snapshot
@@ -662,6 +708,66 @@ def _format_ts(ts: int) -> str:
     return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _symbol_base_quote(symbol: str) -> tuple[str, str]:
+    pair_parts = str(symbol).split("/", 1)
+    if len(pair_parts) != 2:
+        return "", ""
+    base = pair_parts[0].strip().upper()
+    quote = pair_parts[1].split(":", 1)[0].strip().upper()
+    return base, quote
+
+
+def build_spot_url(exchange: str, symbol: str) -> str:
+    """Build spot URLs using the repository's established exchange templates."""
+    base, quote = _symbol_base_quote(symbol)
+    if not base or not quote:
+        return "—"
+    b, q = base, quote
+    bl, ql = base.lower(), quote.lower()
+    urls = {
+        "bybit": f"https://www.bybit.com/ru-RU/trade/spot/{b}/{q}",
+        "bitget": f"https://www.bitget.com/ru/spot/{b}{q}_SPBL?type=spot",
+        "mexc": f"https://www.mexc.com/exchange/{b}_{q}",
+        "kucoin": f"https://trade.kucoin.com/{b}-{q}",
+        "gateio": f"https://www.gate.io/trade/{b}_{q}",
+        "bingx": f"https://bingx.com/en/spot/{b}{q}",
+        "htx": f"https://www.htx.com/trade/{bl}_{ql}?type=spot",
+        "huobipro": f"https://www.htx.com/trade/{bl}_{ql}?type=spot",
+        "huobi": f"https://www.htx.com/trade/{bl}_{ql}?type=spot",
+        "coinex": f"https://www.coinex.com/exchange/{bl}-{ql}",
+        "okx": f"https://www.okx.com/ru/trade-spot/{bl}-{ql}",
+        "okex": f"https://www.okx.com/ru/trade-spot/{bl}-{ql}",
+    }
+    return urls.get(str(exchange).lower(), "—")
+
+
+def build_perp_url(exchange: str, symbol: str) -> str:
+    """Build linear perpetual URLs using the repository's exchange templates."""
+    base, quote = _symbol_base_quote(symbol)
+    if not base or not quote:
+        return "—"
+    b, q = base, quote
+    bl, ql = base.lower(), quote.lower()
+    urls = {
+        "bybit": f"https://www.bybit.com/trade/usdt/{b}{q}",
+        "bitget": f"https://www.bitget.com/ru/futures/usdt/{b}{q}",
+        "mexc": f"https://futures.mexc.com/exchange/{b}_{q}",
+        "kucoin": f"https://www.kucoin.com/futures/trade/{b}{q}M",
+        "gateio": f"https://www.gate.io/futures_trade/USDT/{b}_{q}",
+        "bingx": f"https://bingx.com/en/perpetual/{b}-{q}",
+        "htx": f"https://www.htx.com/futures/linear_swap/exchange#contract_code="
+              f"{b}-{q}&contract_type=swap&type=isolated",
+        "huobipro": f"https://www.htx.com/futures/linear_swap/exchange#contract_code="
+                    f"{b}-{q}&contract_type=swap&type=isolated",
+        "huobi": f"https://www.htx.com/futures/linear_swap/exchange#contract_code="
+                 f"{b}-{q}&contract_type=swap&type=isolated",
+        "coinex": f"https://www.coinex.com/futures/{bl}-{ql}",
+        "okx": f"https://www.okx.com/ru/trade-swap/{bl}-{ql}-swap",
+        "okex": f"https://www.okx.com/ru/trade-swap/{bl}-{ql}-swap",
+    }
+    return urls.get(str(exchange).lower(), "—")
+
+
 def _print_results(results: Sequence[Candidate], stats: Counter, args: argparse.Namespace) -> None:
     print(
         f"\nРост: max low→high за {args.hours:g} ч > {args.pct:g}% | "
@@ -681,6 +787,8 @@ def _print_results(results: Sequence[Candidate], stats: Counter, args: argparse.
             depth = float(snap.get("ob_total_depth_usd") or 0.0)
             tpm = float(snap.get("ob_trades_per_min") or 0.0)
             spread_atr = float(snap.get("ob_spread_atr_pct") or 0.0)
+            spot_url = build_spot_url(pair.exchange, pair.symbol)
+            perp_url = build_perp_url(pair.exchange, pair.symbol)
             print(
                 f"{pair.exchange:<8} {pair.market_type:<5} {pair.symbol:<24} "
                 f"+{move.pct:8.2f}%  low {move.low_price:.10g} @ {_format_ts(move.start_ts)} "
@@ -688,7 +796,9 @@ def _print_results(results: Sequence[Candidate], stats: Counter, args: argparse.
                 f"           min7d ${candidate.min_7d_volume_usd:,.0f}  "
                 f"1D-Gerchik ATR {candidate.daily_gerchik_atr:.10g}  "
                 f"spread {spread_atr:.2f}% ATR  vitality {grade} ({score:.1f}/10)  "
-                f"depth±{settings.ob_depth_pct:g}% ${depth:,.0f}  tape {tpm:.1f}/min"
+                f"depth±{settings.ob_depth_pct:g}% ${depth:,.0f}  tape {tpm:.1f}/min\n"
+                f"           spot: {spot_url}\n"
+                f"           perp: {perp_url}"
             )
     print("=" * 110)
     if stats:
@@ -782,6 +892,8 @@ async def run_scan(args: argparse.Namespace) -> int:
             _print_results([], stats, args)
             return 0
 
+        LOGGER.info("Свежий стакан/ленту проверяем у %d кандидатов.",
+                    len(daily_candidates))
         live_candidates = await _apply_live_filters(
             daily_candidates,
             registry,
@@ -789,6 +901,16 @@ async def run_scan(args: argparse.Namespace) -> int:
             concurrency=args.live_concurrency,
             request_timeout_sec=args.request_timeout_sec,
             stats=stats,
+        )
+        LOGGER.info(
+            "Live-фильтры: валидный стакан=%d; vitality A/B=%d; "
+            "spread ≤ %.2f%% ATR: прошли %d/%d проверок; прошли оба=%d.",
+            stats["live_book_valid"],
+            stats["vitality_a_or_b_pass"],
+            args.max_spread_atr_pct,
+            stats["spread_pass"],
+            stats["spread_tested"],
+            stats["live_filters_pass"],
         )
         _print_results(live_candidates, stats, args)
         return 0
